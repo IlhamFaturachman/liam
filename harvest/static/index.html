@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LIAM Harvest</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <h1>LIAM Harvest</h1>
+            <div class="header-controls">
+                <label class="concurrency-label">
+                    Provider:
+                    <select id="providerSelect">
+                        <option value="antigravity">Antigravity (Gemini Code Assist)</option>
+                    </select>
+                </label>
+                <label class="toggle-label">
+                    <input type="checkbox" id="headlessToggle">
+                    <span>Headless</span>
+                </label>
+                <label class="concurrency-label">
+                    Concurrency:
+                    <select id="concurrencySelect">
+                        <option value="1">1</option>
+                        <option value="2">2</option>
+                        <option value="3">3</option>
+                        <option value="4" selected>4</option>
+                        <option value="6">6</option>
+                        <option value="8">8</option>
+                    </select>
+                </label>
+            </div>
+        </header>
+
+        <section class="input-section">
+            <div class="input-header">
+                <h2>Accounts</h2>
+                <div class="input-actions">
+                    <label class="btn btn-secondary" for="fileInput">Import .txt</label>
+                    <input type="file" id="fileInput" accept=".txt" hidden>
+                    <button class="btn btn-secondary" id="clearBtn">Clear</button>
+                </div>
+            </div>
+            <textarea id="accountsTextarea" placeholder="Paste accounts (one per line)&#10;Format: email:password&#10;&#10;example1@gmail.com:pass123&#10;example2@gmail.com:pass456" rows="8"></textarea>
+            <div class="input-footer">
+                <span id="accountCount">0 accounts detected</span>
+                <button class="btn btn-primary" id="loadBtn">Load Accounts</button>
+            </div>
+        </section>
+
+        <section class="controls-section">
+            <button class="btn btn-success" id="startBtn" disabled>Start Batch</button>
+            <button class="btn btn-warning" id="pauseBtn" disabled>Pause</button>
+            <button class="btn btn-danger" id="stopBtn" disabled>Stop</button>
+            <button class="btn btn-secondary" id="retryBtn" disabled>Retry Failed</button>
+        </section>
+
+        <section class="progress-section" id="progressSection" style="display:none;">
+            <div class="progress-header">
+                <span id="progressText">0/0</span>
+                <span id="progressPercent">0%</span>
+                <span id="elapsedTime">0s</span>
+            </div>
+            <div class="progress-bar">
+                <div class="progress-fill" id="progressFill"></div>
+            </div>
+            <div class="progress-stats">
+                <span class="stat stat-success">Success: <strong id="successCount">0</strong></span>
+                <span class="stat stat-failed">Failed: <strong id="failedCount">0</strong></span>
+                <span class="stat stat-active">Running: <strong id="activeCount">0</strong></span>
+            </div>
+        </section>
+
+        <section class="log-section" id="logSection" style="display:none;">
+            <h2>Live Log</h2>
+            <div class="log-container" id="logContainer"></div>
+        </section>
+
+        <section class="results-section" id="resultsSection" style="display:none;">
+            <div class="results-header">
+                <h2>Results</h2>
+                <div class="results-actions">
+                    <button class="btn btn-primary" id="exportJsonBtn" disabled>Download JSON</button>
+                    <button class="btn btn-secondary" id="copyResultsBtn" disabled>Copy Results</button>
+                </div>
+            </div>
+            <div class="table-wrapper">
+                <table id="resultsTable">
+                    <thead>
+                        <tr><th>#</th><th>Email</th><th>Status</th><th>Detail</th><th>Time</th></tr>
+                    </thead>
+                    <tbody id="resultsBody"></tbody>
+                </table>
+            </div>
+        </section>
+    </div>
+
+    <script>
+    // Load providers on init
+    fetch('/api/providers').then(r=>r.json()).then(providers => {
+        const sel = document.getElementById('providerSelect');
+        sel.innerHTML = '';
+        providers.forEach(p => {
+            const opt = document.createElement('option');
+            opt.value = p.name;
+            opt.textContent = p.display_name;
+            sel.appendChild(opt);
+        });
+    });
+    </script>
+    <script src="/static/app.js"></script>
+</body>
+</html>

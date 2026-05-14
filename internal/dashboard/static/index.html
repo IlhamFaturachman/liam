@@ -1,0 +1,682 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LIAM</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+<link rel="stylesheet" href="/dashboard/style.css">
+<script>
+tailwind.config={theme:{extend:{colors:{
+  brand:{DEFAULT:'#922b21',light:'#c0392b',dark:'#7b241c',glow:'rgba(146,43,33,0.12)'},
+  surface:{1:'#1a1a1e',2:'#222226',3:'#2a2a2f',hover:'#32323a',active:'#3a3a44'},
+  txt:{1:'#e8e8ec',2:'#a0a0a8',3:'#5c5c66'},
+  bdr:{DEFAULT:'#333338',light:'#2a2a2f'},
+  ok:'#27ae60',warn:'#d4a017',err:'#c0392b'
+},fontFamily:{sans:['Inter','system-ui','sans-serif'],mono:['JetBrains Mono','monospace']}}}}
+</script>
+</head>
+<body class="bg-surface-1 text-txt-1 font-sans min-h-screen" x-data="app()" x-init="init()">
+
+<!-- Login -->
+<div x-show="!authenticated" x-transition.opacity class="min-h-screen flex items-center justify-center bg-surface-1">
+  <div class="absolute inset-0 bg-[radial-gradient(ellipse_at_top,rgba(146,43,33,0.06),transparent_60%)]"></div>
+  <div class="relative bg-surface-2 border border-bdr rounded-2xl p-10 w-[380px] text-center shadow-2xl">
+    <div class="text-3xl font-extrabold text-white mb-1">LIAM</div>
+    <p class="text-txt-3 text-xs mb-8 tracking-wide">LIVING INTELLIGENT AUTOMATION MACHINE</p>
+    <div x-show="loginError" class="text-err text-xs mb-3" x-text="loginError"></div>
+    <input type="password" x-model="password" @keydown.enter="login()" placeholder="Password" class="w-full px-4 py-3 bg-surface-1 border border-bdr rounded-lg text-sm text-txt-1 placeholder-txt-3 focus:outline-none focus:border-brand transition-all mb-4 font-mono">
+    <button @click="login()" class="w-full py-3 bg-brand hover:bg-brand-dark text-white font-semibold rounded-lg transition-all">Sign In</button>
+  </div>
+</div>
+
+<!-- App -->
+<div x-show="authenticated" x-cloak class="flex min-h-screen">
+  <!-- Sidebar -->
+  <aside class="sidebar bg-surface-2 border-r border-bdr flex flex-col fixed h-screen z-10" :style="sidebarCollapsed?'width:60px':'width:220px'">
+    <div class="px-4 py-5 flex items-center justify-between border-b border-bdr-light">
+      <div x-show="!sidebarCollapsed" x-transition.opacity>
+        <div class="text-lg font-extrabold text-white">LIAM</div>
+        <div class="text-[10px] text-txt-3 tracking-wider">v0.1.0</div>
+      </div>
+      <button @click="toggleSidebar()" class="text-txt-3 hover:text-txt-1 transition-all" :class="sidebarCollapsed?'mx-auto':''">
+        <span class="material-symbols-outlined text-[20px]" x-text="sidebarCollapsed?'menu':'menu_open'"></span>
+      </button>
+    </div>
+    <nav class="flex-1 px-2 py-3 space-y-1">
+      <template x-for="item in navItems" :key="item.id">
+        <div @click="page=item.id;onPageChange()" 
+             class="nav-item-collapsed flex items-center gap-3 px-3 py-2.5 rounded-md text-sm font-medium cursor-pointer transition-all group"
+             :class="page===item.id?'nav-active':'text-txt-2 hover:bg-surface-hover hover:text-txt-1'">
+          <span class="material-symbols-outlined text-[18px] flex-shrink-0" x-text="item.icon"></span>
+          <span x-show="!sidebarCollapsed" x-transition.opacity x-text="item.label"></span>
+          <span x-show="sidebarCollapsed" class="nav-tooltip" x-text="item.label"></span>
+        </div>
+      </template>
+    </nav>
+    <div class="px-2 py-3 border-t border-bdr-light">
+      <div @click="logout()" 
+           class="nav-item-collapsed flex items-center gap-3 px-3 py-2.5 rounded-md text-sm text-txt-3 hover:text-err hover:bg-surface-hover cursor-pointer transition-all">
+        <span class="material-symbols-outlined text-[18px] flex-shrink-0">logout</span>
+        <span x-show="!sidebarCollapsed" x-transition.opacity>Sign Out</span>
+        <span x-show="sidebarCollapsed" class="nav-tooltip">Sign Out</span>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Main Content -->
+  <main class="flex-1 bg-surface-3 min-h-screen transition-all" :style="sidebarCollapsed?'margin-left:60px':'margin-left:220px'">
+    <div class="max-w-[1400px] mx-auto px-8 py-8">
+
+    <!-- Overview -->
+    <div x-show="page==='overview'" x-transition:enter="transition ease-out duration-250" x-transition:enter-start="opacity-0 translate-y-2" x-transition:enter-end="opacity-100 translate-y-0">
+      <div class="mb-6"><h1 class="text-xl font-semibold">Overview</h1><p class="text-xs text-txt-3 mt-1">System status and quick actions</p></div>
+      <div class="grid grid-cols-5 gap-3 mb-6">
+        <template x-for="s in overviewStats" :key="s.label">
+          <div class="bg-surface-2 border border-bdr rounded-xl p-4 hover:border-bdr/50 transition-all">
+            <div class="text-[10px] text-txt-3 uppercase tracking-wider mb-1" x-text="s.label"></div>
+            <div class="text-2xl font-bold font-mono" :class="s.color" x-text="s.value"></div>
+          </div>
+        </template>
+      </div>
+      <div class="bg-surface-2 border border-bdr rounded-xl px-4 py-3 mb-6 flex items-center justify-between">
+        <code class="text-sm text-brand-light" x-text="endpoint"></code>
+        <button @click="copyEndpoint()" class="text-xs text-txt-3 hover:text-brand-light border border-bdr rounded px-2 py-1" x-text="copied?'Copied!':'Copy'"></button>
+      </div>
+      <div class="grid grid-cols-3 gap-4 mb-6">
+        <div class="col-span-2 bg-surface-2 border border-bdr rounded-xl p-5">
+          <div class="text-xs text-txt-3 uppercase tracking-wider mb-3">Requests (24h)</div>
+          <canvas id="chartCanvas" height="120"></canvas>
+        </div>
+        <div class="bg-surface-2 border border-bdr rounded-xl p-5">
+          <div class="text-xs text-txt-3 uppercase tracking-wider mb-3">Live Feed</div>
+          <div class="space-y-2 max-h-[200px] overflow-y-auto">
+            <template x-for="(req, i) in liveRequests.slice(0,15)" :key="i">
+              <div class="flex items-center gap-2 text-[11px] py-1 border-b border-bdr-light/50 animate-fadeIn">
+                <span class="text-txt-3 font-mono" x-text="req.time"></span>
+                <span class="text-brand-light font-mono truncate flex-1" x-text="req.model"></span>
+                <span :class="req.status===200?'text-ok':'text-err'" x-text="req.status===200?'OK':req.status"></span>
+              </div>
+            </template>
+            <div x-show="liveRequests.length===0" class="text-txt-3 text-xs text-center py-4">No requests yet</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Providers -->
+    <div x-show="page==='providers'" x-transition:enter="transition ease-out duration-250" x-transition:enter-start="opacity-0 translate-y-2" x-transition:enter-end="opacity-100 translate-y-0">
+      <div x-show="!providerDetail">
+        <div class="mb-6"><h1 class="text-xl font-semibold">Providers</h1><p class="text-xs text-txt-3 mt-1">Click a provider to manage models and accounts</p></div>
+        <div class="grid grid-cols-2 gap-4">
+          <template x-for="p in providerStats" :key="p.name">
+            <div @click="openProvider(p.name)" class="bg-surface-2 border border-bdr rounded-xl p-6 hover:border-brand transition-all cursor-pointer group">
+              <div class="flex items-center justify-between mb-4">
+                <div class="flex items-center gap-3">
+                  <div class="w-2.5 h-2.5 rounded-full bg-ok animate-pulse"></div>
+                  <span class="font-semibold capitalize text-base" x-text="p.name"></span>
+                </div>
+                <span class="material-symbols-outlined text-txt-3 group-hover:text-brand-light transition-all">arrow_forward</span>
+              </div>
+              <div class="grid grid-cols-3 gap-3">
+                <div><div class="text-[10px] text-txt-3 uppercase">Active</div><div class="text-xl font-bold text-ok font-mono" x-text="p.active"></div></div>
+                <div><div class="text-[10px] text-txt-3 uppercase">Cooldown</div><div class="text-xl font-bold text-warn font-mono" x-text="p.cooldown"></div></div>
+                <div><div class="text-[10px] text-txt-3 uppercase">Total</div><div class="text-xl font-bold font-mono" x-text="p.total"></div></div>
+              </div>
+            </div>
+          </template>
+          <div x-show="providerStats.length===0" class="col-span-2 bg-surface-2 border border-bdr rounded-xl p-12 text-center">
+            <span class="material-symbols-outlined text-3xl text-txt-3 mb-2 block">cloud_off</span>
+            <p class="text-txt-2 text-sm">No providers configured</p>
+            <p class="text-txt-3 text-xs mt-1">Use Harvest to add accounts</p>
+          </div>
+        </div>
+      </div>
+
+      <div x-show="providerDetail">
+        <button @click="closeProvider()" class="flex items-center gap-2 text-txt-3 hover:text-txt-1 mb-4 text-sm transition-all">
+          <span class="material-symbols-outlined text-[18px]">arrow_back</span> Back to Providers
+        </button>
+        <div class="mb-6 flex items-center justify-between">
+          <div>
+            <h1 class="text-xl font-semibold capitalize" x-text="providerDetail"></h1>
+            <p class="text-txt-3 text-xs mt-1" x-text="providerAccounts.length+' accounts'"></p>
+          </div>
+          <button @click="refreshProviderModels()" class="px-3 py-1.5 bg-surface-2 border border-bdr text-txt-2 hover:text-brand-light hover:border-brand text-xs rounded-lg transition-all flex items-center gap-1.5">
+            <span class="material-symbols-outlined text-[16px]">refresh</span> Refresh Models
+          </button>
+        </div>
+
+        <div class="bg-surface-2 border border-bdr rounded-xl p-6 mb-5">
+          <div class="flex items-center justify-between mb-4">
+            <h2 class="text-sm font-semibold">Available Models</h2>
+            <button @click="openAddModel(providerDetail==='antigravity'?'ag':providerDetail)" class="text-xs text-brand-light hover:text-brand flex items-center gap-1.5">
+              <span class="material-symbols-outlined text-[16px]">add</span> Add Model
+            </button>
+          </div>
+          <div class="grid grid-cols-3 gap-3">
+            <template x-for="m in providerModels" :key="m.id">
+              <div class="bg-surface-1 border border-bdr rounded-lg p-3 hover:border-brand transition-all">
+                <div class="flex items-start justify-between mb-2">
+                  <div class="font-mono text-xs text-brand-light truncate flex-1" x-text="m.id"></div>
+                  <button @click="copyModelId(m.id)" class="text-txt-3 hover:text-brand-light ml-2">
+                    <span class="material-symbols-outlined text-[14px]">content_copy</span>
+                  </button>
+                </div>
+                <div class="text-[11px] text-txt-3 mb-3" x-text="m.display_name"></div>
+                <div class="flex items-center gap-1.5">
+                  <button @click="testModel(m.id)" :disabled="testingModel===m.id" class="flex-1 px-2 py-1 text-[11px] rounded transition-all flex items-center justify-center gap-1" :class="testResults[m.id]?.ok===true?'bg-ok/10 text-ok':testResults[m.id]?.ok===false?'bg-err/10 text-err':'bg-surface-2 border border-bdr text-txt-2 hover:border-brand hover:text-brand-light'">
+                    <span x-show="testingModel===m.id" class="material-symbols-outlined text-[12px] animate-spin">progress_activity</span>
+                    <span x-show="testingModel!==m.id && !testResults[m.id]" class="flex items-center gap-1"><span class="material-symbols-outlined text-[12px]">play_arrow</span>Test</span>
+                    <span x-show="testResults[m.id]?.ok===true" x-text="'OK ' + testResults[m.id].latency_ms + 'ms'"></span>
+                    <span x-show="testResults[m.id]?.ok===false" :title="testResults[m.id].error">Failed</span>
+                  </button>
+                  <button x-show="m.is_custom" @click="removeModel(m.id)" class="px-1.5 py-1 text-txt-3 hover:text-err transition-all" title="Remove">
+                    <span class="material-symbols-outlined text-[14px]">delete</span>
+                  </button>
+                </div>
+              </div>
+            </template>
+            <div @click="openAddModel(providerDetail==='antigravity'?'ag':providerDetail)" class="border-2 border-dashed border-bdr rounded-lg p-3 hover:border-brand cursor-pointer transition-all flex items-center justify-center text-txt-3 hover:text-brand-light min-h-[100px]">
+              <span class="text-[12px] flex items-center gap-1.5">
+                <span class="material-symbols-outlined text-[16px]">add</span> Add Model
+              </span>
+            </div>
+          </div>
+        </div>
+
+        <div class="bg-surface-2 border border-bdr rounded-xl overflow-hidden">
+          <div class="px-4 py-3 border-b border-bdr text-xs text-txt-3 uppercase tracking-wider">Accounts</div>
+          <table x-show="providerAccounts.length>0" class="w-full text-sm">
+            <thead><tr class="border-b border-bdr text-[11px] text-txt-3 uppercase tracking-wider">
+              <th class="text-left py-3 px-4">Email</th><th class="text-left py-3 px-4">Status</th><th class="text-left py-3 px-4">Quota</th><th class="text-left py-3 px-4">Last Used</th><th class="text-left py-3 px-4">Errors</th>
+            </tr></thead>
+            <tbody>
+              <template x-for="a in providerAccounts" :key="a.id">
+                <tr class="border-b border-bdr-light hover:bg-surface-hover/30 transition-colors">
+                  <td class="py-3 px-4 font-mono text-xs" x-text="a.email"></td>
+                  <td class="py-3 px-4">
+                    <span class="inline-flex items-center gap-1.5 text-[11px] font-medium" :class="a.status==='active'?'text-ok':a.status==='cooldown'?'text-warn':'text-err'">
+                      <span class="w-1.5 h-1.5 rounded-full" :class="a.status==='active'?'bg-ok':a.status==='cooldown'?'bg-warn':'bg-err'"></span>
+                      <span x-text="a.status"></span>
+                    </span>
+                  </td>
+                  <td class="py-3 px-4">
+                    <div class="flex items-center gap-2">
+                      <div class="w-24 h-1.5 bg-surface-1 rounded-full overflow-hidden">
+                        <div class="h-full rounded-full transition-all" :class="quotaColor(a)" :style="'width:'+Math.min(quotaPercent(a),100)+'%'"></div>
+                      </div>
+                      <span class="font-mono text-[11px] text-txt-3" x-text="a.quota_remaining+'/'+(a.quota_total||0)+' ('+quotaPercent(a)+'%)'"></span>
+                    </div>
+                  </td>
+                  <td class="py-3 px-4 text-xs text-txt-3" x-text="timeAgo(a.last_used_at)"></td>
+                  <td class="py-3 px-4 font-mono text-xs" :class="a.consecutive_errors>0?'text-err':'text-txt-3'" x-text="a.consecutive_errors"></td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+          <div x-show="providerAccounts.length===0" class="p-12 text-center">
+            <span class="material-symbols-outlined text-3xl text-txt-3 mb-2 block">person_off</span>
+            <p class="text-txt-2 text-sm">No accounts in this provider</p>
+            <p class="text-txt-3 text-xs mt-1">Use Harvest to add accounts</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Usage -->
+    <div x-show="page==='usage'" x-transition:enter="transition ease-out duration-250" x-transition:enter-start="opacity-0 translate-y-2" x-transition:enter-end="opacity-100 translate-y-0">
+      <div class="flex items-center justify-between mb-6">
+        <div><h1 class="text-xl font-semibold">Usage</h1><p class="text-xs text-txt-3 mt-1">Today's request statistics</p></div>
+      </div>
+      <div class="grid grid-cols-5 gap-3 mb-6">
+        <div class="bg-surface-2 border border-bdr rounded-xl p-4"><div class="text-[10px] text-txt-3 uppercase mb-1">Requests</div><div class="text-xl font-bold font-mono" x-text="usageStats.total_requests||0"></div></div>
+        <div class="bg-surface-2 border border-bdr rounded-xl p-4"><div class="text-[10px] text-txt-3 uppercase mb-1">Tokens</div><div class="text-xl font-bold font-mono" x-text="formatNum(usageStats.total_tokens||0)"></div></div>
+        <div class="bg-surface-2 border border-bdr rounded-xl p-4"><div class="text-[10px] text-txt-3 uppercase mb-1">Avg Latency</div><div class="text-xl font-bold font-mono" x-text="(usageStats.avg_latency_ms||0)+'ms'"></div></div>
+        <div class="bg-surface-2 border border-bdr rounded-xl p-4"><div class="text-[10px] text-txt-3 uppercase mb-1">Success</div><div class="text-xl font-bold font-mono text-ok" x-text="(usageStats.success_rate||0).toFixed(1)+'%'"></div></div>
+        <div class="bg-surface-2 border border-bdr rounded-xl p-4"><div class="text-[10px] text-txt-3 uppercase mb-1">Errors</div><div class="text-xl font-bold font-mono text-err" x-text="usageStats.error_count||0"></div></div>
+      </div>
+      <div class="bg-surface-2 border border-bdr rounded-xl p-5 mb-6">
+        <div class="text-xs text-txt-3 uppercase tracking-wider mb-3">Requests Over Time</div>
+        <canvas id="usageChartCanvas" height="100"></canvas>
+      </div>
+      <div class="bg-surface-2 border border-bdr rounded-xl overflow-hidden">
+        <div class="px-4 py-3 border-b border-bdr text-xs text-txt-3 uppercase tracking-wider">Recent Requests <span class="text-txt-3/50 normal-case">- click row to expand</span></div>
+        <div x-show="recentUsage.length>0" class="divide-y divide-bdr-light">
+          <template x-for="u in recentUsage.slice(0,30)" :key="u.id">
+            <div>
+              <div @click="toggleUsageDetail(u.id)" class="grid grid-cols-6 gap-4 px-4 py-2 cursor-pointer hover:bg-surface-hover/30 transition-colors text-sm items-center">
+                <div class="font-mono text-xs text-txt-3" x-text="new Date(u.created_at).toLocaleTimeString()"></div>
+                <div class="font-mono text-xs text-brand-light" x-text="u.model"></div>
+                <div class="text-xs text-txt-2 truncate" x-text="u.account_email||'-'"></div>
+                <div class="font-mono text-xs" x-text="(u.tokens_in+u.tokens_out)||'-'"></div>
+                <div class="font-mono text-xs" x-text="u.latency_ms+'ms'"></div>
+                <div><span class="font-mono text-xs" :class="u.status_code>=200&&u.status_code<400?'text-ok':'text-err'" x-text="u.status_code"></span></div>
+              </div>
+              <div x-show="expandedUsageId===u.id" x-transition class="px-4 py-4 bg-surface-1 border-t border-bdr-light">
+                <div x-show="!expandedUsageData" class="text-txt-3 text-xs">Loading...</div>
+                <div x-show="expandedUsageData">
+                  <div class="grid grid-cols-3 gap-4 mb-4 text-xs">
+                    <div><div class="text-txt-3 uppercase tracking-wider text-[10px]">Account</div><div class="font-mono text-txt-1 mt-1" x-text="expandedUsageData?expandedUsageData.account_email||'-':''"></div></div>
+                    <div><div class="text-txt-3 uppercase tracking-wider text-[10px]">Provider</div><div class="font-mono text-txt-1 mt-1" x-text="expandedUsageData?expandedUsageData.provider:''"></div></div>
+                    <div><div class="text-txt-3 uppercase tracking-wider text-[10px]">Tokens</div><div class="font-mono text-txt-1 mt-1" x-text="expandedUsageData?(expandedUsageData.tokens_in+' in / '+expandedUsageData.tokens_out+' out'):''"></div></div>
+                  </div>
+                  <div class="mb-3">
+                    <div class="text-txt-3 uppercase tracking-wider text-[10px] mb-1">Request</div>
+                    <pre class="bg-surface-2 border border-bdr rounded-lg p-3 text-[11px] font-mono text-txt-2 overflow-x-auto max-h-60 whitespace-pre-wrap" x-text="expandedUsageData?prettyJSON(expandedUsageData.request_body):''"></pre>
+                  </div>
+                  <div>
+                    <div class="text-txt-3 uppercase tracking-wider text-[10px] mb-1">Response</div>
+                    <pre class="bg-surface-2 border border-bdr rounded-lg p-3 text-[11px] font-mono text-txt-2 overflow-x-auto max-h-60 whitespace-pre-wrap" x-text="expandedUsageData?prettyJSON(expandedUsageData.response_body):''"></pre>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </template>
+        </div>
+        <div x-show="recentUsage.length===0" class="p-8 text-center text-txt-3 text-xs">No requests yet</div>
+      </div>
+    </div>
+
+    <!-- Keys -->
+    <div x-show="page==='keys'" x-transition:enter="transition ease-out duration-250" x-transition:enter-start="opacity-0 translate-y-2" x-transition:enter-end="opacity-100 translate-y-0">
+      <div class="flex items-center justify-between mb-6">
+        <div><h1 class="text-xl font-semibold">API Keys</h1><p class="text-xs text-txt-3 mt-1">Manage consumer keys</p></div>
+        <button @click="openCreateKey()" class="px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg transition-all">+ Create Key</button>
+      </div>
+      <div class="bg-surface-2 border border-bdr rounded-xl overflow-hidden">
+        <table x-show="keys.length>0" class="w-full text-sm">
+          <thead><tr class="border-b border-bdr text-[11px] text-txt-3 uppercase tracking-wider">
+            <th class="text-left py-3 px-4">Key</th><th class="text-left py-3 px-4">Name</th><th class="text-left py-3 px-4">Status</th><th class="text-left py-3 px-4">Requests</th><th class="text-left py-3 px-4 w-32">Actions</th>
+          </tr></thead>
+          <tbody>
+            <template x-for="k in keys" :key="k.id">
+              <tr class="border-b border-bdr-light hover:bg-surface-hover/30 transition-colors">
+                <td class="py-3 px-4 font-mono text-xs text-txt-2">
+                  <span x-show="!keyVisibility[k.id]" x-text="k.key_prefix + '••••••••••••••••'"></span>
+                  <span x-show="keyVisibility[k.id]" x-text="k.key_prefix + ' (full key only shown once at creation)'"></span>
+                </td>
+                <td class="py-3 px-4" x-text="k.name"></td>
+                <td class="py-3 px-4"><span class="text-[11px] font-medium" :class="k.is_active?'text-ok':'text-err'" x-text="k.is_active?'Active':'Disabled'"></span></td>
+                <td class="py-3 px-4 font-mono text-xs" x-text="k.total_requests"></td>
+                <td class="py-3 px-4">
+                  <div class="flex items-center gap-1">
+                    <button @click="toggleKeyVisibility(k.id)" class="text-txt-3 hover:text-brand-light p-1" :title="keyVisibility[k.id]?'Hide':'Show'">
+                      <span class="material-symbols-outlined text-[16px]" x-text="keyVisibility[k.id]?'visibility_off':'visibility'"></span>
+                    </button>
+                    <button @click="copyKeyPrefix(k.key_prefix)" class="text-txt-3 hover:text-brand-light p-1" title="Copy prefix">
+                      <span class="material-symbols-outlined text-[16px]">content_copy</span>
+                    </button>
+                    <button @click="deleteKey(k.id)" class="text-txt-3 hover:text-err p-1" title="Delete">
+                      <span class="material-symbols-outlined text-[16px]">delete</span>
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+        <div x-show="keys.length===0" class="p-12 text-center">
+          <span class="material-symbols-outlined text-3xl text-txt-3 mb-2 block">key_off</span>
+          <p class="text-txt-2 text-sm">No API keys</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Integrations -->
+    <div x-show="page==='integrations'" x-transition:enter="transition ease-out duration-250" x-transition:enter-start="opacity-0 translate-y-2" x-transition:enter-end="opacity-100 translate-y-0">
+
+      <!-- Grid View -->
+      <div x-show="!integrationDetail">
+        <div class="mb-6"><h1 class="text-xl font-semibold">Integrations</h1><p class="text-xs text-txt-3 mt-1">Configure CLI tools to use LIAM</p></div>
+        <div class="grid grid-cols-3 gap-4">
+          <template x-for="t in integrations" :key="t.name">
+            <div @click="openIntegration(t.name)" class="bg-surface-2 border border-bdr rounded-xl p-5 hover:border-brand transition-all cursor-pointer group">
+              <div class="flex items-start justify-between mb-3">
+                <div class="flex items-center gap-3">
+                  <div class="w-10 h-10 bg-surface-1 border border-bdr rounded-lg flex items-center justify-center">
+                    <span class="material-symbols-outlined text-brand-light text-[20px]" x-text="t.icon"></span>
+                  </div>
+                  <div>
+                    <div class="font-semibold text-sm" x-text="t.display_name"></div>
+                    <div class="flex items-center gap-1.5 mt-0.5">
+                      <span class="w-1.5 h-1.5 rounded-full" :class="t.has_liam?'bg-ok':t.installed?'bg-warn':'bg-txt-3'"></span>
+                      <span class="text-[11px]" :class="t.has_liam?'text-ok':t.installed?'text-warn':'text-txt-3'" x-text="t.has_liam?'Connected':t.installed?'Not configured':!t.supports_auto_apply?'Manual setup':'Not installed'"></span>
+                    </div>
+                  </div>
+                </div>
+                <span class="material-symbols-outlined text-txt-3 group-hover:text-brand-light transition-all">arrow_forward</span>
+              </div>
+              <div class="text-[11px] text-txt-3" x-text="t.description"></div>
+            </div>
+          </template>
+        </div>
+      </div>
+
+      <!-- Detail View -->
+      <div x-show="integrationDetail && integrationDetailData">
+        <button @click="closeIntegration()" class="flex items-center gap-2 text-txt-3 hover:text-txt-1 mb-4 text-sm transition-all">
+          <span class="material-symbols-outlined text-[18px]">arrow_back</span> Back to Integrations
+        </button>
+
+        <div class="mb-6">
+          <h1 class="text-xl font-semibold" x-text="integrationDetailData?.display_name"></h1>
+          <p class="text-txt-3 text-xs mt-1" x-text="integrationDetailData?.description"></p>
+        </div>
+
+        <div class="bg-surface-2 border border-bdr rounded-xl p-6">
+          <div class="flex items-center gap-3 mb-5 pb-4 border-b border-bdr-light">
+            <div class="w-10 h-10 bg-surface-1 border border-bdr rounded-lg flex items-center justify-center">
+              <span class="material-symbols-outlined text-brand-light text-[20px]" x-text="integrationDetailData?.icon"></span>
+            </div>
+            <div class="flex-1">
+              <div class="font-semibold text-sm flex items-center gap-2" >
+                <span x-text="integrationDetailData?.display_name"></span>
+                <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium" :class="integrationDetailData?.has_liam?'bg-ok/15 text-ok':integrationDetailData?.installed?'bg-warn/15 text-warn':'bg-txt-3/15 text-txt-3'">
+                  <span x-text="integrationDetailData?.has_liam?'Connected':integrationDetailData?.installed?'Not configured':'Not installed'"></span>
+                </span>
+              </div>
+              <div class="text-[11px] text-txt-3 font-mono mt-1" x-text="integrationDetailData?.config_path"></div>
+            </div>
+          </div>
+
+          <!-- Configuration form -->
+          <div class="space-y-4">
+            <!-- Endpoint -->
+            <div class="grid grid-cols-[140px_1fr] gap-4 items-center">
+              <label class="text-xs text-txt-2 flex items-center gap-1">Select Endpoint <span class="material-symbols-outlined text-[14px] text-txt-3">arrow_forward</span></label>
+              <div>
+                <select x-show="!integrationConfig.use_custom_url" x-model="integrationConfig.base_url" @change="if(integrationConfig.base_url==='__custom__'){integrationConfig.use_custom_url=true;integrationConfig.custom_url='';}else{refreshSnippet();}" class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm font-mono text-txt-1 focus:outline-none focus:border-brand">
+                  <option :value="defaultBaseURL" x-text="defaultBaseURL+' (Local)'"></option>
+                  <template x-for="p in savedPresets" :key="p">
+                    <option :value="p" x-text="p"></option>
+                  </template>
+                  <option value="__custom__">Custom URL...</option>
+                </select>
+                <div x-show="integrationConfig.use_custom_url" class="flex gap-2">
+                  <input x-model="integrationConfig.custom_url" @input.debounce.500ms="refreshSnippet()" placeholder="https://liam.example.com/v1" class="flex-1 px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm font-mono text-txt-1 focus:outline-none focus:border-brand">
+                  <button @click="integrationConfig.use_custom_url=false;integrationConfig.base_url=defaultBaseURL;refreshSnippet();" class="px-3 py-2 bg-surface-1 border border-bdr text-txt-3 hover:text-txt-1 text-xs rounded-lg">Cancel</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- Current -->
+            <div class="grid grid-cols-[140px_1fr] gap-4 items-center">
+              <label class="text-xs text-txt-2 flex items-center gap-1">Current <span class="material-symbols-outlined text-[14px] text-txt-3">arrow_forward</span></label>
+              <code class="text-xs font-mono text-brand-light" x-text="integrationConfig.use_custom_url?integrationConfig.custom_url:integrationConfig.base_url"></code>
+            </div>
+
+            <!-- API Key -->
+            <div class="grid grid-cols-[140px_1fr] gap-4 items-center">
+              <label class="text-xs text-txt-2 flex items-center gap-1">API Key <span class="material-symbols-outlined text-[14px] text-txt-3">arrow_forward</span></label>
+              <div>
+                <select x-show="keys.length > 0 && !integrationConfig.api_key.startsWith('li-')" x-model="integrationConfig.api_key" @change="refreshSnippet()" class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm font-mono text-txt-1 focus:outline-none focus:border-brand">
+                  <option value="">-- Select an API key --</option>
+                  <template x-for="k in keys" :key="k.id">
+                    <option :value="k.key_prefix+'...'" x-text="k.key_prefix+'... ('+k.name+')'"></option>
+                  </template>
+                  <option value="__custom__">Custom...</option>
+                </select>
+                <input x-show="integrationConfig.api_key === '__custom__' || (integrationConfig.api_key.startsWith('li-') && !integrationConfig.api_key.endsWith('...'))" x-model="integrationConfig.api_key" @input.debounce.500ms="refreshSnippet()" placeholder="li-..." class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm font-mono text-txt-1 focus:outline-none focus:border-brand">
+                <p x-show="keys.length === 0" class="text-[11px] text-txt-3 mt-1">No API keys yet. Create one in the Keys page.</p>
+              </div>
+            </div>
+
+            <!-- Model Slots -->
+            <template x-for="slot in (integrationDetailData?.model_slots || [])" :key="slot.key">
+              <div class="grid grid-cols-[140px_1fr] gap-4 items-center">
+                <label class="text-xs text-txt-2 flex items-center gap-1"><span x-text="slot.label"></span> <span class="material-symbols-outlined text-[14px] text-txt-3">arrow_forward</span></label>
+                <div class="flex gap-2">
+                  <input x-model="integrationConfig.models[slot.key]" @input.debounce.500ms="refreshSnippet()" :placeholder="slot.default" class="flex-1 px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm font-mono text-txt-1 focus:outline-none focus:border-brand">
+                  <button @click="openModelSelect(integrationDetail, slot.key, integrationConfig.models[slot.key])" class="px-3 py-2 bg-brand hover:bg-brand-dark text-white text-xs rounded-lg transition-all whitespace-nowrap">Select Model</button>
+                </div>
+              </div>
+            </template>
+
+            <div class="flex items-center gap-2 pt-3 border-t border-bdr-light">
+              <button x-show="integrationDetailData?.supports_auto_apply" @click="applyIntegration()" class="px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg transition-all flex items-center gap-2">
+                <span class="material-symbols-outlined text-[16px]">save</span> Apply
+              </button>
+              <button x-show="integrationDetailData?.has_liam" @click="resetIntegration()" class="px-4 py-2 bg-surface-1 border border-bdr text-txt-2 hover:text-err hover:border-err text-sm rounded-lg transition-all flex items-center gap-2">
+                <span class="material-symbols-outlined text-[16px]">restart_alt</span> Reset
+              </button>
+              <button @click="openManualConfig()" class="px-4 py-2 bg-surface-1 border border-bdr text-txt-2 hover:text-brand-light hover:border-brand text-sm rounded-lg transition-all flex items-center gap-2">
+                <span class="material-symbols-outlined text-[16px]">content_copy</span> Manual Config
+              </button>
+              <span x-show="integrationApplyMsg" class="text-xs ml-2" :class="integrationApplyOk?'text-ok':'text-err'" x-text="integrationApplyMsg"></span>
+            </div>
+          </div>
+
+          <!-- Snippet Preview -->
+          <div class="mt-5 pt-4 border-t border-bdr-light">
+            <div class="flex items-center justify-between mb-2">
+              <div class="text-[10px] text-txt-3 uppercase tracking-wider">Configuration Preview</div>
+              <button @click="copyText(integrationSnippet)" class="text-[11px] text-txt-3 hover:text-brand-light flex items-center gap-1">
+                <span class="material-symbols-outlined text-[14px]">content_copy</span> Copy
+              </button>
+            </div>
+            <pre class="bg-surface-1 border border-bdr rounded-lg p-3 text-[11px] font-mono text-txt-2 overflow-x-auto max-h-64 whitespace-pre-wrap" x-text="integrationSnippet"></pre>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Harvest -->
+    <div x-show="page==='harvest'" x-transition:enter="transition ease-out duration-250" x-transition:enter-start="opacity-0 translate-y-2" x-transition:enter-end="opacity-100 translate-y-0">
+      <div class="mb-6"><h1 class="text-xl font-semibold">Harvest</h1><p class="text-xs text-txt-3 mt-1">Batch login Google accounts</p></div>
+      <div class="bg-surface-2 border border-bdr rounded-xl p-6 mb-4">
+        <div class="grid grid-cols-3 gap-4 mb-4">
+          <div><div class="text-[10px] text-txt-3 uppercase mb-1.5">Provider</div><select x-model="harvest.provider" class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm text-txt-1 focus:outline-none focus:border-brand"><option value="ag">Antigravity</option></select></div>
+          <div><div class="text-[10px] text-txt-3 uppercase mb-1.5">Concurrency</div><select x-model="harvest.concurrency" class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm text-txt-1 focus:outline-none focus:border-brand"><option>1</option><option>2</option><option>3</option><option selected>4</option><option>6</option><option>8</option></select></div>
+          <div><div class="text-[10px] text-txt-3 uppercase mb-1.5">Mode</div><select x-model="harvest.headless" class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm text-txt-1 focus:outline-none focus:border-brand"><option value="false">Headed</option><option value="true">Headless</option></select></div>
+        </div>
+        <textarea x-model="harvest.accounts" rows="5" class="w-full px-4 py-3 bg-surface-1 border border-bdr rounded-lg text-xs font-mono text-txt-1 placeholder-txt-3 focus:outline-none focus:border-brand resize-y" placeholder="email1@gmail.com:password123&#10;email2@gmail.com:password456"></textarea>
+        <div class="flex items-center justify-between mt-3">
+          <span class="text-[11px] text-txt-3" x-text="harvestAccountCount+' accounts'"></span>
+          <div class="flex gap-2">
+            <button @click="startHarvest()" class="px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg transition-all">Start</button>
+            <button @click="stopHarvest()" class="px-4 py-2 bg-surface-1 border border-bdr text-txt-2 text-sm rounded-lg hover:text-err hover:border-err transition-all">Stop</button>
+          </div>
+        </div>
+      </div>
+      <div x-show="harvestStatus.total>0||harvestStatus.running" class="bg-surface-2 border border-bdr rounded-xl p-6 mb-4">
+        <div class="flex items-center justify-between mb-4">
+          <span class="text-xs text-txt-3 uppercase tracking-wider">Progress</span>
+          <span x-show="harvestStatus.running" class="text-[11px] text-ok flex items-center gap-1.5"><span class="w-1.5 h-1.5 rounded-full bg-ok animate-pulse"></span>Running</span>
+          <span x-show="!harvestStatus.running&&harvestStatus.total>0" class="text-[11px] text-txt-3">Done</span>
+        </div>
+        <div class="grid grid-cols-3 gap-3 mb-4">
+          <div class="bg-surface-1 border border-bdr rounded-lg p-3 text-center"><div class="text-[10px] text-txt-3 uppercase">Success</div><div class="text-lg font-bold font-mono text-ok" x-text="harvestStatus.success"></div></div>
+          <div class="bg-surface-1 border border-bdr rounded-lg p-3 text-center"><div class="text-[10px] text-txt-3 uppercase">Failed</div><div class="text-lg font-bold font-mono text-err" x-text="harvestStatus.failed"></div></div>
+          <div class="bg-surface-1 border border-bdr rounded-lg p-3 text-center"><div class="text-[10px] text-txt-3 uppercase">Total</div><div class="text-lg font-bold font-mono" x-text="harvestStatus.total"></div></div>
+        </div>
+      </div>
+      <div x-show="harvestStatus.accounts && harvestStatus.accounts.length>0" class="bg-surface-2 border border-bdr rounded-xl overflow-hidden mb-4">
+        <div class="px-4 py-3 border-b border-bdr text-xs text-txt-3 uppercase tracking-wider">Per-Account Status</div>
+        <table class="w-full text-sm">
+          <thead><tr class="border-b border-bdr text-[11px] text-txt-3 uppercase tracking-wider">
+            <th class="text-left py-2 px-4 w-12">#</th><th class="text-left py-2 px-4">Email</th><th class="text-left py-2 px-4">Status</th><th class="text-left py-2 px-4">Time</th><th class="text-left py-2 px-4">Detail</th>
+          </tr></thead>
+          <tbody>
+            <template x-for="(a, i) in harvestStatus.accounts" :key="i">
+              <tr class="border-b border-bdr-light">
+                <td class="py-2 px-4 text-txt-3 font-mono text-xs" x-text="i+1"></td>
+                <td class="py-2 px-4 font-mono text-xs" x-text="a.email"></td>
+                <td class="py-2 px-4">
+                  <span class="text-[11px] font-medium flex items-center gap-1.5" :class="a.status==='success'?'text-ok':a.status==='failed'?'text-err':a.status==='running'?'text-warn':'text-txt-3'">
+                    <span class="w-1.5 h-1.5 rounded-full" :class="a.status==='success'?'bg-ok':a.status==='failed'?'bg-err':a.status==='running'?'bg-warn animate-pulse':'bg-txt-3'"></span>
+                    <span x-text="a.status"></span>
+                  </span>
+                </td>
+                <td class="py-2 px-4 font-mono text-xs text-txt-3" x-text="a.time_sec>0?a.time_sec+'s':'-'"></td>
+                <td class="py-2 px-4 text-xs text-txt-2" x-text="a.detail||'-'"></td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+      <div x-show="harvestStatus.logs && harvestStatus.logs.length>0" class="bg-surface-2 border border-bdr rounded-xl p-4">
+        <div class="text-xs text-txt-3 uppercase tracking-wider mb-3">Logs</div>
+        <div class="bg-surface-1 border border-bdr rounded-lg p-3 max-h-48 overflow-y-auto font-mono text-[11px] leading-relaxed">
+          <template x-for="(log,i) in harvestStatus.logs" :key="i">
+            <div class="py-0.5" :class="log.startsWith('SUCCESS')?'text-ok':log.startsWith('FAILED')||log.startsWith('ERROR')?'text-err':'text-txt-3'" x-text="log"></div>
+          </template>
+        </div>
+      </div>
+    </div>
+
+    <!-- Settings -->
+    <div x-show="page==='settings'" x-transition:enter="transition ease-out duration-250" x-transition:enter-start="opacity-0 translate-y-2" x-transition:enter-end="opacity-100 translate-y-0">
+      <div class="mb-6"><h1 class="text-xl font-semibold">Settings</h1><p class="text-xs text-txt-3 mt-1">Dashboard configuration</p></div>
+      <div class="bg-surface-2 border border-bdr rounded-xl p-6 max-w-md">
+        <div class="text-xs text-txt-3 uppercase tracking-wider mb-4">Change Password</div>
+        <input type="password" x-model="settings.currentPw" placeholder="Current password" class="w-full px-4 py-2.5 bg-surface-1 border border-bdr rounded-lg text-sm text-txt-1 placeholder-txt-3 focus:outline-none focus:border-brand mb-3">
+        <input type="password" x-model="settings.newPw" placeholder="New password" class="w-full px-4 py-2.5 bg-surface-1 border border-bdr rounded-lg text-sm text-txt-1 placeholder-txt-3 focus:outline-none focus:border-brand mb-3">
+        <button @click="changePassword()" class="px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg transition-all">Update</button>
+        <div x-show="settings.msg" class="mt-3 text-xs" :class="settings.ok?'text-ok':'text-err'" x-text="settings.msg"></div>
+      </div>
+    </div>
+
+    </div>
+  </main>
+</div>
+
+<!-- Add Model Modal -->
+<div x-show="showAddModelModal" x-cloak class="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center" @click.self="closeAddModel()">
+  <div class="bg-surface-2 border border-bdr rounded-xl p-6 w-[480px] shadow-2xl">
+    <div class="flex items-center justify-between mb-5">
+      <h2 class="text-base font-semibold">Add Custom Model</h2>
+      <button @click="closeAddModel()" class="text-txt-3 hover:text-txt-1"><span class="material-symbols-outlined text-[20px]">close</span></button>
+    </div>
+    <div class="space-y-3">
+      <div>
+        <label class="text-[10px] text-txt-3 uppercase mb-1.5 block">Provider</label>
+        <select x-model="newModel.provider_alias" class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm text-txt-1 focus:outline-none focus:border-brand">
+          <option value="ag">Antigravity (ag)</option>
+        </select>
+      </div>
+      <div>
+        <label class="text-[10px] text-txt-3 uppercase mb-1.5 block">Model ID</label>
+        <input x-model="newModel.model_id" placeholder="e.g. claude-4-7-preview" class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm font-mono text-txt-1 placeholder-txt-3 focus:outline-none focus:border-brand">
+      </div>
+      <div>
+        <label class="text-[10px] text-txt-3 uppercase mb-1.5 block">Display Name</label>
+        <input x-model="newModel.display_name" placeholder="e.g. Claude 4.7 Preview" class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm text-txt-1 placeholder-txt-3 focus:outline-none focus:border-brand">
+      </div>
+      <div>
+        <label class="text-[10px] text-txt-3 uppercase mb-1.5 block">Type</label>
+        <select x-model="newModel.type" class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm text-txt-1 focus:outline-none focus:border-brand">
+          <option value="llm">LLM (Chat)</option>
+          <option value="image">Image</option>
+          <option value="embedding">Embedding</option>
+        </select>
+      </div>
+      <div x-show="newModelTestResult" class="px-3 py-2 rounded-lg text-xs" :class="newModelTestResult?.ok?'bg-ok/10 text-ok':'bg-err/10 text-err'">
+        <span x-show="newModelTestResult?.ok" x-text="'Working ('+newModelTestResult.latency_ms+'ms)'"></span>
+        <span x-show="newModelTestResult && !newModelTestResult.ok" x-text="'Failed: ' + (newModelTestResult.error || 'Unknown error')"></span>
+      </div>
+    </div>
+    <div class="flex items-center justify-between gap-2 mt-5">
+      <button @click="testNewModel()" :disabled="!newModel.model_id || newModelTesting" class="px-4 py-2 bg-surface-1 border border-bdr text-txt-2 hover:text-brand-light hover:border-brand text-sm rounded-lg transition-all disabled:opacity-50 flex items-center gap-1.5">
+        <span x-show="!newModelTesting" class="material-symbols-outlined text-[14px]">play_arrow</span>
+        <span x-show="newModelTesting" class="material-symbols-outlined text-[14px] animate-spin">progress_activity</span>
+        <span x-text="newModelTesting?'Testing...':'Test Model'"></span>
+      </button>
+      <div class="flex gap-2">
+        <button @click="closeAddModel()" class="px-4 py-2 bg-surface-1 border border-bdr text-txt-2 text-sm rounded-lg hover:text-txt-1">Cancel</button>
+        <button @click="submitAddModel()" :disabled="!newModel.model_id" class="px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg transition-all disabled:opacity-50">Add Model</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Create Key Modal -->
+<div x-show="showCreateKeyModal" x-cloak class="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center" @click.self="closeCreateKey()">
+  <div class="bg-surface-2 border border-bdr rounded-xl p-6 w-[480px] shadow-2xl">
+    <div class="flex items-center justify-between mb-5">
+      <h2 class="text-base font-semibold" x-text="createdKey ? 'API Key Created' : 'Create API Key'"></h2>
+      <button @click="closeCreateKey()" class="text-txt-3 hover:text-txt-1"><span class="material-symbols-outlined text-[20px]">close</span></button>
+    </div>
+
+    <div x-show="!createdKey" class="space-y-3">
+      <div>
+        <label class="text-[10px] text-txt-3 uppercase mb-1.5 block">Name</label>
+        <input x-model="newKeyName" @keydown.enter="submitCreateKey()" placeholder="e.g. main, dev, production" class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm text-txt-1 placeholder-txt-3 focus:outline-none focus:border-brand">
+      </div>
+      <div class="flex justify-end gap-2 mt-5">
+        <button @click="closeCreateKey()" class="px-4 py-2 bg-surface-1 border border-bdr text-txt-2 text-sm rounded-lg hover:text-txt-1">Cancel</button>
+        <button @click="submitCreateKey()" :disabled="!newKeyName.trim()" class="px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg transition-all disabled:opacity-50">Create</button>
+      </div>
+    </div>
+
+    <div x-show="createdKey" class="space-y-3">
+      <div class="bg-ok/10 border border-ok/30 rounded-lg p-4">
+        <div class="text-xs text-ok mb-2 font-medium">Key created — save it now!</div>
+        <div class="flex items-center gap-2">
+          <code class="flex-1 text-xs font-mono text-txt-1 bg-surface-1 px-3 py-2 rounded-lg border border-bdr break-all" x-text="createdKey"></code>
+          <button @click="copyText(createdKey)" class="px-3 py-2 bg-brand hover:bg-brand-dark text-white text-xs rounded-lg transition-all">Copy</button>
+        </div>
+        <p class="text-[11px] text-txt-3 mt-2">This key won't be shown again. Save it somewhere safe.</p>
+      </div>
+      <div class="flex justify-end mt-5">
+        <button @click="closeCreateKey()" class="px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg">Done</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Model Select Modal -->
+<div x-show="showModelSelectModal" x-cloak class="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center" @click.self="showModelSelectModal=false">
+  <div class="bg-surface-2 border border-bdr rounded-xl p-6 w-[640px] max-h-[80vh] flex flex-col shadow-2xl">
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="text-base font-semibold">Select Model</h2>
+      <button @click="showModelSelectModal=false" class="text-txt-3 hover:text-txt-1"><span class="material-symbols-outlined text-[20px]">close</span></button>
+    </div>
+    <input x-model="modelSelectSearch" placeholder="Search models..." class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm text-txt-1 placeholder-txt-3 focus:outline-none focus:border-brand mb-4">
+    <div class="flex-1 overflow-y-auto space-y-4">
+      <template x-for="(models, provider) in filteredModelGroups" :key="provider">
+        <div>
+          <div class="text-[10px] text-txt-3 uppercase tracking-wider mb-2" x-text="provider + ' ('+models.length+')'"></div>
+          <div class="grid grid-cols-2 gap-2">
+            <template x-for="m in models" :key="m.id">
+              <button @click="selectModel(m.id)" class="text-left p-3 rounded-lg border transition-all" :class="modelSelectCurrent===m.id?'bg-brand/10 border-brand text-brand-light':'bg-surface-1 border-bdr hover:border-brand text-txt-1'">
+                <div class="font-mono text-xs truncate" x-text="m.id"></div>
+                <div class="text-[10px] text-txt-3 mt-0.5 truncate" x-text="m.display_name"></div>
+              </button>
+            </template>
+          </div>
+        </div>
+      </template>
+      <div x-show="Object.keys(filteredModelGroups).length===0" class="text-center text-txt-3 text-sm py-8">No models found</div>
+    </div>
+  </div>
+</div>
+
+<!-- Manual Config Modal -->
+<div x-show="showManualConfigModal" x-cloak class="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center" @click.self="showManualConfigModal=false">
+  <div class="bg-surface-2 border border-bdr rounded-xl p-6 w-[720px] max-h-[80vh] flex flex-col shadow-2xl">
+    <div class="flex items-center justify-between mb-4">
+      <div>
+        <h2 class="text-base font-semibold" x-text="manualConfigTool + ' - Manual Configuration'"></h2>
+        <p class="text-[11px] text-txt-3 font-mono mt-1" x-text="manualConfigPath"></p>
+      </div>
+      <button @click="showManualConfigModal=false" class="text-txt-3 hover:text-txt-1"><span class="material-symbols-outlined text-[20px]">close</span></button>
+    </div>
+    <pre class="bg-surface-1 border border-bdr rounded-lg p-4 text-[11px] font-mono text-txt-2 overflow-auto flex-1 whitespace-pre-wrap" x-text="manualConfigContent"></pre>
+    <div class="flex justify-end gap-2 mt-4">
+      <button @click="copyText(manualConfigContent)" class="px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg flex items-center gap-2">
+        <span class="material-symbols-outlined text-[16px]">content_copy</span> Copy to Clipboard
+      </button>
+      <button @click="showManualConfigModal=false" class="px-4 py-2 bg-surface-1 border border-bdr text-txt-2 text-sm rounded-lg hover:text-txt-1">Close</button>
+    </div>
+  </div>
+</div>
+
+<script src="/dashboard/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,93 @@
+:root {
+  --bg-1: #1a1a1e;
+  --bg-2: #222226;
+  --bg-3: #2a2a2f;
+  --bg-hover: #32323a;
+  --bg-active: #3a3a44;
+  --text-1: #e8e8ec;
+  --text-2: #a0a0a8;
+  --text-3: #5c5c66;
+  --accent: #922b21;
+  --accent-hover: #7b241c;
+  --accent-light: #c0392b;
+  --accent-glow: rgba(146, 43, 33, 0.12);
+  --success: #27ae60;
+  --warning: #d4a017;
+  --danger: #c0392b;
+  --border: #333338;
+  --border-light: #2a2a2f;
+}
+
+/* Page transitions */
+@keyframes fadeSlideUp {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.page-transition {
+  animation: fadeSlideUp 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.animate-fadeIn { animation: fadeIn 0.2s ease forwards; }
+
+/* Smooth sidebar */
+.sidebar {
+  transition: width 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--bg-active); }
+
+[x-cloak] { display: none !important; }
+
+/* Active nav indicator */
+.nav-active {
+  background: var(--accent-glow);
+  color: var(--text-1);
+  position: relative;
+}
+.nav-active::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 6px;
+  bottom: 6px;
+  width: 3px;
+  background: var(--accent);
+  border-radius: 0 2px 2px 0;
+}
+
+/* Buttons hover */
+button { transition: all 0.15s ease; }
+
+canvas { max-height: 200px; }
+
+/* Tooltip for collapsed sidebar */
+.nav-item-collapsed { position: relative; }
+.nav-item-collapsed:hover .nav-tooltip {
+  opacity: 1;
+  visibility: visible;
+}
+.nav-tooltip {
+  position: absolute;
+  left: calc(100% + 8px);
+  top: 50%;
+  transform: translateY(-50%);
+  background: var(--bg-2);
+  color: var(--text-1);
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  white-space: nowrap;
+  opacity: 0;
+  visibility: hidden;
+  transition: all 0.15s;
+  pointer-events: none;
+  z-index: 100;
+  border: 1px solid var(--border);
+}

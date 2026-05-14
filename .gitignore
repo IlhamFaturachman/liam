@@ -1,0 +1,47 @@
+# Build artifacts
+bin/
+liam
+*.exe
+*.bak
+*.bak.*
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+data.db
+
+# Logs
+*.log
+/tmp/liam.log
+
+# Local data dir
+.liam/
+
+# Python (harvest module)
+harvest/venv/
+harvest/__pycache__/
+harvest/**/__pycache__/
+harvest/**/*.pyc
+harvest/results/
+harvest/.pytest_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Secrets / env
+.env
+.env.local
+*.pem
+*.key
+
+# Backups
+*.bak
+backups/
