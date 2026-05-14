@@ -121,10 +121,24 @@ func (s *Server) HandleUsageDetail(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleProviderStats returns per-provider statistics
+// Always includes known providers (antigravity, kiro) even if 0 accounts
 func (s *Server) HandleProviderStats(w http.ResponseWriter, r *http.Request) {
 	accounts, _ := s.db.ListAccounts("")
 
+	// Initialize with known providers (always shown)
+	knownProviders := []string{"antigravity", "kiro"}
 	providers := map[string]map[string]interface{}{}
+	for _, p := range knownProviders {
+		providers[p] = map[string]interface{}{
+			"name":     p,
+			"total":    0,
+			"active":   0,
+			"cooldown": 0,
+			"disabled": 0,
+		}
+	}
+
+	// Tally account stats
 	for _, a := range accounts {
 		p := a.Provider
 		if _, ok := providers[p]; !ok {
@@ -147,7 +161,12 @@ func (s *Server) HandleProviderStats(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Return ordered: known providers first, custom after
 	result := []map[string]interface{}{}
+	for _, p := range knownProviders {
+		result = append(result, providers[p])
+		delete(providers, p)
+	}
 	for _, v := range providers {
 		result = append(result, v)
 	}

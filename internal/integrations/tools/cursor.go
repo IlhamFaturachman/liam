@@ -1,6 +1,10 @@
 package integrations
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+	"runtime"
+)
 
 type Cursor struct{}
 
@@ -18,11 +22,47 @@ func (c *Cursor) ModelSlots() []ModelSlot {
 	}
 }
 
+// detectInstalled checks for Cursor app/binary on common install paths
+func (c *Cursor) detectInstalled() bool {
+	// Check binary in PATH first
+	if IsBinaryInstalled("cursor") {
+		return true
+	}
+	// Check macOS app bundles
+	if runtime.GOOS == "darwin" {
+		paths := []string{
+			"/Applications/Cursor.app",
+			ExpandHome("~/Applications/Cursor.app"),
+		}
+		for _, p := range paths {
+			if _, err := os.Stat(p); err == nil {
+				return true
+			}
+		}
+	}
+	// Check Linux/Windows config dir
+	configDirs := []string{
+		ExpandHome("~/.config/Cursor"),
+		ExpandHome("~/Library/Application Support/Cursor"),
+	}
+	for _, d := range configDirs {
+		if _, err := os.Stat(d); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *Cursor) Status() (*ToolStatus, error) {
+	installed := c.detectInstalled()
+	configPath := "Manual setup"
+	if !installed {
+		configPath = "Not installed"
+	}
 	return &ToolStatus{
 		Name: c.Name(), DisplayName: c.DisplayName(), Description: c.Description(), Icon: c.Icon(),
-		Installed: true, HasLiam: false,
-		ConfigPath: "Manual setup", ConfigExists: false,
+		Installed: installed, HasLiam: false,
+		ConfigPath: configPath, ConfigExists: false,
 		SupportsAutoApply: false, ModelSlots: c.ModelSlots(),
 	}, nil
 }
@@ -37,7 +77,9 @@ func (c *Cursor) Reset() error {
 
 func (c *Cursor) Snippet(cfg ToolConfig) string {
 	model := cfg.Models["primary"]
-	if model == "" { model = "ag/claude-opus-4-6-thinking" }
+	if model == "" {
+		model = "ag/claude-opus-4-6-thinking"
+	}
 	return fmt.Sprintf(`Cursor → Settings → Models → OpenAI API:
 
   Override OpenAI Base URL: %s

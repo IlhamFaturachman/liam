@@ -1,6 +1,10 @@
 package integrations
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+)
 
 type Cline struct{}
 
@@ -18,11 +22,46 @@ func (c *Cline) ModelSlots() []ModelSlot {
 	}
 }
 
+// detectInstalled checks for Cline VSCode extension installation
+func (c *Cline) detectInstalled() bool {
+	// VSCode extension paths - look for any folder starting with "saoudrizwan.claude-dev-"
+	extensionDirs := []string{
+		ExpandHome("~/.vscode/extensions"),
+		ExpandHome("~/.vscode-insiders/extensions"),
+		ExpandHome("~/.cursor/extensions"),
+		ExpandHome("~/.windsurf/extensions"),
+	}
+	for _, dir := range extensionDirs {
+		if entries, err := os.ReadDir(dir); err == nil {
+			for _, e := range entries {
+				if e.IsDir() {
+					name := e.Name()
+					// Cline extension ID
+					if len(name) > 21 && name[:21] == "saoudrizwan.claude-dev" {
+						return true
+					}
+				}
+			}
+		}
+	}
+	// Also check Cline data directory (older versions)
+	dataDir := ExpandHome("~/.cline")
+	if _, err := os.Stat(filepath.Join(dataDir, "data")); err == nil {
+		return true
+	}
+	return false
+}
+
 func (c *Cline) Status() (*ToolStatus, error) {
+	installed := c.detectInstalled()
+	configPath := "Manual (VSCode extension)"
+	if !installed {
+		configPath = "Not installed"
+	}
 	return &ToolStatus{
 		Name: c.Name(), DisplayName: c.DisplayName(), Description: c.Description(), Icon: c.Icon(),
-		Installed: true, HasLiam: false,
-		ConfigPath: "Manual (VSCode extension)", ConfigExists: false,
+		Installed: installed, HasLiam: false,
+		ConfigPath: configPath, ConfigExists: false,
 		SupportsAutoApply: false, ModelSlots: c.ModelSlots(),
 	}, nil
 }
@@ -37,7 +76,9 @@ func (c *Cline) Reset() error {
 
 func (c *Cline) Snippet(cfg ToolConfig) string {
 	model := cfg.Models["primary"]
-	if model == "" { model = "ag/claude-opus-4-6-thinking" }
+	if model == "" {
+		model = "ag/claude-opus-4-6-thinking"
+	}
 	return fmt.Sprintf(`Cline (VSCode extension) → Settings:
 
   API Provider: OpenAI Compatible

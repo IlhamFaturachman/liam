@@ -70,7 +70,7 @@ func Start(cfg *config.Config, database *db.Database) error {
 	r := chi.NewRouter()
 
 	// Middleware
-	r.Use(middleware.Logger)
+	r.Use(quietLogger)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(120 * time.Second))
 	r.Use(cors.Handler(cors.Options{
@@ -465,6 +465,22 @@ func stripThinkingFromRequest(req map[string]interface{}) {
 		delete(extra, "thinking")
 		delete(extra, "thinking_config")
 	}
+}
+
+// quietLogger is a chi middleware that logs requests except for noisy polling endpoints
+func quietLogger(next http.Handler) http.Handler {
+	logger := middleware.Logger(next)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Skip logging for noisy polling endpoints
+		if r.URL.Path == "/api/harvest/status" ||
+			r.URL.Path == "/sse/requests" ||
+			r.URL.Path == "/api/usage/recent" ||
+			r.URL.Path == "/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		logger.ServeHTTP(w, r)
+	})
 }
 
 // --- Health ---

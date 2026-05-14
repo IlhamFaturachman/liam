@@ -24,7 +24,7 @@ tailwind.config={theme:{extend:{colors:{
 <body class="bg-surface-1 text-txt-1 font-sans min-h-screen" x-data="app()" x-init="init()">
 
 <!-- Login -->
-<div x-show="!authenticated" x-transition.opacity class="min-h-screen flex items-center justify-center bg-surface-1">
+<div x-show="authChecked && !authenticated" x-cloak x-transition.opacity class="min-h-screen flex items-center justify-center bg-surface-1">
   <div class="absolute inset-0 bg-[radial-gradient(ellipse_at_top,rgba(146,43,33,0.06),transparent_60%)]"></div>
   <div class="relative bg-surface-2 border border-bdr rounded-2xl p-10 w-[380px] text-center shadow-2xl">
     <div class="text-3xl font-extrabold text-white mb-1">LIAM</div>
@@ -155,7 +155,7 @@ tailwind.config={theme:{extend:{colors:{
         <div class="bg-surface-2 border border-bdr rounded-xl p-6 mb-5">
           <div class="flex items-center justify-between mb-4">
             <h2 class="text-sm font-semibold">Available Models</h2>
-            <button @click="openAddModel(providerDetail==='antigravity'?'ag':providerDetail)" class="text-xs text-brand-light hover:text-brand flex items-center gap-1.5">
+            <button @click="openAddModel(providerNameToAlias(providerDetail))" class="text-xs text-brand-light hover:text-brand flex items-center gap-1.5">
               <span class="material-symbols-outlined text-[16px]">add</span> Add Model
             </button>
           </div>
@@ -182,7 +182,7 @@ tailwind.config={theme:{extend:{colors:{
                 </div>
               </div>
             </template>
-            <div @click="openAddModel(providerDetail==='antigravity'?'ag':providerDetail)" class="border-2 border-dashed border-bdr rounded-lg p-3 hover:border-brand cursor-pointer transition-all flex items-center justify-center text-txt-3 hover:text-brand-light min-h-[100px]">
+            <div @click="openAddModel(providerNameToAlias(providerDetail))" class="border-2 border-dashed border-bdr rounded-lg p-3 hover:border-brand cursor-pointer transition-all flex items-center justify-center text-txt-3 hover:text-brand-light min-h-[100px]">
               <span class="text-[12px] flex items-center gap-1.5">
                 <span class="material-symbols-outlined text-[16px]">add</span> Add Model
               </span>
@@ -415,15 +415,20 @@ tailwind.config={theme:{extend:{colors:{
             <div class="grid grid-cols-[140px_1fr] gap-4 items-center">
               <label class="text-xs text-txt-2 flex items-center gap-1">API Key <span class="material-symbols-outlined text-[14px] text-txt-3">arrow_forward</span></label>
               <div>
-                <select x-show="keys.length > 0 && !integrationConfig.api_key.startsWith('li-')" x-model="integrationConfig.api_key" @change="refreshSnippet()" class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm font-mono text-txt-1 focus:outline-none focus:border-brand">
-                  <option value="">-- Select an API key --</option>
-                  <template x-for="k in keys" :key="k.id">
-                    <option :value="k.key_prefix+'...'" x-text="k.key_prefix+'... ('+k.name+')'"></option>
-                  </template>
-                  <option value="__custom__">Custom...</option>
-                </select>
-                <input x-show="integrationConfig.api_key === '__custom__' || (integrationConfig.api_key.startsWith('li-') && !integrationConfig.api_key.endsWith('...'))" x-model="integrationConfig.api_key" @input.debounce.500ms="refreshSnippet()" placeholder="li-..." class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm font-mono text-txt-1 focus:outline-none focus:border-brand">
-                <p x-show="keys.length === 0" class="text-[11px] text-txt-3 mt-1">No API keys yet. Create one in the Keys page.</p>
+                <div x-show="!integrationConfig.api_key_custom" class="flex gap-2">
+                  <select x-model="integrationConfig.api_key" @change="refreshSnippet()" class="flex-1 px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm font-mono text-txt-1 focus:outline-none focus:border-brand">
+                    <option value="">-- Select an API key --</option>
+                    <template x-for="k in keys" :key="k.id">
+                      <option :value="k.key_prefix+'...'" x-text="k.key_prefix+'... ('+k.name+')'"></option>
+                    </template>
+                  </select>
+                  <button @click="integrationConfig.api_key_custom=true;integrationConfig.api_key='';" class="px-3 py-2 bg-surface-1 border border-bdr text-txt-2 hover:text-brand-light hover:border-brand text-xs rounded-lg transition-all whitespace-nowrap">Custom Key</button>
+                </div>
+                <div x-show="integrationConfig.api_key_custom" class="flex gap-2">
+                  <input x-model="integrationConfig.api_key" @input.debounce.500ms="refreshSnippet()" placeholder="li-..." class="flex-1 px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm font-mono text-txt-1 focus:outline-none focus:border-brand">
+                  <button @click="integrationConfig.api_key_custom=false;integrationConfig.api_key='';refreshSnippet();" class="px-3 py-2 bg-surface-1 border border-bdr text-txt-3 hover:text-txt-1 text-xs rounded-lg whitespace-nowrap">Cancel</button>
+                </div>
+                <p x-show="keys.length === 0 && !integrationConfig.api_key_custom" class="text-[11px] text-txt-3 mt-1">No API keys yet. Create one in the Keys page or click "Custom Key" to enter manually.</p>
               </div>
             </div>
 
@@ -533,7 +538,42 @@ tailwind.config={theme:{extend:{colors:{
     <!-- Settings -->
     <div x-show="page==='settings'" x-transition:enter="transition ease-out duration-250" x-transition:enter-start="opacity-0 translate-y-2" x-transition:enter-end="opacity-100 translate-y-0">
       <div class="mb-6"><h1 class="text-xl font-semibold">Settings</h1><p class="text-xs text-txt-3 mt-1">Dashboard configuration</p></div>
-      <div class="bg-surface-2 border border-bdr rounded-xl p-6 max-w-md">
+
+      <!-- Base URL -->
+      <div class="bg-surface-2 border border-bdr rounded-xl p-6 max-w-2xl mb-4">
+        <div class="text-xs text-txt-3 uppercase tracking-wider mb-2">Public Base URL</div>
+        <p class="text-[12px] text-txt-3 mb-4 leading-relaxed">
+          Used when generating CLI tool configs (Integrations page). Set this when LIAM is exposed
+          via VPS, reverse proxy, or tunnel (e.g. <code class="text-txt-2">https://liam.myserver.com/v1</code>)
+          so external tools can reach LIAM. Leave empty to use localhost (default for local-only setups).
+        </p>
+        <div class="flex gap-2 mb-2">
+          <input x-model="baseURL" placeholder="http://localhost:666/v1" class="flex-1 px-4 py-2.5 bg-surface-1 border border-bdr rounded-lg text-sm font-mono text-txt-1 placeholder-txt-3 focus:outline-none focus:border-brand">
+          <button @click="saveSettingsBaseURL()" class="px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg transition-all">Save</button>
+          <button @click="resetSettingsBaseURL()" class="px-4 py-2 bg-surface-1 border border-bdr text-txt-2 hover:text-txt-1 text-sm rounded-lg transition-all">Reset</button>
+        </div>
+        <p class="text-[11px] text-txt-3">Default: <code class="text-txt-2" x-text="defaultBaseURL"></code></p>
+        <div x-show="baseURLMsg" class="mt-3 text-xs" :class="baseURLOk?'text-ok':'text-err'" x-text="baseURLMsg"></div>
+      </div>
+
+      <!-- Saved Presets -->
+      <div x-show="savedPresets.length > 0" class="bg-surface-2 border border-bdr rounded-xl p-6 max-w-2xl mb-4">
+        <div class="text-xs text-txt-3 uppercase tracking-wider mb-3">Saved URL Presets</div>
+        <p class="text-[12px] text-txt-3 mb-3">URLs you've saved (used in Integrations endpoint dropdown).</p>
+        <div class="space-y-2">
+          <template x-for="(p, i) in savedPresets" :key="i">
+            <div class="flex items-center gap-2">
+              <code class="flex-1 px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-xs font-mono text-txt-1" x-text="p"></code>
+              <button @click="deletePreset(p)" class="text-txt-3 hover:text-err p-1.5">
+                <span class="material-symbols-outlined text-[16px]">delete</span>
+              </button>
+            </div>
+          </template>
+        </div>
+      </div>
+
+      <!-- Password -->
+      <div class="bg-surface-2 border border-bdr rounded-xl p-6 max-w-2xl">
         <div class="text-xs text-txt-3 uppercase tracking-wider mb-4">Change Password</div>
         <input type="password" x-model="settings.currentPw" placeholder="Current password" class="w-full px-4 py-2.5 bg-surface-1 border border-bdr rounded-lg text-sm text-txt-1 placeholder-txt-3 focus:outline-none focus:border-brand mb-3">
         <input type="password" x-model="settings.newPw" placeholder="New password" class="w-full px-4 py-2.5 bg-surface-1 border border-bdr rounded-lg text-sm text-txt-1 placeholder-txt-3 focus:outline-none focus:border-brand mb-3">
@@ -558,6 +598,7 @@ tailwind.config={theme:{extend:{colors:{
         <label class="text-[10px] text-txt-3 uppercase mb-1.5 block">Provider</label>
         <select x-model="newModel.provider_alias" class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm text-txt-1 focus:outline-none focus:border-brand">
           <option value="ag">Antigravity (ag)</option>
+          <option value="kr">Kiro (kr)</option>
         </select>
       </div>
       <div>

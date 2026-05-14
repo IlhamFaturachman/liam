@@ -1,6 +1,7 @@
 function app() {
   return {
     authenticated: false,
+    authChecked: false,
     password: '',
     loginError: '',
     token: '',
@@ -66,6 +67,8 @@ function app() {
     // Base URL settings
     baseURL: '',
     defaultBaseURL: '',
+    baseURLMsg: '',
+    baseURLOk: null,
     savedPresets: [],
 
     // Model Select Modal
@@ -135,7 +138,11 @@ function app() {
       this.token = localStorage.getItem('liam_token') || '';
       this.sidebarCollapsed = localStorage.getItem('liam_sidebar_collapsed') === '1';
       this.loadPresets();
-      if (this.token) this.verifyToken();
+      if (this.token) {
+        this.verifyToken();
+      } else {
+        this.authChecked = true;
+      }
     },
 
     loadPresets() {
@@ -171,6 +178,7 @@ function app() {
         this.token = d.token;
         localStorage.setItem('liam_token', d.token);
         this.authenticated = true;
+        this.authChecked = true;
         this.password = '';
         this.loadAll();
       } catch (e) { this.loginError = 'Connection error'; }
@@ -181,6 +189,7 @@ function app() {
         if (r.ok) { this.authenticated = true; this.loadAll(); }
         else { localStorage.removeItem('liam_token'); this.token = ''; }
       } catch (e) { this.authenticated = true; this.loadAll(); }
+      finally { this.authChecked = true; }
     },
     logout() { localStorage.removeItem('liam_token'); this.token = ''; this.authenticated = false; if (this.sse) this.sse.close(); },
 
@@ -247,10 +256,15 @@ function app() {
     },
 
     // Provider detail
+    providerNameToAlias(name) {
+      if (name === 'antigravity') return 'ag';
+      if (name === 'kiro') return 'kr';
+      return name;
+    },
     async openProvider(name) {
       this.providerDetail = name;
       this.providerAccounts = this.accounts.filter(a => a.provider === name);
-      const alias = name === 'antigravity' ? 'ag' : name;
+      const alias = this.providerNameToAlias(name);
       try {
         const r = await fetch('/api/models?provider=' + alias);
         if (r.ok) this.providerModels = await r.json() || [];
@@ -325,7 +339,7 @@ function app() {
     },
     async refreshProviderModels() {
       if (!this.providerDetail) return;
-      const alias = this.providerDetail === 'antigravity' ? 'ag' : this.providerDetail;
+      const alias = this.providerNameToAlias(this.providerDetail);
       try {
         const r = await fetch('/api/providers/' + alias + '/refresh-models', { method: 'POST' });
         const d = await r.json();
@@ -459,6 +473,7 @@ function app() {
         base_url: this.baseURL || ('http://localhost:' + location.port + '/v1'),
         api_key: firstKey ? firstKey.key_prefix + '...' : '',
         api_key_id: firstKey ? firstKey.id : '',
+        api_key_custom: false,
         models: {},
         agent_models: {},
         use_custom_url: false,
@@ -508,13 +523,14 @@ function app() {
       } catch (e) {}
     },
     getActualApiKey() {
-      // If user typed custom key (starts with li-), use it as-is
-      if (this.integrationConfig.api_key && this.integrationConfig.api_key.startsWith('li-')
-          && !this.integrationConfig.api_key.endsWith('...')) {
-        return this.integrationConfig.api_key;
+      const k = this.integrationConfig.api_key || '';
+      // Custom mode: use as-is (must start with li-)
+      if (this.integrationConfig.api_key_custom) {
+        return k;
       }
-      // Otherwise fall back to placeholder
-      return this.integrationConfig.api_key || '<YOUR_KEY>';
+      // Selected from dropdown (ends with '...'): user must switch to custom mode for actual full key
+      // Return prefix as-is (apply will reject if invalid)
+      return k || '<YOUR_KEY>';
     },
     async applyIntegration() {
       if (!this.integrationDetail) return;
@@ -596,7 +612,7 @@ function app() {
       this.showModelSelectModal = false;
     },
 
-    // Save base URL
+    // Save base URL (from integrations page custom URL flow)
     async saveBaseURL() {
       const url = this.integrationConfig.use_custom_url
         ? this.integrationConfig.custom_url
@@ -611,6 +627,52 @@ function app() {
       } catch (e) {}
     },
 
+    // Save base URL from settings page
+    async saveSettingsBaseURL() {
+      this.baseURLMsg = '';
+      try {
+        const r = await fetch('/api/settings/base-url', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({base_url: this.baseURL || ''})
+        });
+        if (r.ok) {
+          this.baseURLMsg = 'Saved';
+          this.baseURLOk = true;
+          await this.fetchBaseURL();
+          if (this.baseURL && !this.savedPresets.includes(this.baseURL)) {
+            this.savePreset(this.baseURL);
+          }
+        } else {
+          const d = await r.json();
+          this.baseURLMsg = d.error?.message || 'Failed';
+          this.baseURLOk = false;
+        }
+      } catch (e) {
+        this.baseURLMsg = 'Connection error';
+        this.baseURLOk = false;
+      }
+      setTimeout(() => { this.baseURLMsg = ''; }, 4000);
+    },
+
+    async resetSettingsBaseURL() {
+      this.baseURL = '';
+      try {
+        await fetch('/api/settings/base-url', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({base_url: ''})
+        });
+        await this.fetchBaseURL();
+        this.baseURLMsg = 'Reset to default';
+        this.baseURLOk = true;
+      } catch (e) {
+        this.baseURLMsg = 'Connection error';
+        this.baseURLOk = false;
+      }
+      setTimeout(() => { this.baseURLMsg = ''; }, 4000);
+    },
+
     // Harvest
     async startHarvest() {
       if (!this.harvest.accounts.trim()) { alert('Paste accounts first'); return; }
@@ -621,17 +683,27 @@ function app() {
     async stopHarvest() { await fetch('/api/harvest/stop', { method: 'POST' }); },
     startHarvestPoll() {
       if (this.harvestPoll) clearInterval(this.harvestPoll);
-      this.harvestPoll = setInterval(async () => {
-        try {
-          const r = await fetch('/api/harvest/status');
-          if (r.ok) {
-            this.harvestStatus = await r.json();
-            if (!this.harvestStatus.logs) this.harvestStatus.logs = [];
-            if (!this.harvestStatus.accounts) this.harvestStatus.accounts = [];
-            if (!this.harvestStatus.running && this.harvestStatus.success > 0) { this.fetchAccounts(); this.fetchStats(); this.fetchProviders(); this.buildOverviewStats(); }
-          }
-        } catch (e) {}
+      // Initial fetch to know current state
+      this.fetchHarvestStatus();
+      // Smart polling: only run when needed
+      this.harvestPoll = setInterval(() => {
+        // Skip if not running AND not on harvest page
+        if (!this.harvestStatus.running && this.page !== 'harvest') return;
+        this.fetchHarvestStatus();
       }, 2000);
+    },
+    async fetchHarvestStatus() {
+      try {
+        const r = await fetch('/api/harvest/status');
+        if (r.ok) {
+          this.harvestStatus = await r.json();
+          if (!this.harvestStatus.logs) this.harvestStatus.logs = [];
+          if (!this.harvestStatus.accounts) this.harvestStatus.accounts = [];
+          if (!this.harvestStatus.running && this.harvestStatus.success > 0) {
+            this.fetchAccounts(); this.fetchStats(); this.fetchProviders(); this.buildOverviewStats();
+          }
+        }
+      } catch (e) {}
     },
 
     // Settings
