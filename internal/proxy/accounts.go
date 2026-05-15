@@ -362,30 +362,6 @@ func (s *Server) handleRefreshQuota(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleGetAccountLocks returns active model locks for an account
-func (s *Server) handleGetAccountLocks(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	if id == "" {
-		writeError(w, 400, "missing id")
-		return
-	}
-
-	locks := s.db.GetModelLocks(id)
-	result := []map[string]interface{}{}
-	now := time.Now().UTC()
-	for model, until := range locks {
-		remaining := until.Sub(now)
-		if remaining > 0 {
-			result = append(result, map[string]interface{}{
-				"model":     model,
-				"until":     until.Format(time.RFC3339),
-				"remaining": int(remaining.Seconds()),
-			})
-		}
-	}
-	writeJSON(w, 200, result)
-}
-
 // handleSetExcludedModels sets excluded model patterns for an account
 func (s *Server) handleSetExcludedModels(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")

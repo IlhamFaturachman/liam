@@ -184,7 +184,7 @@ func (s *Server) HandleOverview(w http.ResponseWriter, r *http.Request) {
 	stats, _ := s.db.GetUsageStats(period)
 	topModels, _ := s.db.GetTopModels(period, 5)
 	recentErrors, _ := s.db.GetRecentErrors(5)
-	activeLocks, _ := s.db.CountActiveModelLocks()
+	backoffActive, _ := s.db.CountAccountsInBackoff()
 	keys, _ := s.db.ListAPIKeys()
 
 	writeJSON(w, 200, map[string]interface{}{
@@ -193,7 +193,7 @@ func (s *Server) HandleOverview(w http.ResponseWriter, r *http.Request) {
 		"stats":          stats,
 		"top_models":     topModels,
 		"recent_errors":  recentErrors,
-		"active_locks":   activeLocks,
+		"backoff_active": backoffActive,
 		"api_keys_total": len(keys),
 		"sync":           s.syncer.Status(),
 		"server_time":    time.Now().UTC().Format(time.RFC3339),

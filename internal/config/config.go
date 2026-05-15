@@ -109,7 +109,7 @@ func Load() *Config {
 		},
 
 		// Anti-ban (conservative defaults for longevity)
-		MaxRetriesPerRequest: 3,
+		MaxRetriesPerRequest: 5,
 		// Reactive cooldown still runs unconditionally; pre-emptive
 		// throttling is opt-in via these knobs. Default 0 = unlimited
 		// (matches 9router's "non-stop coding" UX).

@@ -39,6 +39,7 @@ type Account struct {
 	ConsecutiveErrors int             `json:"consecutive_errors"`
 	LastError         string          `json:"last_error,omitempty"`
 	CooldownUntil     *time.Time      `json:"cooldown_until,omitempty"`
+	BackoffLevel      int             `json:"backoff_level,omitempty"`
 	LastUsedAt        *time.Time      `json:"last_used_at,omitempty"`
 	LastLoginAt       *time.Time      `json:"last_login_at,omitempty"`
 	Metadata          json.RawMessage `json:"metadata,omitempty"`
@@ -258,6 +259,12 @@ func (d *Database) migrate() error {
 		"ALTER TABLE accounts ADD COLUMN plan TEXT DEFAULT ''",
 		"ALTER TABLE accounts ADD COLUMN auth_method TEXT DEFAULT ''",
 		"ALTER TABLE accounts ADD COLUMN quota_breakdown TEXT DEFAULT '{}'",
+		// Tracks the per-account 429 backoff level (matches 9router):
+		// every rate-limit hit bumps the level (cooldown 2s, 4s, 8s, …
+		// up to 5 min); a successful request resets it to 0. Replaces
+		// the much harsher per-(account, model) lockout the proxy used
+		// to do which made single-account users 503 within minutes.
+		"ALTER TABLE accounts ADD COLUMN backoff_level INTEGER DEFAULT 0",
 	}
 	for _, stmt := range alterStatements {
 		d.db.Exec(stmt) // Ignore errors (column already exists)
@@ -334,7 +341,8 @@ func (d *Database) ListAccounts(provider string) ([]Account, error) {
 
 	const baseSelect = `SELECT id, provider, email, status, credentials, quota_total, quota_remaining,
 		quota_reset_at, plan, auth_method, quota_breakdown,
-		consecutive_errors, last_error, created_at, updated_at FROM accounts`
+		consecutive_errors, last_error, cooldown_until,
+		COALESCE(backoff_level, 0), created_at, updated_at FROM accounts`
 
 	if provider == "" {
 		rows, err = d.db.Query(baseSelect + " ORDER BY provider, email")
@@ -349,12 +357,14 @@ func (d *Database) ListAccounts(provider string) ([]Account, error) {
 	var accounts []Account
 	for rows.Next() {
 		var a Account
-		var creds, lastErr, plan, authMethod, breakdown, quotaResetAt sql.NullString
+		var creds, lastErr, plan, authMethod, breakdown, quotaResetAt, cooldownUntil sql.NullString
 		var createdAt, updatedAt sql.NullString
+		var backoffLevel int
 		err := rows.Scan(&a.ID, &a.Provider, &a.Email, &a.Status, &creds,
 			&a.QuotaTotal, &a.QuotaRemaining,
 			&quotaResetAt, &plan, &authMethod, &breakdown,
-			&a.ConsecutiveErrors, &lastErr, &createdAt, &updatedAt)
+			&a.ConsecutiveErrors, &lastErr, &cooldownUntil,
+			&backoffLevel, &createdAt, &updatedAt)
 		if err != nil {
 			return nil, err
 		}
@@ -393,6 +403,17 @@ func (d *Database) ListAccounts(provider string) ([]Account, error) {
 				a.QuotaResetAt = &t
 			}
 		}
+		// cooldown_until drives the per-account "in cooldown" badge on
+		// the dashboard. Stale rows (cooldown_until in the past) are
+		// still surfaced — the UI hides the badge once the timestamp
+		// lapses without us needing to clear the column.
+		if cooldownUntil.Valid && cooldownUntil.String != "" {
+			t, errParse := time.Parse(time.RFC3339Nano, cooldownUntil.String)
+			if errParse == nil {
+				a.CooldownUntil = &t
+			}
+		}
+		a.BackoffLevel = backoffLevel
 		if createdAt.Valid {
 			a.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt.String)
 		}
@@ -454,7 +475,12 @@ func (d *Database) MarkAccountUsed(id string) error {
 	return err
 }
 
-// MarkAccountError increments error count and optionally sets cooldown
+// MarkAccountError records the latest failure on an account and optionally
+// puts it on cooldown. Auto-disable is intentionally NOT applied here —
+// 9router's reference implementation never auto-disables, and our previous
+// "disable after 10 consecutive errors" rule turned routine 429s into
+// permanent blackouts for users with one or two accounts. Operators can
+// still mark accounts disabled manually from the dashboard.
 func (d *Database) MarkAccountError(id string, errMsg string, cooldownSecs int) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 
@@ -469,17 +495,68 @@ func (d *Database) MarkAccountError(id string, errMsg string, cooldownSecs int) 
 			consecutive_errors = consecutive_errors + 1,
 			last_error = ?,
 			cooldown_until = COALESCE(?, cooldown_until),
-			status = CASE WHEN consecutive_errors + 1 >= 10 THEN 'disabled' ELSE status END,
 			updated_at = ?
 		WHERE id = ?`, errMsg, cooldown, now, id)
 	return err
 }
 
-// MarkAccountSuccess resets error count
+// BumpBackoff bumps the per-account 429 backoff level by one (capped at
+// `maxLevel`) and writes the resulting cooldown window to the account
+// row. Returns the new level so callers can log it. Mirrors 9router's
+// `getQuotaCooldown` schedule: 2s, 4s, 8s, 16s, …, capped at 5 min.
+func (d *Database) BumpBackoff(id string, maxLevel int, baseSec int, maxSec int) (int, error) {
+	if maxLevel <= 0 {
+		maxLevel = 15
+	}
+	if baseSec <= 0 {
+		baseSec = 2
+	}
+	if maxSec <= 0 {
+		maxSec = 5 * 60
+	}
+
+	var current int
+	if err := d.db.QueryRow(`SELECT COALESCE(backoff_level, 0) FROM accounts WHERE id = ?`, id).Scan(&current); err != nil {
+		return 0, err
+	}
+	next := current + 1
+	if next > maxLevel {
+		next = maxLevel
+	}
+
+	// Exponential schedule capped at maxSec.
+	cooldownSec := baseSec
+	for i := 1; i < next; i++ {
+		cooldownSec *= 2
+		if cooldownSec >= maxSec {
+			cooldownSec = maxSec
+			break
+		}
+	}
+
+	now := time.Now().UTC()
+	cooldownUntil := now.Add(time.Duration(cooldownSec) * time.Second).Format(time.RFC3339Nano)
+	_, err := d.db.Exec(`
+		UPDATE accounts SET
+			backoff_level = ?,
+			cooldown_until = ?,
+			updated_at = ?
+		WHERE id = ?`, next, cooldownUntil, now.Format(time.RFC3339Nano), id)
+	return next, err
+}
+
+// MarkAccountSuccess resets error count and the 429 backoff level. We
+// always clear backoff on success so an account that recovers from a
+// rough patch isn't permanently stuck at the longest cooldown step.
 func (d *Database) MarkAccountSuccess(id string) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	_, err := d.db.Exec(`
-		UPDATE accounts SET consecutive_errors = 0, last_error = NULL, status = 'active', updated_at = ?
+		UPDATE accounts SET
+			consecutive_errors = 0,
+			last_error = NULL,
+			backoff_level = 0,
+			status = CASE WHEN status = 'disabled' THEN status ELSE 'active' END,
+			updated_at = ?
 		WHERE id = ?`, now, id)
 	return err
 }
@@ -1132,24 +1209,20 @@ func (d *Database) GetRecentErrors(limit int) ([]RecentErrorEntry, error) {
 	return out, nil
 }
 
-// CountActiveModelLocks returns how many `(account, model)` pairs are
-// still in cooldown across all accounts. Useful as a quick health
-// signal: a high lock count means many accounts are throttled and the
-// system is degrading.
-func (d *Database) CountActiveModelLocks() (int, error) {
-	accounts, err := d.ListAccounts("")
+// CountAccountsInBackoff returns how many accounts currently have an
+// active per-account cooldown (cooldown_until in the future). Used as
+// a quick health signal on the dashboard overview page; replaces the
+// older CountActiveModelLocks now that per-(account, model) locks are
+// gone.
+func (d *Database) CountAccountsInBackoff() (int, error) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	var count int
+	err := d.db.QueryRow(`
+		SELECT COUNT(*) FROM accounts
+		WHERE cooldown_until IS NOT NULL
+			AND cooldown_until > ?`, now).Scan(&count)
 	if err != nil {
 		return 0, err
-	}
-	now := time.Now().UTC()
-	count := 0
-	for _, a := range accounts {
-		locks := d.GetModelLocks(a.ID)
-		for _, until := range locks {
-			if until.After(now) {
-				count++
-			}
-		}
 	}
 	return count, nil
 }
@@ -1246,44 +1319,10 @@ func (d *Database) ReorderAccounts(ids []string) error {
 	return nil
 }
 
-// SetModelLock locks an account for a specific model until a given time
-func (d *Database) SetModelLock(accountID, model string, until time.Time) error {
-	// Read current locks
-	var locksJSON string
-	d.db.QueryRow("SELECT model_locks FROM accounts WHERE id = ?", accountID).Scan(&locksJSON)
-
-	locks := map[string]string{}
-	if locksJSON != "" {
-		json.Unmarshal([]byte(locksJSON), &locks)
-	}
-
-	locks[model] = until.Format(time.RFC3339Nano)
-
-	newJSON, _ := json.Marshal(locks)
-	_, err := d.db.Exec("UPDATE accounts SET model_locks = ? WHERE id = ?", string(newJSON), accountID)
-	return err
-}
-
-// GetModelLocks returns current model locks for an account
-func (d *Database) GetModelLocks(accountID string) map[string]time.Time {
-	var locksJSON string
-	d.db.QueryRow("SELECT model_locks FROM accounts WHERE id = ?", accountID).Scan(&locksJSON)
-
-	raw := map[string]string{}
-	if locksJSON != "" {
-		json.Unmarshal([]byte(locksJSON), &raw)
-	}
-
-	result := map[string]time.Time{}
-	now := time.Now().UTC()
-	for model, untilStr := range raw {
-		t, err := time.Parse(time.RFC3339Nano, untilStr)
-		if err == nil && t.After(now) {
-			result[model] = t
-		}
-	}
-	return result
-}
+// SetModelLock and GetModelLocks were removed in favour of per-account
+// cooldown_until + backoff_level. The model_locks column is preserved
+// in the schema for backward compatibility with older binaries but is
+// no longer read or written.
 
 // UpdateConsecutiveUseCount updates the consecutive use count for an account
 func (d *Database) UpdateConsecutiveUseCount(id string, count int) error {

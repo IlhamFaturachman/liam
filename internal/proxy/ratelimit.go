@@ -7,127 +7,179 @@ import (
 	"time"
 )
 
-// RateLimitCategory classifies different types of rate limit responses
-type RateLimitCategory int
-
+// Backoff schedule constants — match 9router/open-sse/config/errorConfig.js
+// BACKOFF_CONFIG = { base: 2000ms, max: 5min, maxLevel: 15 }.
+//
+// Replaces the previous 4-category Categorize429 state machine that put
+// accounts on long cooldowns + per-(account, model) locks for any
+// unrecognised 429 — that caused single-account users to 503 within
+// minutes of normal coding.
 const (
-	// SoftRetry — transient blip, retry immediately same account
-	SoftRetry RateLimitCategory = iota
-	// InstantRetrySameAuth — tiny delay (100-500ms), same account
-	InstantRetrySameAuth
-	// ShortCooldownSwitch — 5-30s cooldown on this account, switch to another
-	ShortCooldownSwitch
-	// FullQuotaExhausted — 5-30min cooldown, account done for this model
-	FullQuotaExhausted
+	BackoffBaseMs       = 2000
+	BackoffMaxMs        = 5 * 60 * 1000
+	BackoffMaxLevel     = 15
+	TransientCooldownMs = 30 * 1000
+	LongCooldownMs      = 2 * 60 * 1000
+	ShortCooldownMs     = 5 * 1000
+
+	// Hard cap on Retry-After / provider-supplied cooldowns so a wildly
+	// long upstream value (e.g. codex resets_at 6h) doesn't take an
+	// account out of rotation for the rest of the session.
+	MaxRateLimitCooldownMs = 30 * 60 * 1000
 )
 
-// RateLimitDecision holds the categorization result
-type RateLimitDecision struct {
-	Category RateLimitCategory
-	Cooldown time.Duration
-	Reason   string
+// ErrorDecision describes how the proxy should handle an upstream failure.
+//
+//   - UseBackoff = true: bump the per-account backoff_level via
+//     db.BumpBackoff and use BackoffCooldown(level) for the wait.
+//   - UseBackoff = false: apply CooldownMs as a fixed cooldown via
+//     db.MarkAccountError.
+//
+// In both cases the caller switches to a different account when more
+// than one is registered for the provider, and otherwise sleeps in
+// place and retries the same account.
+type ErrorDecision struct {
+	UseBackoff bool
+	CooldownMs time.Duration
+	Reason     string
 }
 
-// Categorize429 analyzes a rate limit response and returns handling decision
-func Categorize429(statusCode int, body []byte, headers http.Header) RateLimitDecision {
+// errorRule mirrors one entry of 9router's ERROR_RULES table. Order
+// matters: text rules are evaluated first (high → low priority), then
+// status rules as a fallback.
+type errorRule struct {
+	text       string
+	status     int
+	backoff    bool
+	cooldownMs int
+}
+
+// errorRules ports 9router/open-sse/config/errorConfig.js::ERROR_RULES
+// 1:1. Keep these aligned: any change to upstream behaviour should be
+// reflected in both forks.
+var errorRules = []errorRule{
+	// --- Text-based rules (checked first, order = priority) ---
+	{text: "no credentials", cooldownMs: LongCooldownMs},
+	{text: "request not allowed", cooldownMs: ShortCooldownMs},
+	{text: "improperly formed request", cooldownMs: LongCooldownMs},
+	{text: "rate limit", backoff: true},
+	{text: "too many requests", backoff: true},
+	{text: "quota exceeded", backoff: true},
+	{text: "capacity", backoff: true},
+	{text: "overloaded", backoff: true},
+
+	// --- Status-based rules (fallback when text doesn't match) ---
+	{status: 401, cooldownMs: LongCooldownMs},
+	{status: 402, cooldownMs: LongCooldownMs},
+	{status: 403, cooldownMs: LongCooldownMs},
+	{status: 404, cooldownMs: LongCooldownMs},
+	{status: 429, backoff: true},
+}
+
+// ClassifyError classifies an upstream failure into a backoff/cooldown
+// decision. Matches text rules first, then status rules. Anything that
+// doesn't match falls back to a 30 s transient cooldown so unknown
+// failure modes still rotate accounts without permanently sidelining
+// any single one.
+//
+// The Retry-After header (if present and parseable) overrides the
+// rule's fixed cooldown — providers know best how long until retry is
+// safe. We still cap at MaxRateLimitCooldownMs.
+func ClassifyError(status int, body []byte, headers http.Header) ErrorDecision {
 	bodyStr := strings.ToLower(string(body))
 
-	// 1. Check for quota exhaustion keywords (most severe)
-	if containsAny(bodyStr, "quota_exhausted", "resource_exhausted", "quota exceeded", "billing", "credits") {
-		cooldown := parseRetryDuration(headers, bodyStr)
-		if cooldown == 0 {
-			cooldown = 5 * time.Minute
+	for _, rule := range errorRules {
+		if rule.text != "" && strings.Contains(bodyStr, rule.text) {
+			return ruleToDecision(rule, headers)
 		}
-		if cooldown > 30*time.Minute {
-			cooldown = 30 * time.Minute
-		}
-		return RateLimitDecision{
-			Category: FullQuotaExhausted,
-			Cooldown: cooldown,
-			Reason:   "quota_exhausted",
+		if rule.status != 0 && rule.status == status {
+			return ruleToDecision(rule, headers)
 		}
 	}
 
-	// 2. Check Retry-After header
-	if retryAfter := headers.Get("Retry-After"); retryAfter != "" {
-		duration := parseRetryAfterHeader(retryAfter)
-		if duration <= 500*time.Millisecond {
-			return RateLimitDecision{Category: InstantRetrySameAuth, Cooldown: duration, Reason: "retry_after_short"}
-		}
-		if duration <= 30*time.Second {
-			return RateLimitDecision{Category: ShortCooldownSwitch, Cooldown: duration, Reason: "retry_after_medium"}
-		}
-		return RateLimitDecision{Category: FullQuotaExhausted, Cooldown: duration, Reason: "retry_after_long"}
+	// Default: transient cooldown for any unmatched error, including
+	// 5xx upstream failures and network blips. Caller still rotates to
+	// the next account.
+	return ErrorDecision{
+		UseBackoff: false,
+		CooldownMs: time.Duration(TransientCooldownMs) * time.Millisecond,
+		Reason:     "transient",
+	}
+}
+
+func ruleToDecision(rule errorRule, headers http.Header) ErrorDecision {
+	reason := ruleReason(rule)
+
+	if rule.backoff {
+		// Backoff rules ignore Retry-After: the per-account level is
+		// the authority. The caller computes the wait after bumping
+		// the level via BackoffCooldown.
+		return ErrorDecision{UseBackoff: true, Reason: reason}
 	}
 
-	// 3. Check for soft rate limit keywords (least severe)
-	if containsAny(bodyStr, "rate_limited", "rate limit", "too many requests", "slow down") &&
-		!containsAny(bodyStr, "quota", "exhausted", "exceeded") {
-		return RateLimitDecision{
-			Category: SoftRetry,
-			Cooldown: 100 * time.Millisecond,
-			Reason:   "soft_rate_limit",
-		}
-	}
-
-	// 4. Check for "reset after" time in body (AG-specific)
-	if resetDuration := parseResetAfterFromBody(bodyStr); resetDuration > 0 {
-		if resetDuration <= 10*time.Second {
-			return RateLimitDecision{Category: ShortCooldownSwitch, Cooldown: resetDuration, Reason: "reset_after_short"}
-		}
-		return RateLimitDecision{Category: FullQuotaExhausted, Cooldown: resetDuration, Reason: "reset_after_long"}
-	}
-
-	// 5. Check x-ratelimit headers
-	if remaining := headers.Get("x-ratelimit-remaining"); remaining == "0" {
-		resetStr := headers.Get("x-ratelimit-reset")
-		if resetStr != "" {
-			ts, err := strconv.ParseInt(resetStr, 10, 64)
-			if err == nil {
-				cooldown := time.Until(time.Unix(ts, 0))
-				if cooldown <= 0 {
-					cooldown = 5 * time.Second
-				}
-				if cooldown <= 30*time.Second {
-					return RateLimitDecision{Category: ShortCooldownSwitch, Cooldown: cooldown, Reason: "ratelimit_reset"}
-				}
-				return RateLimitDecision{Category: FullQuotaExhausted, Cooldown: cooldown, Reason: "ratelimit_reset_long"}
+	cooldown := time.Duration(rule.cooldownMs) * time.Millisecond
+	if ra := headers.Get("Retry-After"); ra != "" {
+		if d := parseRetryAfter(ra); d > 0 {
+			capDuration := time.Duration(MaxRateLimitCooldownMs) * time.Millisecond
+			if d > capDuration {
+				d = capDuration
 			}
+			cooldown = d
 		}
 	}
-
-	// 6. Default: short cooldown + switch
-	return RateLimitDecision{
-		Category: ShortCooldownSwitch,
-		Cooldown: 10 * time.Second,
-		Reason:   "unknown_429",
-	}
+	return ErrorDecision{UseBackoff: false, CooldownMs: cooldown, Reason: reason}
 }
 
-// --- Helpers ---
+func ruleReason(rule errorRule) string {
+	if rule.text != "" {
+		return rule.text
+	}
+	if rule.status != 0 {
+		return "status_" + strconv.Itoa(rule.status)
+	}
+	return "transient"
+}
 
-func containsAny(s string, keywords ...string) bool {
-	for _, kw := range keywords {
-		if strings.Contains(s, kw) {
-			return true
+// BackoffCooldown returns the exponential cooldown for a given backoff
+// level. Mirrors 9router's getQuotaCooldown:
+//
+//	level 1: 2 s, 2: 4 s, 3: 8 s, 4: 16 s, …, capped at 5 min.
+//
+// Level 0 (or below) is treated as level 1 — callers should always
+// bump the level before computing the wait.
+func BackoffCooldown(level int) time.Duration {
+	if level < 1 {
+		level = 1
+	}
+	if level > BackoffMaxLevel {
+		level = BackoffMaxLevel
+	}
+	ms := BackoffBaseMs
+	for i := 1; i < level; i++ {
+		ms *= 2
+		if ms >= BackoffMaxMs {
+			return time.Duration(BackoffMaxMs) * time.Millisecond
 		}
 	}
-	return false
+	return time.Duration(ms) * time.Millisecond
 }
 
-func parseRetryAfterHeader(value string) time.Duration {
-	// Try seconds (integer)
+// parseRetryAfter accepts seconds (integer or float), milliseconds
+// (float < 1000), or HTTP date. Returns 0 if unparseable.
+func parseRetryAfter(value string) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
 	if secs, err := strconv.Atoi(value); err == nil {
 		return time.Duration(secs) * time.Second
 	}
-	// Try milliseconds (float)
-	if ms, err := strconv.ParseFloat(value, 64); err == nil {
-		if ms < 1000 {
-			return time.Duration(ms*1000) * time.Microsecond
+	if f, err := strconv.ParseFloat(value, 64); err == nil {
+		if f < 1000 {
+			return time.Duration(f*1000) * time.Millisecond
 		}
-		return time.Duration(ms) * time.Millisecond
+		return time.Duration(f) * time.Millisecond
 	}
-	// Try HTTP date
 	if t, err := http.ParseTime(value); err == nil {
 		d := time.Until(t)
 		if d < 0 {
@@ -135,51 +187,5 @@ func parseRetryAfterHeader(value string) time.Duration {
 		}
 		return d
 	}
-	return 5 * time.Second // Default
-}
-
-func parseResetAfterFromBody(body string) time.Duration {
-	// Parse "reset after 2h7m23s" or "1h30m" or "45m" or "30s"
-	idx := strings.Index(body, "reset after ")
-	if idx == -1 {
-		return 0
-	}
-	timeStr := body[idx+len("reset after "):]
-	// Extract until non-time character
-	end := 0
-	for end < len(timeStr) && (timeStr[end] >= '0' && timeStr[end] <= '9' || timeStr[end] == 'h' || timeStr[end] == 'm' || timeStr[end] == 's') {
-		end++
-	}
-	if end == 0 {
-		return 0
-	}
-	timeStr = timeStr[:end]
-
-	var total time.Duration
-	var num int
-	for _, c := range timeStr {
-		if c >= '0' && c <= '9' {
-			num = num*10 + int(c-'0')
-		} else {
-			switch c {
-			case 'h':
-				total += time.Duration(num) * time.Hour
-			case 'm':
-				total += time.Duration(num) * time.Minute
-			case 's':
-				total += time.Duration(num) * time.Second
-			}
-			num = 0
-		}
-	}
-	return total
-}
-
-func parseRetryDuration(headers http.Header, body string) time.Duration {
-	// Try Retry-After header first
-	if ra := headers.Get("Retry-After"); ra != "" {
-		return parseRetryAfterHeader(ra)
-	}
-	// Try body
-	return parseResetAfterFromBody(body)
+	return 0
 }

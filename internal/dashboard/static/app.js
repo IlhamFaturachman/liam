@@ -36,7 +36,7 @@ function app() {
       stats: {},
       top_models: [],
       recent_errors: [],
-      active_locks: 0,
+      backoff_active: 0,
       api_keys_total: 0,
       sync: {},
     },
@@ -1619,6 +1619,30 @@ function app() {
     },
     quotaPercent(a) { return a.quota_total > 0 ? Math.round((a.quota_remaining / a.quota_total) * 100) : 0; },
     quotaColor(a) { const p = this.quotaPercent(a); return p > 50 ? 'bg-ok' : p > 20 ? 'bg-warn' : 'bg-err'; },
+
+    // True when the account is currently sitting out an upstream-error
+    // cooldown (per-account backoff window). Drives the "cooldown 8s"
+    // badge on each account card. Auto-clears once cooldown_until lapses.
+    isInBackoff(a) {
+      if (!a || !a.cooldown_until) return false;
+      const t = Date.parse(a.cooldown_until);
+      if (!isFinite(t)) return false;
+      return t > Date.now();
+    },
+
+    // Short remaining-time string for the cooldown badge: "8s", "2m", "5m".
+    cooldownRemaining(a) {
+      if (!a || !a.cooldown_until) return '';
+      const ms = Date.parse(a.cooldown_until) - Date.now();
+      if (!isFinite(ms) || ms <= 0) return '0s';
+      const sec = Math.ceil(ms / 1000);
+      if (sec < 60) return sec + 's';
+      const min = Math.ceil(sec / 60);
+      if (min < 60) return min + 'm';
+      const hr = Math.floor(min / 60);
+      const rem = min % 60;
+      return rem ? hr + 'h' + rem + 'm' : hr + 'h';
+    },
 
     // True when the credentials JSON does not have a usable token yet
     // (server strips creds before sending; we rely on has_credentials).

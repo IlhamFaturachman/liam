@@ -207,11 +207,11 @@ tailwind.config={theme:{extend:{colors:{
                  x-text="(overview.stats?.success_rate||0).toFixed(1)+'%'"></div>
           </div>
           <div>
-            <div class="text-[10px] text-txt-3 uppercase mb-1">Active Locks</div>
+            <div class="text-[10px] text-txt-3 uppercase mb-1">In Backoff</div>
             <div class="text-lg font-bold font-mono"
-                 :class="(overview.active_locks||0)>0?'text-warn':'text-txt-2'"
-                 x-text="overview.active_locks||0"
-                 title="Active per-(account,model) cooldown locks. High counts mean accounts are throttled."></div>
+                 :class="(overview.backoff_active||0)>0?'text-warn':'text-txt-2'"
+                 x-text="overview.backoff_active||0"
+                 title="Accounts currently in per-account cooldown after an upstream error. They auto-recover when the backoff window expires."></div>
           </div>
         </div>
       </div>
@@ -404,6 +404,9 @@ tailwind.config={theme:{extend:{colors:{
                         <div class="text-xs font-semibold capitalize" x-text="providerDetail"></div>
                         <span x-show="a.plan" class="text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-brand/15 text-brand-light font-medium" x-text="a.plan"></span>
                         <span x-show="a.auth_method" class="text-[9px] text-txt-3" x-text="'· '+a.auth_method"></span>
+                        <span x-show="isInBackoff(a)" class="text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-warn/15 text-warn font-medium font-mono"
+                              :title="'Account in cooldown until '+formatDateTime(a.cooldown_until)+(a.last_error?'\\n'+a.last_error:'')"
+                              x-text="'cooldown '+cooldownRemaining(a)"></span>
                       </div>
                       <div class="text-[11px] text-txt-3 truncate" x-text="a.email"></div>
                       <div x-show="a.token_expires_at" class="text-[10px] mt-0.5 flex items-center gap-1"

@@ -221,7 +221,6 @@ func Start(cfg *config.Config, database *db.Database) error {
 
 			// Account actions
 			r.Post("/accounts/{id}/refresh-quota", s.handleRefreshQuota)
-			r.Get("/accounts/{id}/locks", s.handleGetAccountLocks)
 			r.Post("/accounts/{id}/excluded-models", s.handleSetExcludedModels)
 			r.Post("/accounts/{id}/test", s.handleTestAccount)
 			r.Patch("/accounts/{id}", s.handleEditAccount)
@@ -392,11 +391,24 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Pick best account (with per-model lock + session affinity)
+	// Pick best account (with session affinity). Per-account cooldown
+	// is enforced by GetActiveAccounts via cooldown_until; we no longer
+	// per-(account, model) lock since that turned single-account setups
+	// into instant 503 storms.
 	var lastErr error
 	for attempt := 0; attempt < s.cfg.MaxRetriesPerRequest; attempt++ {
 		account, err := s.pool.PickForSession(provider, model, sessionID)
 		if err != nil {
+			// All accounts in cooldown. Wait one backoff base unit and
+			// try again so we don't immediately 503 the caller — the
+			// next iteration will pick up whichever account exits
+			// cooldown first.
+			if attempt < s.cfg.MaxRetriesPerRequest-1 {
+				wait := time.Duration(BackoffBaseMs) * time.Millisecond
+				log.Printf("[RETRY %d] No active accounts (%v), sleeping %v", attempt+1, err, wait)
+				time.Sleep(wait)
+				continue
+			}
 			writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("No available accounts: %v", err))
 			return
 		}
@@ -422,19 +434,18 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		resp, err = providerInfo.Executor.ExecuteWithSession(account, model, body, stream, sessionID)
 
+		// --- Network/transport error ---
 		if err != nil {
 			lastErr = err
-			log.Printf("[RETRY %d] Account %s error: %v", attempt+1, account.Email, err)
-			cooldown := s.pool.CalculateCooldown(account.ConsecutiveErrors + 1)
-			s.db.MarkAccountError(account.ID, err.Error(), cooldown)
-			// Set per-model lock
-			if model != "" {
-				s.db.SetModelLock(account.ID, model, time.Now().UTC().Add(time.Duration(cooldown)*time.Second))
+			cooldown, msg := s.applyAccountError(account, 0, []byte(err.Error()), nil)
+			log.Printf("[RETRY %d] Account %s transport error: %v -> %s", attempt+1, account.Email, err, msg)
+			if s.pool.Count(provider) <= 1 {
+				time.Sleep(cooldown)
 			}
 			continue
 		}
 
-		// Check non-retryable errors (don't retry — all accounts will fail with same input)
+		// --- Non-retryable input errors (don't burn other accounts) ---
 		if resp.StatusCode == 400 || resp.StatusCode == 404 || resp.StatusCode == 422 {
 			respBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
@@ -443,73 +454,27 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 				writeError(w, resp.StatusCode, ExtractErrorMessage(respBody))
 				return
 			}
-			// Not non-retryable 400 — treat as account error, retry
+			// Generic 4xx (not in non-retryable list): treat as account error
 			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody[:min(len(respBody), 100)]))
-			cooldown := s.pool.CalculateCooldown(account.ConsecutiveErrors + 1)
-			s.db.MarkAccountError(account.ID, lastErr.Error(), cooldown)
-			continue
-		}
-
-		// Check upstream status
-		if resp.StatusCode == 401 || resp.StatusCode == 403 {
-			lastErr = fmt.Errorf("auth error %d from upstream", resp.StatusCode)
-			log.Printf("[RETRY %d] Account %s auth error: %d", attempt+1, account.Email, resp.StatusCode)
-			cooldown := s.pool.CalculateCooldown(account.ConsecutiveErrors + 1)
-			s.db.MarkAccountError(account.ID, lastErr.Error(), cooldown)
-			if model != "" {
-				s.db.SetModelLock(account.ID, model, time.Now().UTC().Add(time.Duration(cooldown)*time.Second))
+			cooldown, msg := s.applyAccountError(account, resp.StatusCode, respBody, resp.Header)
+			log.Printf("[RETRY %d] Account %s HTTP %d -> %s", attempt+1, account.Email, resp.StatusCode, msg)
+			if s.pool.Count(provider) <= 1 {
+				time.Sleep(cooldown)
 			}
-			resp.Body.Close()
 			continue
 		}
 
-		if resp.StatusCode == 429 {
-			// Use 429 Decision Engine (categorized rate limit handling)
+		// --- 401/403/429 + 5xx — unified fallback path ---
+		if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 429 || resp.StatusCode >= 500 {
 			respBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			decision := Categorize429(resp.StatusCode, respBody, resp.Header)
-
-			switch decision.Category {
-			case SoftRetry:
-				// Retry immediately same account — don't switch, don't cooldown
-				log.Printf("[RETRY %d] Account %s soft rate limit (%s), retrying in %v", attempt+1, account.Email, decision.Reason, decision.Cooldown)
-				time.Sleep(decision.Cooldown)
-				continue
-
-			case InstantRetrySameAuth:
-				// Tiny delay, same account
-				log.Printf("[RETRY %d] Account %s instant retry (%s), waiting %v", attempt+1, account.Email, decision.Reason, decision.Cooldown)
-				time.Sleep(decision.Cooldown)
-				continue
-
-			case ShortCooldownSwitch:
-				// Brief cooldown on this account, try different account
-				log.Printf("[RETRY %d] Account %s short cooldown (%s), switching account for %v", attempt+1, account.Email, decision.Reason, decision.Cooldown)
-				cooldownSecs := int(decision.Cooldown.Seconds())
-				if cooldownSecs < 5 {
-					cooldownSecs = 5
-				}
-				s.db.MarkAccountError(account.ID, "rate_limited: "+decision.Reason, cooldownSecs)
-				if model != "" {
-					s.db.SetModelLock(account.ID, model, time.Now().UTC().Add(decision.Cooldown))
-				}
-				lastErr = fmt.Errorf("rate limited (%s)", decision.Reason)
-				continue
-
-			case FullQuotaExhausted:
-				// Long cooldown, account exhausted
-				log.Printf("[RETRY %d] Account %s quota exhausted (%s), cooldown %v", attempt+1, account.Email, decision.Reason, decision.Cooldown)
-				cooldownSecs := int(decision.Cooldown.Seconds())
-				if cooldownSecs < 300 {
-					cooldownSecs = 300
-				}
-				s.db.MarkAccountError(account.ID, "quota_exhausted: "+decision.Reason, cooldownSecs)
-				if model != "" {
-					s.db.SetModelLock(account.ID, model, time.Now().UTC().Add(decision.Cooldown))
-				}
-				lastErr = fmt.Errorf("quota exhausted (%s)", decision.Reason)
-				continue
+			cooldown, msg := s.applyAccountError(account, resp.StatusCode, respBody, resp.Header)
+			log.Printf("[RETRY %d] Account %s HTTP %d -> %s", attempt+1, account.Email, resp.StatusCode, msg)
+			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+			if s.pool.Count(provider) <= 1 {
+				time.Sleep(cooldown)
 			}
+			continue
 		}
 
 		// Success - mark account healthy
@@ -775,6 +740,39 @@ func (s *Server) syncWorker() {
 	}
 }
 
+// applyAccountError classifies an upstream failure and applies the
+// resulting cooldown / backoff to the account. Returns the cooldown
+// duration the caller should sleep when only one account exists for
+// the provider, plus a short human-readable message for logging.
+//
+// Mirrors 9router's accountFallback flow: 429-class errors bump the
+// per-account backoff_level (exponential 2/4/8/…/300 s), other failure
+// modes use a fixed cooldown from ERROR_RULES, and unmatched errors
+// fall back to TRANSIENT_COOLDOWN_MS (30 s). The previous per-(account,
+// model) lock is gone — it locked single-account setups out within
+// minutes for any unrecognised 429.
+func (s *Server) applyAccountError(account *db.Account, status int, body []byte, headers http.Header) (time.Duration, string) {
+	decision := ClassifyError(status, body, headers)
+	if decision.UseBackoff {
+		level, err := s.db.BumpBackoff(account.ID, BackoffMaxLevel, BackoffBaseMs/1000, BackoffMaxMs/1000)
+		if err != nil {
+			log.Printf("[BACKOFF] BumpBackoff failed for %s: %v", account.ID, err)
+		}
+		cooldown := BackoffCooldown(level)
+		// We log the error message alongside the bumped level so the
+		// dashboard's last_error column still surfaces something useful.
+		s.db.MarkAccountError(account.ID, "rate_limit: "+decision.Reason, 0)
+		return cooldown, fmt.Sprintf("backoff L%d (%s) cooldown %v", level, decision.Reason, cooldown)
+	}
+	cooldown := decision.CooldownMs
+	cooldownSecs := int(cooldown.Seconds())
+	if cooldownSecs < 1 {
+		cooldownSecs = 1
+	}
+	s.db.MarkAccountError(account.ID, decision.Reason, cooldownSecs)
+	return cooldown, fmt.Sprintf("cooldown %v (%s)", cooldown, decision.Reason)
+}
+
 // handleComboRequest tries each model in a combo until one succeeds
 func (s *Server) handleComboRequest(w http.ResponseWriter, r *http.Request, req map[string]interface{}, originalBody []byte, comboModels []string, stream bool, startTime time.Time) {
 	var lastErr error
@@ -811,20 +809,19 @@ func (s *Server) handleComboRequest(w http.ResponseWriter, r *http.Request, req 
 
 		if err != nil {
 			lastErr = err
-			log.Printf("[COMBO] %s failed (account %s): %v", comboModel, account.Email, err)
-			cooldown := s.pool.CalculateCooldown(account.ConsecutiveErrors + 1)
-			s.db.MarkAccountError(account.ID, err.Error(), cooldown)
-			s.db.SetModelLock(account.ID, comboModel, time.Now().UTC().Add(time.Duration(cooldown)*time.Second))
+			cooldown, msg := s.applyAccountError(account, 0, []byte(err.Error()), nil)
+			log.Printf("[COMBO] %s account %s transport error: %v -> %s", comboModel, account.Email, err, msg)
+			_ = cooldown
 			continue
 		}
 
-		if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 429 {
-			lastErr = fmt.Errorf("HTTP %d from %s", resp.StatusCode, comboModel)
-			log.Printf("[COMBO] %s returned %d, trying next", comboModel, resp.StatusCode)
-			cooldown := s.pool.CalculateCooldown(account.ConsecutiveErrors + 1)
-			s.db.MarkAccountError(account.ID, lastErr.Error(), cooldown)
-			s.db.SetModelLock(account.ID, comboModel, time.Now().UTC().Add(time.Duration(cooldown)*time.Second))
+		if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 429 || resp.StatusCode >= 500 {
+			respBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			cooldown, msg := s.applyAccountError(account, resp.StatusCode, respBody, resp.Header)
+			lastErr = fmt.Errorf("HTTP %d from %s", resp.StatusCode, comboModel)
+			log.Printf("[COMBO] %s account %s HTTP %d -> %s, trying next", comboModel, account.Email, resp.StatusCode, msg)
+			_ = cooldown
 			continue
 		}
 

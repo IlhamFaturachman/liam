@@ -58,13 +58,14 @@ func (p *AccountPool) PickForSession(provider, model, sessionID string) (*db.Acc
 		accountID := entry.accountID
 		p.mu.Unlock()
 
-		// Verify account is still usable
+		// Verify account is still usable. cooldown_until is enforced
+		// by GetActiveAccounts already, and excluded_models is the
+		// only remaining per-model gate.
 		accounts, err := p.database.GetActiveAccounts(provider)
 		if err == nil {
 			for i := range accounts {
 				if accounts[i].ID == accountID {
-					// Check not model-locked
-					if model == "" || !p.isModelLocked(&accounts[i], model, time.Now()) {
+					if model == "" || !p.isModelExcluded(&accounts[i], model) {
 						p.mu.Lock()
 						p.recordUse(&accounts[i], time.Now())
 						p.mu.Unlock()
@@ -189,14 +190,15 @@ func (p *AccountPool) PickForModel(provider, model string) (*db.Account, error) 
 	now := time.Now()
 	strategy, stickyLimit := p.getProviderStrategy(provider)
 
-	// Filter: rate limit + min gap + per-model lock + excluded models
+	// Filter: rate limit + min gap + excluded models. Per-(account,
+	// model) locks are gone — they were the leading cause of single-
+	// account 503 storms when an unrecognised 429 marked the same
+	// (account, model) pair across the entire pool. Per-account
+	// cooldown_until (enforced by GetActiveAccounts) is the new
+	// authority.
 	var eligible []*db.Account
 	for i := range accounts {
 		if !p.canUse(&accounts[i], now) {
-			continue
-		}
-		// Per-model lock check
-		if model != "" && p.isModelLocked(&accounts[i], model, now) {
 			continue
 		}
 		// Per-auth excluded models check
@@ -207,7 +209,7 @@ func (p *AccountPool) PickForModel(provider, model string) (*db.Account, error) 
 	}
 
 	if len(eligible) == 0 {
-		return nil, fmt.Errorf("all accounts rate-limited or model-locked for '%s'", provider)
+		return nil, fmt.Errorf("all accounts in cooldown for '%s'", provider)
 	}
 
 	var selected *db.Account
@@ -342,14 +344,6 @@ func (p *AccountPool) canUse(account *db.Account, now time.Time) bool {
 	}
 
 	return true
-}
-
-func (p *AccountPool) isModelLocked(account *db.Account, model string, now time.Time) bool {
-	locks := p.database.GetModelLocks(account.ID)
-	if until, ok := locks[model]; ok {
-		return until.After(now)
-	}
-	return false
 }
 
 func (p *AccountPool) isModelExcluded(account *db.Account, model string) bool {
