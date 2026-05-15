@@ -180,6 +180,15 @@ func Start(cfg *config.Config, database *db.Database) error {
 		// Account reorder (drag-and-drop)
 		r.Post("/accounts/reorder", s.handleReorderAccounts)
 
+		// Account import (manual add)
+		r.Post("/accounts/import/ag", s.handleImportAG)
+		r.Post("/accounts/import/kiro", s.handleImportKiro)
+
+		// Account actions
+		r.Post("/accounts/{id}/refresh-quota", s.handleRefreshQuota)
+		r.Get("/accounts/{id}/locks", s.handleGetAccountLocks)
+		r.Post("/accounts/{id}/excluded-models", s.handleSetExcludedModels)
+
 		// Harvest
 		r.Post("/harvest/start", s.harvest.HandleStart)
 		r.Get("/harvest/status", s.harvest.HandleStatus)
@@ -366,6 +375,22 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			if model != "" {
 				s.db.SetModelLock(account.ID, model, time.Now().UTC().Add(time.Duration(cooldown)*time.Second))
 			}
+			continue
+		}
+
+		// Check non-retryable errors (don't retry — all accounts will fail with same input)
+		if resp.StatusCode == 400 || resp.StatusCode == 404 || resp.StatusCode == 422 {
+			respBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if IsNonRetryable(resp.StatusCode, respBody) {
+				log.Printf("[NON-RETRYABLE] %s: %d — %s", account.Email, resp.StatusCode, string(respBody[:min(len(respBody), 100)]))
+				writeError(w, resp.StatusCode, ExtractErrorMessage(respBody))
+				return
+			}
+			// Not non-retryable 400 — treat as account error, retry
+			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody[:min(len(respBody), 100)]))
+			cooldown := s.pool.CalculateCooldown(account.ConsecutiveErrors + 1)
+			s.db.MarkAccountError(account.ID, lastErr.Error(), cooldown)
 			continue
 		}
 

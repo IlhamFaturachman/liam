@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -188,7 +189,7 @@ func (p *AccountPool) PickForModel(provider, model string) (*db.Account, error) 
 	now := time.Now()
 	strategy, stickyLimit := p.getProviderStrategy(provider)
 
-	// Filter: rate limit + min gap + per-model lock
+	// Filter: rate limit + min gap + per-model lock + excluded models
 	var eligible []*db.Account
 	for i := range accounts {
 		if !p.canUse(&accounts[i], now) {
@@ -196,6 +197,10 @@ func (p *AccountPool) PickForModel(provider, model string) (*db.Account, error) 
 		}
 		// Per-model lock check
 		if model != "" && p.isModelLocked(&accounts[i], model, now) {
+			continue
+		}
+		// Per-auth excluded models check
+		if model != "" && p.isModelExcluded(&accounts[i], model) {
 			continue
 		}
 		eligible = append(eligible, &accounts[i])
@@ -331,6 +336,56 @@ func (p *AccountPool) isModelLocked(account *db.Account, model string, now time.
 		return until.After(now)
 	}
 	return false
+}
+
+func (p *AccountPool) isModelExcluded(account *db.Account, model string) bool {
+	// Read excluded_models from account metadata
+	if account.Metadata == nil {
+		return false
+	}
+	var meta map[string]interface{}
+	json.Unmarshal(account.Metadata, &meta)
+	excludedRaw, ok := meta["excluded_models"]
+	if !ok {
+		return false
+	}
+	excluded, ok := excludedRaw.([]interface{})
+	if !ok {
+		return false
+	}
+	for _, pattern := range excluded {
+		patternStr, ok := pattern.(string)
+		if !ok {
+			continue
+		}
+		if matchWildcard(patternStr, model) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchWildcard matches a pattern with * wildcard against a string
+func matchWildcard(pattern, s string) bool {
+	if pattern == "*" {
+		return true
+	}
+	if !strings.Contains(pattern, "*") {
+		return pattern == s
+	}
+	// Simple wildcard: only support trailing * (e.g. "claude-opus-*")
+	if strings.HasSuffix(pattern, "*") {
+		prefix := pattern[:len(pattern)-1]
+		return strings.HasPrefix(s, prefix)
+	}
+	// Leading * (e.g. "*-thinking")
+	if strings.HasPrefix(pattern, "*") {
+		suffix := pattern[1:]
+		return strings.HasSuffix(s, suffix)
+	}
+	// Middle * (e.g. "claude-*-4")
+	parts := strings.SplitN(pattern, "*", 2)
+	return strings.HasPrefix(s, parts[0]) && strings.HasSuffix(s, parts[1])
 }
 
 func (p *AccountPool) getAccountPriority(account *db.Account) int {
