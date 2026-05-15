@@ -4,16 +4,52 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
+
+func init() {
+	// Auto-load ~/.liam/.env on startup (before any config reads)
+	loadDotEnv()
+}
+
+// loadDotEnv reads ~/.liam/.env and sets env vars (doesn't override existing)
+func loadDotEnv() {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	envPath := filepath.Join(home, ".liam", ".env")
+	data, err := os.ReadFile(envPath)
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line[0] == '#' {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		val := strings.TrimSpace(parts[1])
+		// Don't override existing env vars (explicit env takes priority)
+		if os.Getenv(key) == "" {
+			os.Setenv(key, val)
+		}
+	}
+}
 
 type Config struct {
 	// Server
 	Port int
 
 	// Database
-	SupabaseURL string
-	SupabaseKey string
-	DBPath      string
+	SupabaseURL        string
+	SupabaseKey        string
+	SupabaseDBPassword string
+	DBPath             string
 
 	// Antigravity OAuth
 	AGClientID     string
@@ -49,9 +85,10 @@ func Load() *Config {
 		Port: port,
 
 		// Database
-		SupabaseURL: getEnv("SUPABASE_URL", ""),
-		SupabaseKey: getEnv("SUPABASE_KEY", ""),
-		DBPath:      getEnv("LIAM_DB_PATH", defaultDBPath),
+		SupabaseURL:        getEnv("SUPABASE_URL", ""),
+		SupabaseKey:        getEnv("SUPABASE_KEY", ""),
+		SupabaseDBPassword: getEnv("SUPABASE_DB_PASSWORD", ""),
+		DBPath:             getEnv("LIAM_DB_PATH", defaultDBPath),
 
 		// Antigravity OAuth (Google)
 		// These are the public Antigravity IDE OAuth credentials, used by all

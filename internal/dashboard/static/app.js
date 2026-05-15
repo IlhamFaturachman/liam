@@ -69,6 +69,7 @@ function app() {
     defaultBaseURL: '',
     baseURLMsg: '',
     baseURLOk: null,
+    syncStatus: { enabled: false, connected: false, last_sync: '', supabase_url: '' },
     savedPresets: [],
 
     // Model Select Modal
@@ -205,6 +206,7 @@ function app() {
         this.fetchChart(),
         this.fetchRegistryModels(),
         this.fetchBaseURL(),
+        this.fetchSyncStatus(),
       ]);
       this.buildOverviewStats();
       this.startSSE();
@@ -243,6 +245,29 @@ function app() {
           this.defaultBaseURL = d.default_url;
         }
       } catch (e) {}
+    },
+
+    async fetchSyncStatus() {
+      try {
+        const r = await fetch('/api/sync/status');
+        if (r.ok) this.syncStatus = await r.json();
+      } catch (e) {}
+    },
+
+    async triggerSync() {
+      try {
+        const r = await fetch('/api/sync/now', { method: 'POST' });
+        const d = await r.json();
+        if (r.ok) {
+          this.syncStatus.last_sync = d.last_sync;
+          this.syncStatus.connected = true;
+          await this.fetchSyncStatus();
+          await this.fetchAccounts();
+          await this.fetchKeys();
+        } else {
+          alert(d.error?.message || 'Sync failed');
+        }
+      } catch (e) { alert('Connection error'); }
     },
 
     buildOverviewStats() {

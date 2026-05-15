@@ -539,6 +539,27 @@ tailwind.config={theme:{extend:{colors:{
     <div x-show="page==='settings'" x-transition:enter="transition ease-out duration-250" x-transition:enter-start="opacity-0 translate-y-2" x-transition:enter-end="opacity-100 translate-y-0">
       <div class="mb-6"><h1 class="text-xl font-semibold">Settings</h1><p class="text-xs text-txt-3 mt-1">Dashboard configuration</p></div>
 
+      <!-- Supabase Sync -->
+      <div class="bg-surface-2 border border-bdr rounded-xl p-6 max-w-2xl mb-4">
+        <div class="text-xs text-txt-3 uppercase tracking-wider mb-2">Supabase Sync</div>
+        <p class="text-[12px] text-txt-3 mb-4 leading-relaxed">
+          Sync accounts, API keys, and custom models across devices via Supabase.
+          Set <code class="text-txt-2">SUPABASE_URL</code> and <code class="text-txt-2">SUPABASE_KEY</code> env vars to enable.
+        </p>
+        <div class="flex items-center gap-4 mb-3">
+          <div class="flex items-center gap-2">
+            <span class="w-2 h-2 rounded-full" :class="syncStatus.connected?'bg-ok animate-pulse':'bg-txt-3'"></span>
+            <span class="text-sm" :class="syncStatus.connected?'text-ok':'text-txt-3'" x-text="syncStatus.enabled?(syncStatus.connected?'Connected':'Disconnected'):'Not configured'"></span>
+          </div>
+          <span x-show="syncStatus.last_sync" class="text-[11px] text-txt-3" x-text="'Last sync: '+new Date(syncStatus.last_sync).toLocaleTimeString()"></span>
+        </div>
+        <div x-show="syncStatus.supabase_url" class="text-[11px] font-mono text-txt-3 mb-3" x-text="syncStatus.supabase_url"></div>
+        <div class="flex gap-2">
+          <button x-show="syncStatus.enabled" @click="triggerSync()" class="px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg transition-all">Sync Now</button>
+          <span x-show="!syncStatus.enabled" class="text-[12px] text-txt-3">Set SUPABASE_URL and SUPABASE_KEY env vars, then restart LIAM.</span>
+        </div>
+      </div>
+
       <!-- Base URL -->
       <div class="bg-surface-2 border border-bdr rounded-xl p-6 max-w-2xl mb-4">
         <div class="text-xs text-txt-3 uppercase tracking-wider mb-2">Public Base URL</div>

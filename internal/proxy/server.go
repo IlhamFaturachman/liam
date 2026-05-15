@@ -20,20 +20,22 @@ import (
 	"github.com/liam-auto/liam/internal/models"
 	"github.com/liam-auto/liam/internal/providers/antigravity"
 	"github.com/liam-auto/liam/internal/providers/kiro"
+	liamsync "github.com/liam-auto/liam/internal/sync"
 )
 
 // Server holds the proxy server state
 type Server struct {
-	cfg          *config.Config
-	db           *db.Database
-	pool         *AccountPool
-	ag           *antigravity.Executor
-	kiro         *kiro.Executor
-	harvest      *harvest.HarvestService
-	registry     *models.Registry
-	aliases      *models.AliasStore
+	cfg           *config.Config
+	db            *db.Database
+	pool          *AccountPool
+	ag            *antigravity.Executor
+	kiro          *kiro.Executor
+	harvest       *harvest.HarvestService
+	registry      *models.Registry
+	aliases       *models.AliasStore
 	modelsHandler *ModelsHandler
-	integrations *integrations.Service
+	integrations  *integrations.Service
+	syncer        *liamsync.Syncer
 }
 
 // GetPort implements ServerConfig for ModelsHandler
@@ -61,6 +63,20 @@ func Start(cfg *config.Config, database *db.Database) error {
 		integrations: integrations.NewService(),
 	}
 	s.modelsHandler = NewModelsHandler(s, database, registry, aliases, s.pool, s.ag)
+
+	// Initialize Supabase sync
+	syncClient := liamsync.NewClient(cfg.SupabaseURL, cfg.SupabaseKey)
+	s.syncer = liamsync.NewSyncer(syncClient, database)
+	if s.syncer.IsEnabled() {
+		if err := liamsync.EnsureTables(syncClient); err != nil {
+			log.Printf("[SYNC] Warning: %v", err)
+		}
+		if err := s.syncer.InitialSync(); err != nil {
+			log.Printf("[SYNC] Initial sync warning: %v", err)
+		}
+		// Start sync worker (every 30s)
+		go s.syncWorker()
+	}
 
 	// Ensure internal test key exists
 	if _, err := database.EnsureInternalTestKey(); err != nil {
@@ -144,6 +160,10 @@ func Start(cfg *config.Config, database *db.Database) error {
 		r.Post("/integrations/{tool}/snippet", s.integrations.HandleSnippet)
 		r.Post("/integrations/{tool}/apply", s.integrations.HandleApply)
 		r.Post("/integrations/{tool}/reset", s.integrations.HandleReset)
+
+		// Sync
+		r.Get("/sync/status", s.handleSyncStatus)
+		r.Post("/sync/now", s.handleSyncNow)
 
 		// Harvest
 		r.Post("/harvest/start", s.harvest.HandleStart)
@@ -453,6 +473,35 @@ func getProviderName(alias string) string {
 		return "kiro"
 	}
 	return alias
+}
+
+// syncWorker runs bidirectional sync every 30 seconds
+func (s *Server) syncWorker() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		if err := s.syncer.Sync(); err != nil {
+			log.Printf("[SYNC] Error: %v", err)
+		}
+	}
+}
+
+// handleSyncStatus returns current sync status for dashboard
+func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.syncer.Status())
+}
+
+// handleSyncNow triggers an immediate sync
+func (s *Server) handleSyncNow(w http.ResponseWriter, r *http.Request) {
+	if !s.syncer.IsEnabled() {
+		writeError(w, 400, "Supabase sync not configured. Set SUPABASE_URL and SUPABASE_KEY env vars.")
+		return
+	}
+	if err := s.syncer.Sync(); err != nil {
+		writeError(w, 500, fmt.Sprintf("Sync failed: %v", err))
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{"status": "synced", "last_sync": s.syncer.LastSyncTime().Format(time.RFC3339)})
 }
 
 // stripThinkingFromRequest removes thinking-related fields from the OpenAI request

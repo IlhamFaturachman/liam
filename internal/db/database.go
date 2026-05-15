@@ -509,6 +509,19 @@ func (d *Database) DeleteAPIKey(id string) error {
 	return err
 }
 
+// ImportAPIKey imports a key from remote (Supabase sync) — inserts if not exists
+func (d *Database) ImportAPIKey(id, keyHash, keyPrefix, name string, isActive bool, createdAt time.Time) error {
+	active := 0
+	if isActive {
+		active = 1
+	}
+	_, err := d.db.Exec(`
+		INSERT OR IGNORE INTO api_keys (id, key_hash, key_prefix, name, is_active, rate_limit_rpm, rate_limit_rpd, created_at)
+		VALUES (?, ?, ?, ?, ?, 60, 1000, ?)`,
+		id, keyHash, keyPrefix, name, active, createdAt.Format(time.RFC3339Nano))
+	return err
+}
+
 // --- Usage Log Operations ---
 
 // LogUsage records a request
