@@ -253,7 +253,39 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		body, _ = json.Marshal(req)
 	}
 
-	// Option C Thinking: handle -thinking suffix
+	// Thinking DSL: handle model(value) syntax — e.g. ag/claude-opus-4-6(8192) or ag/model(high)
+	if idx := strings.LastIndex(model, "("); idx > 0 && strings.HasSuffix(model, ")") {
+		baseModel := model[:idx]
+		thinkingValue := model[idx+1 : len(model)-1]
+		model = baseModel
+		req["model"] = baseModel
+
+		// Map value to reasoning_effort
+		switch thinkingValue {
+		case "none":
+			req["reasoning_effort"] = "none"
+		case "auto":
+			// Don't set — let model decide
+		case "low":
+			req["reasoning_effort"] = "low"
+		case "medium":
+			req["reasoning_effort"] = "medium"
+		case "high":
+			req["reasoning_effort"] = "high"
+		case "max":
+			req["reasoning_effort"] = "max"
+		default:
+			// Numeric value — store as direct budget (will be mapped in executor)
+			if _, err := fmt.Sscanf(thinkingValue, "%d", new(int)); err == nil {
+				req["reasoning_effort"] = thinkingValue // Pass numeric string, executor maps it
+			} else {
+				req["reasoning_effort"] = "high" // Unknown → default high
+			}
+		}
+		body, _ = json.Marshal(req)
+	}
+
+	// Option C Thinking: handle -thinking suffix (backward compat)
 	if strings.HasSuffix(model, "-thinking") {
 		baseModel := strings.TrimSuffix(model, "-thinking")
 		// Check if base model exists in registry
@@ -276,6 +308,12 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	stream, _ := req["stream"].(bool)
 
+	// Determine provider from model
+	provider := resolveProvider(model)
+
+	// Extract session ID for session affinity
+	sessionID := extractSessionID(r, req)
+
 	// Check if model is a combo
 	comboModels := s.combo.ResolveCombo(model)
 	if comboModels != nil {
@@ -284,13 +322,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Determine provider from model
-	provider := resolveProvider(model)
-
-	// Pick best account (with per-model lock awareness)
+	// Pick best account (with per-model lock + session affinity)
 	var lastErr error
 	for attempt := 0; attempt < s.cfg.MaxRetriesPerRequest; attempt++ {
-		account, err := s.pool.PickForModel(provider, model)
+		account, err := s.pool.PickForSession(provider, model, sessionID)
 		if err != nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("No available accounts: %v", err))
 			return
@@ -348,18 +383,48 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if resp.StatusCode == 429 {
-			lastErr = fmt.Errorf("rate limited")
-			log.Printf("[RETRY %d] Account %s rate limited", attempt+1, account.Email)
-			cooldown := s.pool.CalculateCooldown(account.ConsecutiveErrors + 2)
-			if cooldown < 300 {
-				cooldown = 300
-			}
-			s.db.MarkAccountError(account.ID, "rate_limited", cooldown)
-			if model != "" {
-				s.db.SetModelLock(account.ID, model, time.Now().UTC().Add(time.Duration(cooldown)*time.Second))
-			}
+			// Use 429 Decision Engine (categorized rate limit handling)
+			respBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			continue
+			decision := Categorize429(resp.StatusCode, respBody, resp.Header)
+
+			switch decision.Category {
+			case SoftRetry:
+				// Retry immediately same account — don't switch, don't cooldown
+				log.Printf("[RETRY %d] Account %s soft rate limit (%s), retrying in %v", attempt+1, account.Email, decision.Reason, decision.Cooldown)
+				time.Sleep(decision.Cooldown)
+				continue
+
+			case InstantRetrySameAuth:
+				// Tiny delay, same account
+				log.Printf("[RETRY %d] Account %s instant retry (%s), waiting %v", attempt+1, account.Email, decision.Reason, decision.Cooldown)
+				time.Sleep(decision.Cooldown)
+				continue
+
+			case ShortCooldownSwitch:
+				// Brief cooldown on this account, try different account
+				log.Printf("[RETRY %d] Account %s short cooldown (%s), switching account for %v", attempt+1, account.Email, decision.Reason, decision.Cooldown)
+				cooldownSecs := int(decision.Cooldown.Seconds())
+				if cooldownSecs < 5 { cooldownSecs = 5 }
+				s.db.MarkAccountError(account.ID, "rate_limited: "+decision.Reason, cooldownSecs)
+				if model != "" {
+					s.db.SetModelLock(account.ID, model, time.Now().UTC().Add(decision.Cooldown))
+				}
+				lastErr = fmt.Errorf("rate limited (%s)", decision.Reason)
+				continue
+
+			case FullQuotaExhausted:
+				// Long cooldown, account exhausted
+				log.Printf("[RETRY %d] Account %s quota exhausted (%s), cooldown %v", attempt+1, account.Email, decision.Reason, decision.Cooldown)
+				cooldownSecs := int(decision.Cooldown.Seconds())
+				if cooldownSecs < 300 { cooldownSecs = 300 }
+				s.db.MarkAccountError(account.ID, "quota_exhausted: "+decision.Reason, cooldownSecs)
+				if model != "" {
+					s.db.SetModelLock(account.ID, model, time.Now().UTC().Add(decision.Cooldown))
+				}
+				lastErr = fmt.Errorf("quota exhausted (%s)", decision.Reason)
+				continue
+			}
 		}
 
 		// Success - mark account healthy
@@ -650,7 +715,6 @@ func (s *Server) handleSyncNow(w http.ResponseWriter, r *http.Request) {
 }
 
 // stripThinkingFromRequest removes thinking-related fields from the OpenAI request
-// for models that don't support thinking (e.g. ag/gemini-3-flash)
 func stripThinkingFromRequest(req map[string]interface{}) {
 	delete(req, "reasoning_effort")
 	delete(req, "thinking")
@@ -659,6 +723,31 @@ func stripThinkingFromRequest(req map[string]interface{}) {
 		delete(extra, "thinking")
 		delete(extra, "thinking_config")
 	}
+}
+
+// extractSessionID extracts a session identifier from the request for session affinity
+// Priority: X-Session-ID header > metadata.user_id > X-Client-Request-Id > conversation_id
+func extractSessionID(r *http.Request, body map[string]interface{}) string {
+	// 1. Explicit session header
+	if sid := r.Header.Get("X-Session-ID"); sid != "" {
+		return sid
+	}
+	// 2. metadata.user_id (Claude Code sends this)
+	if meta, ok := body["metadata"].(map[string]interface{}); ok {
+		if uid, ok := meta["user_id"].(string); ok && uid != "" {
+			return uid
+		}
+	}
+	// 3. X-Client-Request-Id
+	if crid := r.Header.Get("X-Client-Request-Id"); crid != "" {
+		return crid
+	}
+	// 4. conversation_id in body
+	if cid, ok := body["conversation_id"].(string); ok && cid != "" {
+		return cid
+	}
+	// 5. No session ID found — no affinity
+	return ""
 }
 
 // quietLogger is a chi middleware that logs requests except for noisy polling endpoints

@@ -29,7 +29,7 @@ func FetchModels(accessToken string) ([]UpstreamModel, error) {
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("User-Agent", "antigravity/1.107.0 darwin/arm64")
 
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)

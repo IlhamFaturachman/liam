@@ -27,11 +27,88 @@ type AccountPool struct {
 	// Per-account tracking (in-memory, fast)
 	usageCount map[string][]time.Time
 	sessionIDs map[string]string
+
+	// Session affinity (sessionID → accountID)
+	sessionMap    map[string]*sessionEntry
+	sessionMaxSize int
 }
 
 type providerStrategy struct {
 	Strategy    string `json:"strategy"`
 	StickyLimit int    `json:"sticky_limit"`
+}
+
+type sessionEntry struct {
+	accountID string
+	lastUsed  time.Time
+}
+
+// PickForSession selects account with session affinity (same session → same account)
+func (p *AccountPool) PickForSession(provider, model, sessionID string) (*db.Account, error) {
+	if sessionID == "" {
+		return p.PickForModel(provider, model)
+	}
+
+	p.mu.Lock()
+
+	// Check existing session assignment
+	if entry, ok := p.sessionMap[sessionID]; ok {
+		entry.lastUsed = time.Now()
+		accountID := entry.accountID
+		p.mu.Unlock()
+
+		// Verify account is still usable
+		accounts, err := p.database.GetActiveAccounts(provider)
+		if err == nil {
+			for i := range accounts {
+				if accounts[i].ID == accountID {
+					// Check not model-locked
+					if model == "" || !p.isModelLocked(&accounts[i], model, time.Now()) {
+						p.mu.Lock()
+						p.recordUse(&accounts[i], time.Now())
+						p.mu.Unlock()
+						return &accounts[i], nil
+					}
+					break
+				}
+			}
+		}
+		// Account no longer usable — fall through to normal pick
+	} else {
+		p.mu.Unlock()
+	}
+
+	// Normal pick
+	account, err := p.PickForModel(provider, model)
+	if err != nil {
+		return nil, err
+	}
+
+	// Save session assignment
+	p.mu.Lock()
+	// Evict oldest if at capacity
+	if len(p.sessionMap) >= p.sessionMaxSize {
+		p.evictOldestSession()
+	}
+	p.sessionMap[sessionID] = &sessionEntry{accountID: account.ID, lastUsed: time.Now()}
+	p.mu.Unlock()
+
+	return account, nil
+}
+
+// evictOldestSession removes the least recently used session entry
+func (p *AccountPool) evictOldestSession() {
+	var oldestKey string
+	var oldestTime time.Time
+	for k, v := range p.sessionMap {
+		if oldestKey == "" || v.lastUsed.Before(oldestTime) {
+			oldestKey = k
+			oldestTime = v.lastUsed
+		}
+	}
+	if oldestKey != "" {
+		delete(p.sessionMap, oldestKey)
+	}
 }
 
 // NewAccountPool creates a new account pool with anti-ban features
@@ -44,6 +121,8 @@ func NewAccountPool(database *db.Database, cfg *config.Config) *AccountPool {
 		providerOverrides: make(map[string]providerStrategy),
 		strategy:          "round-robin",
 		stickyLimit:       cfg.StickyRequests,
+		sessionMap:        make(map[string]*sessionEntry),
+		sessionMaxSize:    10000,
 	}
 	p.UpdateStrategy(database)
 	return p

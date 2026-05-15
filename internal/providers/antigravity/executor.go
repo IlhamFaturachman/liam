@@ -16,11 +16,34 @@ import (
 )
 
 const (
-	baseURL    = "https://daily-cloudcode-pa.googleapis.com"
-	apiPath    = "/v1internal"
-	userAgent  = "antigravity/1.107.0 darwin/arm64"
+	baseURL         = "https://daily-cloudcode-pa.googleapis.com"
+	apiPath         = "/v1internal"
 	maxOutputTokens = 65536 // No artificial cap - let model use full capacity
 )
+
+// Device profiles for stabilization (pinned per account)
+var deviceProfiles = []string{
+	"darwin/arm64",
+	"darwin/amd64",
+	"linux/amd64",
+	"linux/arm64",
+	"win32/x64",
+}
+
+// getStableUserAgent returns a per-account stable User-Agent
+// Same account always gets same device profile (prevents fingerprint drift)
+func getStableUserAgent(accountID string) string {
+	// Deterministic selection based on account ID hash
+	hash := 0
+	for _, c := range accountID {
+		hash = hash*31 + int(c)
+	}
+	if hash < 0 {
+		hash = -hash
+	}
+	profile := deviceProfiles[hash%len(deviceProfiles)]
+	return "antigravity/1.107.0 " + profile
+}
 
 // Executor handles Antigravity (Gemini Code Assist) requests
 type Executor struct {
@@ -77,10 +100,11 @@ func (e *Executor) ExecuteWithSession(account *db.Account, model string, body []
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 
-	// Headers
+	// Headers — use per-account stable User-Agent (device profile stabilization)
 	if sessionID == "" {
 		sessionID = generateSessionID(account.Email)
 	}
+	userAgent := getStableUserAgent(account.ID)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
 	req.Header.Set("User-Agent", userAgent)
@@ -228,10 +252,23 @@ func (e *Executor) translateRequest(model string, body []byte, stream bool, cred
 			budget = 32768
 		case "max":
 			budget = 65536
+		case "none":
+			// Explicitly disable thinking — don't set config
+		case "auto":
+			// Let model decide — set budget to -1 (auto)
+			budget = -1
+		default:
+			// Try parse as numeric (direct budget from DSL)
+			fmt.Sscanf(openaiReq.ReasoningEffort, "%d", &budget)
 		}
 		if budget > 0 {
 			genConfig.ThinkingConfig = &GeminiThinkingConfig{
 				ThinkingBudget:  budget,
+				IncludeThoughts: true,
+			}
+		} else if budget == -1 {
+			// Auto mode — include thoughts but let model decide budget
+			genConfig.ThinkingConfig = &GeminiThinkingConfig{
 				IncludeThoughts: true,
 			}
 		}
