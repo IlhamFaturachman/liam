@@ -93,6 +93,12 @@ function app() {
     addAccountLoading: false,
     addAccountMsg: '',
     addAccountOk: null,
+
+    // Edit Account
+    showEditAccountModal: false,
+    editAccountId: '',
+    editAccountEmail: '',
+    editAccountMsg: '',
     savedPresets: [],
 
     // Model Select Modal
@@ -464,6 +470,33 @@ function app() {
         }
       } catch (e) { this.addAccountMsg = 'Connection error'; this.addAccountOk = false; }
       this.addAccountLoading = false;
+    },
+
+    // Edit Account
+    openEditAccount(account) {
+      this.editAccountId = account.id;
+      this.editAccountEmail = account.email;
+      this.editAccountMsg = '';
+      this.showEditAccountModal = true;
+    },
+    closeEditAccount() { this.showEditAccountModal = false; },
+    async submitEditAccount() {
+      if (!this.editAccountEmail.trim()) { this.editAccountMsg = 'Name required'; return; }
+      try {
+        const r = await fetch('/api/accounts/' + this.editAccountId, {
+          method: 'PATCH',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ email: this.editAccountEmail.trim() })
+        });
+        const d = await r.json();
+        if (r.ok) {
+          await this.fetchAccounts();
+          if (this.providerDetail) await this.openProvider(this.providerDetail);
+          this.closeEditAccount();
+        } else {
+          this.editAccountMsg = d.error?.message || 'Failed';
+        }
+      } catch (e) { this.editAccountMsg = 'Connection error'; }
     },
 
     buildOverviewStats() {

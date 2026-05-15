@@ -85,3 +85,113 @@ func IsTokenExpired(creds *KiroCredentials, leadMinutes int) bool {
 	threshold := time.Now().UTC().Add(time.Duration(leadMinutes) * time.Minute)
 	return expiresAt.Before(threshold)
 }
+
+// FetchQuota fetches usage limits from Kiro API
+// Returns (used, total, error)
+func FetchQuota(accessToken, profileARN string) (int, int, error) {
+	if accessToken == "" {
+		return 0, 0, fmt.Errorf("no access token")
+	}
+
+	if profileARN == "" {
+		profileARN = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
+	}
+
+	client := &http.Client{Timeout: 15 * time.Second}
+
+	// Try multiple endpoints (same as 9Router)
+	type attempt struct {
+		name   string
+		doReq  func() (*http.Request, error)
+	}
+
+	attempts := []attempt{
+		{
+			name: "codewhisperer-post",
+			doReq: func() (*http.Request, error) {
+				body := fmt.Sprintf(`{"origin":"AI_EDITOR","profileArn":"%s","resourceType":"AGENTIC_REQUEST"}`, profileARN)
+				req, err := http.NewRequest("POST", "https://codewhisperer.us-east-1.amazonaws.com", strings.NewReader(body))
+				if err != nil {
+					return nil, err
+				}
+				req.Header.Set("Authorization", "Bearer "+accessToken)
+				req.Header.Set("Content-Type", "application/x-amz-json-1.0")
+				req.Header.Set("x-amz-target", "AmazonCodeWhispererService.GetUsageLimits")
+				req.Header.Set("Accept", "application/json")
+				return req, nil
+			},
+		},
+		{
+			name: "codewhisperer-get",
+			doReq: func() (*http.Request, error) {
+				req, err := http.NewRequest("GET", "https://codewhisperer.us-east-1.amazonaws.com/getUsageLimits?isEmailRequired=true&origin=AI_EDITOR&resourceType=AGENTIC_REQUEST", nil)
+				if err != nil {
+					return nil, err
+				}
+				req.Header.Set("Authorization", "Bearer "+accessToken)
+				req.Header.Set("Accept", "application/json")
+				req.Header.Set("x-amz-user-agent", "aws-sdk-js/1.0.0 KiroIDE")
+				return req, nil
+			},
+		},
+		{
+			name: "q-get",
+			doReq: func() (*http.Request, error) {
+				url := fmt.Sprintf("https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&profileArn=%s&resourceType=AGENTIC_REQUEST", profileARN)
+				req, err := http.NewRequest("GET", url, nil)
+				if err != nil {
+					return nil, err
+				}
+				req.Header.Set("Authorization", "Bearer "+accessToken)
+				req.Header.Set("Accept", "application/json")
+				return req, nil
+			},
+		},
+	}
+
+	for _, a := range attempts {
+		req, err := a.doReq()
+		if err != nil {
+			continue
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			continue
+		}
+
+		var data struct {
+			UsageBreakdownList []struct {
+				ResourceType              string  `json:"resourceType"`
+				CurrentUsageWithPrecision float64 `json:"currentUsageWithPrecision"`
+				UsageLimitWithPrecision   float64 `json:"usageLimitWithPrecision"`
+			} `json:"usageBreakdownList"`
+		}
+
+		if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+			continue
+		}
+
+		// Find AGENTIC_REQUEST quota
+		for _, breakdown := range data.UsageBreakdownList {
+			if strings.EqualFold(breakdown.ResourceType, "AGENTIC_REQUEST") {
+				used := int(breakdown.CurrentUsageWithPrecision)
+				total := int(breakdown.UsageLimitWithPrecision)
+				return used, total, nil
+			}
+		}
+
+		// Use first entry if no AGENTIC_REQUEST
+		if len(data.UsageBreakdownList) > 0 {
+			b := data.UsageBreakdownList[0]
+			return int(b.CurrentUsageWithPrecision), int(b.UsageLimitWithPrecision), nil
+		}
+	}
+
+	return 0, 0, fmt.Errorf("all quota endpoints failed")
+}

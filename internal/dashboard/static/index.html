@@ -202,7 +202,7 @@ tailwind.config={theme:{extend:{colors:{
           </div>
           <table x-show="providerAccounts.length>0" class="w-full text-sm">
             <thead><tr class="border-b border-bdr text-[11px] text-txt-3 uppercase tracking-wider">
-              <th class="w-8"></th><th class="text-left py-3 px-4">Email</th><th class="text-left py-3 px-4">Status</th><th class="text-left py-3 px-4">Quota</th><th class="text-left py-3 px-4">Last Used</th><th class="text-left py-3 px-4">Errors</th>
+              <th class="w-8"></th><th class="text-left py-3 px-4">Email</th><th class="text-left py-3 px-4">Status</th><th class="text-left py-3 px-4">Quota</th><th class="text-left py-3 px-4">Last Used</th><th class="text-left py-3 px-4">Errors</th><th class="w-10"></th>
             </tr></thead>
             <tbody>
               <template x-for="a in providerAccounts" :key="a.id">
@@ -229,6 +229,11 @@ tailwind.config={theme:{extend:{colors:{
                   </td>
                   <td class="py-3 px-4 text-xs text-txt-3" x-text="timeAgo(a.last_used_at)"></td>
                   <td class="py-3 px-4 font-mono text-xs" :class="a.consecutive_errors>0?'text-err':'text-txt-3'" x-text="a.consecutive_errors"></td>
+                  <td class="py-3 px-2">
+                    <button @click="openEditAccount(a)" class="text-txt-3 hover:text-brand-light p-1" title="Edit">
+                      <span class="material-symbols-outlined text-[14px]">edit</span>
+                    </button>
+                  </td>
                 </tr>
               </template>
             </tbody>
@@ -794,6 +799,27 @@ tailwind.config={theme:{extend:{colors:{
       <div class="flex justify-end mt-5">
         <button @click="closeCreateKey()" class="px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg">Done</button>
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- Edit Account Modal -->
+<div x-show="showEditAccountModal" x-cloak class="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center" @click.self="closeEditAccount()">
+  <div class="bg-surface-2 border border-bdr rounded-xl p-6 w-[400px] shadow-2xl">
+    <div class="flex items-center justify-between mb-5">
+      <h2 class="text-base font-semibold">Edit Account</h2>
+      <button @click="closeEditAccount()" class="text-txt-3 hover:text-txt-1"><span class="material-symbols-outlined text-[20px]">close</span></button>
+    </div>
+    <div class="space-y-3">
+      <div>
+        <label class="text-[10px] text-txt-3 uppercase mb-1.5 block">Account Name / Email</label>
+        <input x-model="editAccountEmail" @keydown.enter="submitEditAccount()" class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm text-txt-1 focus:outline-none focus:border-brand">
+      </div>
+      <div x-show="editAccountMsg" class="text-xs text-err" x-text="editAccountMsg"></div>
+    </div>
+    <div class="flex justify-end gap-2 mt-5">
+      <button @click="closeEditAccount()" class="px-4 py-2 bg-surface-1 border border-bdr text-txt-2 text-sm rounded-lg hover:text-txt-1">Cancel</button>
+      <button @click="submitEditAccount()" class="px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg transition-all">Save</button>
     </div>
   </div>
 </div>

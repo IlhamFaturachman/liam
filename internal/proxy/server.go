@@ -194,6 +194,7 @@ func Start(cfg *config.Config, database *db.Database) error {
 		r.Post("/accounts/{id}/refresh-quota", s.handleRefreshQuota)
 		r.Get("/accounts/{id}/locks", s.handleGetAccountLocks)
 		r.Post("/accounts/{id}/excluded-models", s.handleSetExcludedModels)
+		r.Patch("/accounts/{id}", s.handleEditAccount)
 
 		// Harvest
 		r.Post("/harvest/start", s.harvest.HandleStart)

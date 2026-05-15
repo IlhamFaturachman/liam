@@ -930,3 +930,10 @@ func (d *Database) GetAccountWithDetails(id string) (priority int, consecutiveUs
 	err = d.db.QueryRow("SELECT COALESCE(priority, 0), COALESCE(consecutive_use_count, 0) FROM accounts WHERE id = ?", id).Scan(&priority, &consecutiveUseCount)
 	return
 }
+
+// UpdateAccountEmail updates just the email/name field of an account
+func (d *Database) UpdateAccountEmail(id, email string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := d.db.Exec("UPDATE accounts SET email = ?, updated_at = ? WHERE id = ?", email, now, id)
+	return err
+}

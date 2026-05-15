@@ -147,11 +147,16 @@ func (s *Server) handleImportKiro(w http.ResponseWriter, r *http.Request) {
 	}
 	finalCredsJSON, _ := json.Marshal(finalCreds)
 
+	// Fetch quota from Kiro API
+	used, total, _ := kiro.FetchQuota(newCreds.AccessToken, newCreds.ProfileARN)
+
 	account := &db.Account{
-		Provider:    "kiro",
-		Email:       email,
-		Status:      "active",
-		Credentials: finalCredsJSON,
+		Provider:       "kiro",
+		Email:          email,
+		Status:         "active",
+		Credentials:    finalCredsJSON,
+		QuotaTotal:     total,
+		QuotaRemaining: total - used,
 	}
 
 	if err := s.db.UpsertAccount(account); err != nil {
@@ -196,18 +201,41 @@ func (s *Server) handleRefreshQuota(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Call loadCodeAssist to get quota info
-		// For now, just verify token works (quota tracking from response)
 		_, _, err := antigravity.LoadCodeAssist(creds.AccessToken)
 		if err != nil {
 			writeError(w, 502, fmt.Sprintf("Failed to fetch quota: %v", err))
 			return
 		}
 
-		// TODO: Parse actual quota from response when AG exposes it
 		writeJSON(w, 200, map[string]interface{}{
 			"status":  "refreshed",
 			"message": "Token validated successfully",
+		})
+	} else if account.Provider == "kiro" {
+		var creds db.KiroCredentials
+		json.Unmarshal(account.Credentials, &creds)
+
+		if creds.AccessToken == "" {
+			writeError(w, 400, "no access token")
+			return
+		}
+
+		used, total, err := kiro.FetchQuota(creds.AccessToken, creds.ProfileARN)
+		if err != nil {
+			writeError(w, 502, fmt.Sprintf("Failed to fetch quota: %v", err))
+			return
+		}
+
+		// Update quota in DB
+		account.QuotaTotal = total
+		account.QuotaRemaining = total - used
+		s.db.UpsertAccount(account)
+
+		writeJSON(w, 200, map[string]interface{}{
+			"status":    "refreshed",
+			"used":      used,
+			"total":     total,
+			"remaining": total - used,
 		})
 	} else {
 		writeError(w, 400, "quota refresh not supported for this provider")
@@ -473,4 +501,34 @@ func (s *Server) handleAGExchange(w http.ResponseWriter, r *http.Request) {
 		"email":      email,
 		"project_id": projectID,
 	})
+}
+
+// handleEditAccount updates account fields (name/email)
+func (s *Server) handleEditAccount(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		writeError(w, 400, "missing id")
+		return
+	}
+
+	var req struct {
+		Email string `json:"email"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid JSON")
+		return
+	}
+
+	if req.Email == "" {
+		writeError(w, 400, "email/name required")
+		return
+	}
+
+	// Direct UPDATE (not upsert — avoids UNIQUE constraint on provider+email)
+	if err := s.db.UpdateAccountEmail(id, req.Email); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+
+	writeJSON(w, 200, map[string]string{"status": "updated", "email": req.Email})
 }
