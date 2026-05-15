@@ -10,6 +10,7 @@ function app() {
     navItems: [
       { id: 'overview', label: 'Overview', icon: 'dashboard' },
       { id: 'providers', label: 'Providers', icon: 'hub' },
+      { id: 'combos', label: 'Combos', icon: 'merge_type' },
       { id: 'usage', label: 'Usage', icon: 'analytics' },
       { id: 'keys', label: 'Keys', icon: 'key' },
       { id: 'integrations', label: 'Integrations', icon: 'integration_instructions' },
@@ -70,6 +71,19 @@ function app() {
     baseURLMsg: '',
     baseURLOk: null,
     syncStatus: { enabled: false, connected: false, last_sync: '', supabase_url: '' },
+
+    // Combos
+    combos: [],
+    showComboModal: false,
+    editingCombo: null,
+    comboForm: { name: '', models: [], strategy: 'fallback', sticky_limit: 1 },
+
+    // Routing
+    routing: { strategy: 'round-robin', sticky_limit: 3, provider_overrides: {} },
+    routingMsg: '',
+
+    // Drag-and-drop
+    dragAccountId: null,
     savedPresets: [],
 
     // Model Select Modal
@@ -207,6 +221,8 @@ function app() {
         this.fetchRegistryModels(),
         this.fetchBaseURL(),
         this.fetchSyncStatus(),
+        this.fetchCombos(),
+        this.fetchRouting(),
       ]);
       this.buildOverviewStats();
       this.startSSE();
@@ -268,6 +284,95 @@ function app() {
           alert(d.error?.message || 'Sync failed');
         }
       } catch (e) { alert('Connection error'); }
+    },
+
+    // Combos
+    async fetchCombos() {
+      try { const r = await fetch('/api/combos'); if (r.ok) this.combos = await r.json() || []; } catch (e) {}
+    },
+    openCreateCombo() {
+      this.editingCombo = null;
+      this.comboForm = { name: '', models: [], strategy: 'fallback', sticky_limit: 1 };
+      this.showComboModal = true;
+    },
+    openEditCombo(combo) {
+      this.editingCombo = combo;
+      this.comboForm = { name: combo.name, models: [...combo.models], strategy: combo.strategy, sticky_limit: combo.sticky_limit };
+      this.showComboModal = true;
+    },
+    closeComboModal() { this.showComboModal = false; this.editingCombo = null; },
+    addModelToCombo() {
+      this.modelSelectTarget = { context: 'combo' };
+      this.modelSelectCurrent = '';
+      this.modelSelectSearch = '';
+      this.showModelSelectModal = true;
+    },
+    removeModelFromCombo(index) { this.comboForm.models.splice(index, 1); },
+    moveComboModel(index, dir) {
+      const newIdx = index + dir;
+      if (newIdx < 0 || newIdx >= this.comboForm.models.length) return;
+      const temp = this.comboForm.models[index];
+      this.comboForm.models[index] = this.comboForm.models[newIdx];
+      this.comboForm.models[newIdx] = temp;
+    },
+    async saveCombo() {
+      if (!this.comboForm.name || this.comboForm.models.length === 0) { alert('Name and at least 1 model required'); return; }
+      try {
+        let r;
+        if (this.editingCombo) {
+          r = await fetch('/api/combos/' + this.editingCombo.id, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(this.comboForm) });
+        } else {
+          r = await fetch('/api/combos', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(this.comboForm) });
+        }
+        if (!r.ok) { const d = await r.json(); alert(d.error?.message || 'Failed'); return; }
+        await this.fetchCombos();
+        this.closeComboModal();
+      } catch (e) { alert('Error: ' + e.message); }
+    },
+    async deleteCombo(id) {
+      if (!confirm('Delete this combo?')) return;
+      try { await fetch('/api/combos/' + id, { method: 'DELETE' }); await this.fetchCombos(); } catch (e) {}
+    },
+
+    // Routing
+    async fetchRouting() {
+      try { const r = await fetch('/api/settings/routing'); if (r.ok) this.routing = await r.json(); } catch (e) {}
+    },
+    async saveRouting() {
+      this.routingMsg = '';
+      try {
+        const r = await fetch('/api/settings/routing', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({
+          strategy: this.routing.strategy,
+          sticky_limit: parseInt(this.routing.sticky_limit) || 3,
+          provider_overrides: this.routing.provider_overrides || {}
+        })});
+        if (r.ok) { this.routingMsg = 'Saved'; setTimeout(() => this.routingMsg = '', 3000); }
+      } catch (e) { this.routingMsg = 'Error'; }
+    },
+    setProviderRouting(provider, strategy, sticky) {
+      if (!this.routing.provider_overrides) this.routing.provider_overrides = {};
+      this.routing.provider_overrides[provider] = { strategy, sticky_limit: parseInt(sticky) || 3 };
+    },
+
+    // Drag-and-drop account reorder
+    dragStart(e, accountId) { this.dragAccountId = accountId; e.dataTransfer.effectAllowed = 'move'; },
+    dragOver(e) { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; },
+    async dropAccount(e, targetId) {
+      e.preventDefault();
+      if (!this.dragAccountId || this.dragAccountId === targetId) return;
+      // Reorder: move dragged to target position
+      const ids = this.providerAccounts.map(a => a.id);
+      const fromIdx = ids.indexOf(this.dragAccountId);
+      const toIdx = ids.indexOf(targetId);
+      if (fromIdx === -1 || toIdx === -1) return;
+      ids.splice(fromIdx, 1);
+      ids.splice(toIdx, 0, this.dragAccountId);
+      this.dragAccountId = null;
+      // Save new order
+      try {
+        await fetch('/api/accounts/reorder', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ ids }) });
+        if (this.providerDetail) await this.openProvider(this.providerDetail);
+      } catch (e) {}
     },
 
     buildOverviewStats() {
@@ -630,7 +735,12 @@ function app() {
       this.showModelSelectModal = true;
     },
     selectModel(modelId) {
-      if (this.modelSelectTarget && this.modelSelectTarget.slot) {
+      if (this.modelSelectTarget && this.modelSelectTarget.context === 'combo') {
+        // Adding model to combo form
+        if (!this.comboForm.models.includes(modelId)) {
+          this.comboForm.models.push(modelId);
+        }
+      } else if (this.modelSelectTarget && this.modelSelectTarget.slot) {
         this.integrationConfig.models[this.modelSelectTarget.slot] = modelId;
         this.refreshSnippet();
       }

@@ -63,6 +63,17 @@ type KiroCredentials struct {
 	ProfileARN   string `json:"profile_arn,omitempty"`
 }
 
+// Combo represents a named model group with fallback/round-robin
+type Combo struct {
+	ID         string   `json:"id"`
+	Name       string   `json:"name"`
+	Models     []string `json:"models"`
+	Strategy   string   `json:"strategy"`    // "fallback" | "round-robin"
+	StickyLimit int     `json:"sticky_limit"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
 // APIKey represents a consumer API key
 type APIKey struct {
 	ID        string    `json:"id"`
@@ -213,12 +224,32 @@ func (d *Database) migrate() error {
 			target TEXT NOT NULL,
 			created_at TEXT NOT NULL
 		)`,
+
+		`CREATE TABLE IF NOT EXISTS combos (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL UNIQUE,
+			models TEXT NOT NULL DEFAULT '[]',
+			strategy TEXT DEFAULT 'fallback',
+			sticky_limit INTEGER DEFAULT 1,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
 	}
 
 	for _, m := range migrations {
 		if _, err := d.db.Exec(m); err != nil {
 			return fmt.Errorf("migration failed: %w\nSQL: %s", err, m)
 		}
+	}
+
+	// Safe column additions (ALTER TABLE — ignore errors if column already exists)
+	alterStatements := []string{
+		"ALTER TABLE accounts ADD COLUMN priority INTEGER DEFAULT 0",
+		"ALTER TABLE accounts ADD COLUMN consecutive_use_count INTEGER DEFAULT 0",
+		"ALTER TABLE accounts ADD COLUMN model_locks TEXT DEFAULT '{}'",
+	}
+	for _, stmt := range alterStatements {
+		d.db.Exec(stmt) // Ignore errors (column already exists)
 	}
 
 	return nil
@@ -749,4 +780,147 @@ func (d *Database) GetUsageChart(hours int) ([]ChartBucket, error) {
 	}
 
 	return buckets, nil
+}
+
+// --- Combo Operations ---
+
+// ListCombos returns all combos
+func (d *Database) ListCombos() ([]Combo, error) {
+	rows, err := d.db.Query("SELECT id, name, models, strategy, sticky_limit, created_at, updated_at FROM combos ORDER BY name")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var combos []Combo
+	for rows.Next() {
+		var c Combo
+		var modelsJSON, createdAt, updatedAt string
+		err := rows.Scan(&c.ID, &c.Name, &modelsJSON, &c.Strategy, &c.StickyLimit, &createdAt, &updatedAt)
+		if err != nil {
+			continue
+		}
+		json.Unmarshal([]byte(modelsJSON), &c.Models)
+		c.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+		c.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+		combos = append(combos, c)
+	}
+	return combos, nil
+}
+
+// GetCombo returns a combo by name
+func (d *Database) GetCombo(name string) (*Combo, error) {
+	var c Combo
+	var modelsJSON, createdAt, updatedAt string
+	err := d.db.QueryRow("SELECT id, name, models, strategy, sticky_limit, created_at, updated_at FROM combos WHERE name = ?", name).Scan(
+		&c.ID, &c.Name, &modelsJSON, &c.Strategy, &c.StickyLimit, &createdAt, &updatedAt)
+	if err != nil {
+		return nil, err
+	}
+	json.Unmarshal([]byte(modelsJSON), &c.Models)
+	c.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+	c.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+	return &c, nil
+}
+
+// CreateCombo creates a new combo
+func (d *Database) CreateCombo(name, strategy string, models []string, stickyLimit int) (*Combo, error) {
+	id := uuid.New().String()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	modelsJSON, _ := json.Marshal(models)
+	if strategy == "" {
+		strategy = "fallback"
+	}
+	if stickyLimit <= 0 {
+		stickyLimit = 1
+	}
+
+	_, err := d.db.Exec(`INSERT INTO combos (id, name, models, strategy, sticky_limit, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		id, name, string(modelsJSON), strategy, stickyLimit, now, now)
+	if err != nil {
+		return nil, err
+	}
+	return d.GetCombo(name)
+}
+
+// UpdateCombo updates an existing combo
+func (d *Database) UpdateCombo(id string, name, strategy string, models []string, stickyLimit int) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	modelsJSON, _ := json.Marshal(models)
+	_, err := d.db.Exec(`UPDATE combos SET name=?, models=?, strategy=?, sticky_limit=?, updated_at=? WHERE id=?`,
+		name, string(modelsJSON), strategy, stickyLimit, now, id)
+	return err
+}
+
+// DeleteCombo deletes a combo
+func (d *Database) DeleteCombo(id string) error {
+	_, err := d.db.Exec("DELETE FROM combos WHERE id = ?", id)
+	return err
+}
+
+// --- Account Priority & Model Lock ---
+
+// UpdateAccountPriority sets priority for an account
+func (d *Database) UpdateAccountPriority(id string, priority int) error {
+	_, err := d.db.Exec("UPDATE accounts SET priority = ? WHERE id = ?", priority, id)
+	return err
+}
+
+// ReorderAccounts sets priorities based on ordered list of IDs
+func (d *Database) ReorderAccounts(ids []string) error {
+	for i, id := range ids {
+		d.db.Exec("UPDATE accounts SET priority = ? WHERE id = ?", i+1, id)
+	}
+	return nil
+}
+
+// SetModelLock locks an account for a specific model until a given time
+func (d *Database) SetModelLock(accountID, model string, until time.Time) error {
+	// Read current locks
+	var locksJSON string
+	d.db.QueryRow("SELECT model_locks FROM accounts WHERE id = ?", accountID).Scan(&locksJSON)
+
+	locks := map[string]string{}
+	if locksJSON != "" {
+		json.Unmarshal([]byte(locksJSON), &locks)
+	}
+
+	locks[model] = until.Format(time.RFC3339Nano)
+
+	newJSON, _ := json.Marshal(locks)
+	_, err := d.db.Exec("UPDATE accounts SET model_locks = ? WHERE id = ?", string(newJSON), accountID)
+	return err
+}
+
+// GetModelLocks returns current model locks for an account
+func (d *Database) GetModelLocks(accountID string) map[string]time.Time {
+	var locksJSON string
+	d.db.QueryRow("SELECT model_locks FROM accounts WHERE id = ?", accountID).Scan(&locksJSON)
+
+	raw := map[string]string{}
+	if locksJSON != "" {
+		json.Unmarshal([]byte(locksJSON), &raw)
+	}
+
+	result := map[string]time.Time{}
+	now := time.Now().UTC()
+	for model, untilStr := range raw {
+		t, err := time.Parse(time.RFC3339Nano, untilStr)
+		if err == nil && t.After(now) {
+			result[model] = t
+		}
+	}
+	return result
+}
+
+// UpdateConsecutiveUseCount updates the consecutive use count for an account
+func (d *Database) UpdateConsecutiveUseCount(id string, count int) error {
+	_, err := d.db.Exec("UPDATE accounts SET consecutive_use_count = ? WHERE id = ?", count, id)
+	return err
+}
+
+// GetAccountWithDetails returns an account with priority and consecutive_use_count
+func (d *Database) GetAccountWithDetails(id string) (priority int, consecutiveUseCount int, err error) {
+	err = d.db.QueryRow("SELECT COALESCE(priority, 0), COALESCE(consecutive_use_count, 0) FROM accounts WHERE id = ?", id).Scan(&priority, &consecutiveUseCount)
+	return
 }

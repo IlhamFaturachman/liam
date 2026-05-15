@@ -191,14 +191,22 @@ tailwind.config={theme:{extend:{colors:{
         </div>
 
         <div class="bg-surface-2 border border-bdr rounded-xl overflow-hidden">
-          <div class="px-4 py-3 border-b border-bdr text-xs text-txt-3 uppercase tracking-wider">Accounts</div>
+          <div class="px-4 py-3 border-b border-bdr flex items-center justify-between">
+            <span class="text-xs text-txt-3 uppercase tracking-wider">Accounts</span>
+            <span class="text-[11px] text-txt-3">Drag to reorder priority</span>
+          </div>
           <table x-show="providerAccounts.length>0" class="w-full text-sm">
             <thead><tr class="border-b border-bdr text-[11px] text-txt-3 uppercase tracking-wider">
-              <th class="text-left py-3 px-4">Email</th><th class="text-left py-3 px-4">Status</th><th class="text-left py-3 px-4">Quota</th><th class="text-left py-3 px-4">Last Used</th><th class="text-left py-3 px-4">Errors</th>
+              <th class="w-8"></th><th class="text-left py-3 px-4">Email</th><th class="text-left py-3 px-4">Status</th><th class="text-left py-3 px-4">Quota</th><th class="text-left py-3 px-4">Last Used</th><th class="text-left py-3 px-4">Errors</th>
             </tr></thead>
             <tbody>
               <template x-for="a in providerAccounts" :key="a.id">
-                <tr class="border-b border-bdr-light hover:bg-surface-hover/30 transition-colors">
+                <tr class="border-b border-bdr-light hover:bg-surface-hover/30 transition-colors cursor-grab"
+                    draggable="true"
+                    @dragstart="dragStart($event, a.id)"
+                    @dragover="dragOver($event)"
+                    @drop="dropAccount($event, a.id)">
+                  <td class="py-3 px-2 text-center text-txt-3"><span class="material-symbols-outlined text-[14px]">drag_indicator</span></td>
                   <td class="py-3 px-4 font-mono text-xs" x-text="a.email"></td>
                   <td class="py-3 px-4">
                     <span class="inline-flex items-center gap-1.5 text-[11px] font-medium" :class="a.status==='active'?'text-ok':a.status==='cooldown'?'text-warn':'text-err'">
@@ -226,6 +234,56 @@ tailwind.config={theme:{extend:{colors:{
             <p class="text-txt-3 text-xs mt-1">Use Harvest to add accounts</p>
           </div>
         </div>
+      </div>
+    </div>
+
+    <!-- Combos -->
+    <div x-show="page==='combos'" x-transition:enter="transition ease-out duration-250" x-transition:enter-start="opacity-0 translate-y-2" x-transition:enter-end="opacity-100 translate-y-0">
+      <div class="flex items-center justify-between mb-6">
+        <div><h1 class="text-xl font-semibold">Combos</h1><p class="text-xs text-txt-3 mt-1">Named model groups with automatic fallback</p></div>
+        <button @click="openCreateCombo()" class="px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg transition-all">+ Create Combo</button>
+      </div>
+
+      <div x-show="combos.length===0" class="bg-surface-2 border border-bdr rounded-xl p-12 text-center">
+        <span class="material-symbols-outlined text-3xl text-txt-3 mb-2 block">merge_type</span>
+        <p class="text-txt-2 text-sm">No combos yet</p>
+        <p class="text-txt-3 text-xs mt-1">Create a combo to chain models with automatic fallback</p>
+      </div>
+
+      <div class="space-y-4">
+        <template x-for="c in combos" :key="c.id">
+          <div class="bg-surface-2 border border-bdr rounded-xl p-5">
+            <div class="flex items-center justify-between mb-3">
+              <div class="flex items-center gap-3">
+                <span class="material-symbols-outlined text-brand-light">merge_type</span>
+                <div>
+                  <div class="font-semibold text-sm" x-text="c.name"></div>
+                  <div class="text-[11px] text-txt-3 flex items-center gap-2">
+                    <span x-text="c.strategy === 'round-robin' ? 'Round Robin' : 'Fallback'"></span>
+                    <span>•</span>
+                    <span x-text="c.models.length + ' models'"></span>
+                    <span x-show="c.strategy==='round-robin'">• Sticky: <span x-text="c.sticky_limit"></span></span>
+                  </div>
+                </div>
+              </div>
+              <div class="flex items-center gap-2">
+                <button @click="openEditCombo(c)" class="text-txt-3 hover:text-brand-light p-1"><span class="material-symbols-outlined text-[18px]">edit</span></button>
+                <button @click="deleteCombo(c.id)" class="text-txt-3 hover:text-err p-1"><span class="material-symbols-outlined text-[18px]">delete</span></button>
+              </div>
+            </div>
+            <div class="space-y-1.5">
+              <template x-for="(m, i) in c.models" :key="i">
+                <div class="flex items-center gap-2 text-xs">
+                  <span class="text-txt-3 w-5 text-right" x-text="(i+1)+'.'"></span>
+                  <span class="font-mono text-brand-light" x-text="m"></span>
+                </div>
+              </template>
+            </div>
+            <div class="mt-3 pt-3 border-t border-bdr-light">
+              <code class="text-[11px] text-txt-3">Use as: model = "<span class="text-brand-light" x-text="c.name"></span>"</code>
+            </div>
+          </div>
+        </template>
       </div>
     </div>
 
@@ -539,6 +597,49 @@ tailwind.config={theme:{extend:{colors:{
     <div x-show="page==='settings'" x-transition:enter="transition ease-out duration-250" x-transition:enter-start="opacity-0 translate-y-2" x-transition:enter-end="opacity-100 translate-y-0">
       <div class="mb-6"><h1 class="text-xl font-semibold">Settings</h1><p class="text-xs text-txt-3 mt-1">Dashboard configuration</p></div>
 
+      <!-- Routing Strategy -->
+      <div class="bg-surface-2 border border-bdr rounded-xl p-6 max-w-2xl mb-4">
+        <div class="text-xs text-txt-3 uppercase tracking-wider mb-2">Routing Strategy</div>
+        <p class="text-[12px] text-txt-3 mb-4 leading-relaxed">
+          Controls how accounts are selected for requests. <strong class="text-txt-2">Fill First</strong> always uses highest-priority account.
+          <strong class="text-txt-2">Round Robin</strong> distributes across accounts with sticky rotation.
+        </p>
+        <div class="grid grid-cols-2 gap-4 mb-4">
+          <div>
+            <label class="text-[10px] text-txt-3 uppercase mb-1.5 block">Default Strategy</label>
+            <select x-model="routing.strategy" class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm text-txt-1 focus:outline-none focus:border-brand">
+              <option value="round-robin">Round Robin</option>
+              <option value="fill-first">Fill First</option>
+            </select>
+          </div>
+          <div>
+            <label class="text-[10px] text-txt-3 uppercase mb-1.5 block">Sticky Limit</label>
+            <input type="number" x-model="routing.sticky_limit" min="1" max="20" class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm text-txt-1 focus:outline-none focus:border-brand">
+            <p class="text-[10px] text-txt-3 mt-1">Requests per account before rotating</p>
+          </div>
+        </div>
+        <div class="mb-4">
+          <label class="text-[10px] text-txt-3 uppercase mb-2 block">Per-Provider Overrides</label>
+          <div class="bg-surface-1 border border-bdr rounded-lg p-3 space-y-2">
+            <template x-for="p in providerStats" :key="p.name">
+              <div class="flex items-center gap-3">
+                <span class="text-xs text-txt-2 w-24 capitalize" x-text="p.name"></span>
+                <select @change="setProviderRouting(p.name, $event.target.value, routing.provider_overrides?.[p.name]?.sticky_limit || routing.sticky_limit)" :value="routing.provider_overrides?.[p.name]?.strategy || ''" class="px-2 py-1 bg-surface-2 border border-bdr rounded text-xs text-txt-1 focus:outline-none focus:border-brand">
+                  <option value="">Default</option>
+                  <option value="round-robin">Round Robin</option>
+                  <option value="fill-first">Fill First</option>
+                </select>
+                <input type="number" :value="routing.provider_overrides?.[p.name]?.sticky_limit || ''" @change="setProviderRouting(p.name, routing.provider_overrides?.[p.name]?.strategy || routing.strategy, $event.target.value)" min="1" max="20" placeholder="—" class="w-16 px-2 py-1 bg-surface-2 border border-bdr rounded text-xs text-txt-1 focus:outline-none focus:border-brand">
+              </div>
+            </template>
+          </div>
+        </div>
+        <div class="flex items-center gap-3">
+          <button @click="saveRouting()" class="px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg transition-all">Save</button>
+          <span x-show="routingMsg" class="text-xs text-ok" x-text="routingMsg"></span>
+        </div>
+      </div>
+
       <!-- Supabase Sync -->
       <div class="bg-surface-2 border border-bdr rounded-xl p-6 max-w-2xl mb-4">
         <div class="text-xs text-txt-3 uppercase tracking-wider mb-2">Supabase Sync</div>
@@ -688,6 +789,57 @@ tailwind.config={theme:{extend:{colors:{
       <div class="flex justify-end mt-5">
         <button @click="closeCreateKey()" class="px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg">Done</button>
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- Combo Create/Edit Modal -->
+<div x-show="showComboModal" x-cloak class="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center" @click.self="closeComboModal()">
+  <div class="bg-surface-2 border border-bdr rounded-xl p-6 w-[560px] max-h-[80vh] flex flex-col shadow-2xl">
+    <div class="flex items-center justify-between mb-5">
+      <h2 class="text-base font-semibold" x-text="editingCombo ? 'Edit Combo' : 'Create Combo'"></h2>
+      <button @click="closeComboModal()" class="text-txt-3 hover:text-txt-1"><span class="material-symbols-outlined text-[20px]">close</span></button>
+    </div>
+    <div class="space-y-4 flex-1 overflow-y-auto">
+      <div>
+        <label class="text-[10px] text-txt-3 uppercase mb-1.5 block">Combo Name</label>
+        <input x-model="comboForm.name" placeholder="e.g. smart-fallback" class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm font-mono text-txt-1 placeholder-txt-3 focus:outline-none focus:border-brand">
+      </div>
+      <div class="grid grid-cols-2 gap-4">
+        <div>
+          <label class="text-[10px] text-txt-3 uppercase mb-1.5 block">Strategy</label>
+          <select x-model="comboForm.strategy" class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm text-txt-1 focus:outline-none focus:border-brand">
+            <option value="fallback">Fallback (try in order)</option>
+            <option value="round-robin">Round Robin (rotate first)</option>
+          </select>
+        </div>
+        <div>
+          <label class="text-[10px] text-txt-3 uppercase mb-1.5 block">Sticky Limit</label>
+          <input type="number" x-model="comboForm.sticky_limit" min="1" max="100" class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm text-txt-1 focus:outline-none focus:border-brand">
+        </div>
+      </div>
+      <div>
+        <label class="text-[10px] text-txt-3 uppercase mb-1.5 block">Models (in priority order)</label>
+        <div class="bg-surface-1 border border-bdr rounded-lg p-3 min-h-[80px]">
+          <template x-for="(m, i) in comboForm.models" :key="i">
+            <div class="flex items-center gap-2 py-1.5 border-b border-bdr-light last:border-0">
+              <span class="text-txt-3 text-xs w-5 text-right" x-text="(i+1)+'.'"></span>
+              <span class="flex-1 font-mono text-xs text-brand-light" x-text="m"></span>
+              <button @click="moveComboModel(i, -1)" :disabled="i===0" class="text-txt-3 hover:text-txt-1 disabled:opacity-30 p-0.5"><span class="material-symbols-outlined text-[14px]">arrow_upward</span></button>
+              <button @click="moveComboModel(i, 1)" :disabled="i===comboForm.models.length-1" class="text-txt-3 hover:text-txt-1 disabled:opacity-30 p-0.5"><span class="material-symbols-outlined text-[14px]">arrow_downward</span></button>
+              <button @click="removeModelFromCombo(i)" class="text-txt-3 hover:text-err p-0.5"><span class="material-symbols-outlined text-[14px]">close</span></button>
+            </div>
+          </template>
+          <div x-show="comboForm.models.length===0" class="text-txt-3 text-xs text-center py-3">No models added yet</div>
+        </div>
+        <button @click="addModelToCombo()" class="mt-2 px-3 py-1.5 bg-surface-2 border border-bdr text-txt-2 hover:text-brand-light hover:border-brand text-xs rounded-lg transition-all flex items-center gap-1.5">
+          <span class="material-symbols-outlined text-[14px]">add</span> Add Model
+        </button>
+      </div>
+    </div>
+    <div class="flex justify-end gap-2 mt-5 pt-4 border-t border-bdr-light">
+      <button @click="closeComboModal()" class="px-4 py-2 bg-surface-1 border border-bdr text-txt-2 text-sm rounded-lg hover:text-txt-1">Cancel</button>
+      <button @click="saveCombo()" class="px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg transition-all">Save Combo</button>
     </div>
   </div>
 </div>

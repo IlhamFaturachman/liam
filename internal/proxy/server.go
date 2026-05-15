@@ -36,6 +36,7 @@ type Server struct {
 	modelsHandler *ModelsHandler
 	integrations  *integrations.Service
 	syncer        *liamsync.Syncer
+	combo         *ComboHandler
 }
 
 // GetPort implements ServerConfig for ModelsHandler
@@ -61,6 +62,7 @@ func Start(cfg *config.Config, database *db.Database) error {
 		registry:     registry,
 		aliases:      aliases,
 		integrations: integrations.NewService(),
+		combo:        NewComboHandler(database),
 	}
 	s.modelsHandler = NewModelsHandler(s, database, registry, aliases, s.pool, s.ag)
 
@@ -165,6 +167,19 @@ func Start(cfg *config.Config, database *db.Database) error {
 		r.Get("/sync/status", s.handleSyncStatus)
 		r.Post("/sync/now", s.handleSyncNow)
 
+		// Combos
+		r.Get("/combos", s.combo.HandleList)
+		r.Post("/combos", s.combo.HandleCreate)
+		r.Put("/combos/{id}", s.combo.HandleUpdate)
+		r.Delete("/combos/{id}", s.combo.HandleDelete)
+
+		// Routing settings
+		r.Get("/settings/routing", s.handleGetRouting)
+		r.Post("/settings/routing", s.handleSetRouting)
+
+		// Account reorder (drag-and-drop)
+		r.Post("/accounts/reorder", s.handleReorderAccounts)
+
 		// Harvest
 		r.Post("/harvest/start", s.harvest.HandleStart)
 		r.Get("/harvest/status", s.harvest.HandleStatus)
@@ -261,13 +276,21 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	stream, _ := req["stream"].(bool)
 
+	// Check if model is a combo
+	comboModels := s.combo.ResolveCombo(model)
+	if comboModels != nil {
+		// Combo mode: try each model in order until one succeeds
+		s.handleComboRequest(w, r, req, body, comboModels, stream, startTime)
+		return
+	}
+
 	// Determine provider from model
 	provider := resolveProvider(model)
 
-	// Pick best account
+	// Pick best account (with per-model lock awareness)
 	var lastErr error
 	for attempt := 0; attempt < s.cfg.MaxRetriesPerRequest; attempt++ {
-		account, err := s.pool.Pick(provider)
+		account, err := s.pool.PickForModel(provider, model)
 		if err != nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("No available accounts: %v", err))
 			return
@@ -304,6 +327,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[RETRY %d] Account %s error: %v", attempt+1, account.Email, err)
 			cooldown := s.pool.CalculateCooldown(account.ConsecutiveErrors + 1)
 			s.db.MarkAccountError(account.ID, err.Error(), cooldown)
+			// Set per-model lock
+			if model != "" {
+				s.db.SetModelLock(account.ID, model, time.Now().UTC().Add(time.Duration(cooldown)*time.Second))
+			}
 			continue
 		}
 
@@ -313,6 +340,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[RETRY %d] Account %s auth error: %d", attempt+1, account.Email, resp.StatusCode)
 			cooldown := s.pool.CalculateCooldown(account.ConsecutiveErrors + 1)
 			s.db.MarkAccountError(account.ID, lastErr.Error(), cooldown)
+			if model != "" {
+				s.db.SetModelLock(account.ID, model, time.Now().UTC().Add(time.Duration(cooldown)*time.Second))
+			}
 			resp.Body.Close()
 			continue
 		}
@@ -320,12 +350,14 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		if resp.StatusCode == 429 {
 			lastErr = fmt.Errorf("rate limited")
 			log.Printf("[RETRY %d] Account %s rate limited", attempt+1, account.Email)
-			// Longer cooldown for rate limits (5 minutes minimum)
 			cooldown := s.pool.CalculateCooldown(account.ConsecutiveErrors + 2)
 			if cooldown < 300 {
 				cooldown = 300
 			}
 			s.db.MarkAccountError(account.ID, "rate_limited", cooldown)
+			if model != "" {
+				s.db.SetModelLock(account.ID, model, time.Now().UTC().Add(time.Duration(cooldown)*time.Second))
+			}
 			resp.Body.Close()
 			continue
 		}
@@ -443,7 +475,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	models := []map[string]interface{}{}
+	modelsList := []map[string]interface{}{}
 	for _, m := range registryModels {
 		if !m.IsEnabled {
 			continue
@@ -452,16 +484,26 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		if p := getProviderName(m.ProviderAlias); p != "" {
 			owner = p
 		}
-		models = append(models, map[string]interface{}{
+		modelsList = append(modelsList, map[string]interface{}{
 			"id":       m.ID,
 			"object":   "model",
 			"owned_by": owner,
 		})
 	}
 
+	// Add combo names as virtual models
+	combos, _ := s.db.ListCombos()
+	for _, c := range combos {
+		modelsList = append(modelsList, map[string]interface{}{
+			"id":       c.Name,
+			"object":   "model",
+			"owned_by": "liam-combo",
+		})
+	}
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"object": "list",
-		"data":   models,
+		"data":   modelsList,
 	})
 }
 
@@ -484,6 +526,109 @@ func (s *Server) syncWorker() {
 			log.Printf("[SYNC] Error: %v", err)
 		}
 	}
+}
+
+// handleComboRequest tries each model in a combo until one succeeds
+func (s *Server) handleComboRequest(w http.ResponseWriter, r *http.Request, req map[string]interface{}, originalBody []byte, comboModels []string, stream bool, startTime time.Time) {
+	var lastErr error
+
+	for _, comboModel := range comboModels {
+		// Update model in request
+		req["model"] = comboModel
+		body, _ := json.Marshal(req)
+
+		provider := resolveProvider(comboModel)
+		account, err := s.pool.PickForModel(provider, comboModel)
+		if err != nil {
+			lastErr = err
+			log.Printf("[COMBO] No accounts for %s: %v", comboModel, err)
+			continue // Try next model in combo
+		}
+
+		// Inline token refresh
+		if provider == "antigravity" {
+			RefreshIfNeeded(s.cfg, s.db, account)
+		} else if provider == "kiro" {
+			RefreshKiroIfNeeded(s.cfg, s.db, account)
+		}
+
+		sessionID := s.pool.GetSessionID(account.ID)
+
+		// Execute
+		var resp *http.Response
+		switch provider {
+		case "antigravity":
+			resp, err = s.ag.ExecuteWithSession(account, comboModel, body, stream, sessionID)
+		case "kiro":
+			resp, err = s.kiro.ExecuteWithSession(account, comboModel, body, stream, sessionID)
+		default:
+			continue
+		}
+
+		if err != nil {
+			lastErr = err
+			log.Printf("[COMBO] %s failed (account %s): %v", comboModel, account.Email, err)
+			cooldown := s.pool.CalculateCooldown(account.ConsecutiveErrors + 1)
+			s.db.MarkAccountError(account.ID, err.Error(), cooldown)
+			s.db.SetModelLock(account.ID, comboModel, time.Now().UTC().Add(time.Duration(cooldown)*time.Second))
+			continue
+		}
+
+		if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 429 {
+			lastErr = fmt.Errorf("HTTP %d from %s", resp.StatusCode, comboModel)
+			log.Printf("[COMBO] %s returned %d, trying next", comboModel, resp.StatusCode)
+			cooldown := s.pool.CalculateCooldown(account.ConsecutiveErrors + 1)
+			s.db.MarkAccountError(account.ID, lastErr.Error(), cooldown)
+			s.db.SetModelLock(account.ID, comboModel, time.Now().UTC().Add(time.Duration(cooldown)*time.Second))
+			resp.Body.Close()
+			continue
+		}
+
+		// Success
+		s.db.MarkAccountSuccess(account.ID)
+
+		// Log
+		reqBodyLog := string(originalBody)
+		if len(reqBodyLog) > 5120 {
+			reqBodyLog = reqBodyLog[:5120] + "\n...(truncated)"
+		}
+		latency := int(time.Since(startTime).Milliseconds())
+		usageLog := &db.UsageLog{
+			APIKeyID:     r.Header.Get("X-API-Key-ID"),
+			AccountID:    account.ID,
+			AccountEmail: account.Email,
+			Provider:     provider,
+			Model:        comboModel,
+			StatusCode:   resp.StatusCode,
+			LatencyMs:    latency,
+			RequestBody:  reqBodyLog,
+		}
+
+		BroadcastRequest(map[string]interface{}{
+			"time":       time.Now().UTC().Format("15:04:05"),
+			"model":      comboModel,
+			"account":    account.Email,
+			"latency_ms": latency,
+			"status":     resp.StatusCode,
+		})
+
+		if stream {
+			s.streamResponse(w, resp)
+			usageLog.ResponseBody = "(streaming response)"
+		} else {
+			respBody := s.forwardResponseCapture(w, resp)
+			if len(respBody) > 5120 {
+				usageLog.ResponseBody = respBody[:5120] + "\n...(truncated)"
+			} else {
+				usageLog.ResponseBody = respBody
+			}
+		}
+		s.db.LogUsage(usageLog)
+		return
+	}
+
+	// All combo models failed
+	writeError(w, http.StatusBadGateway, fmt.Sprintf("All models in combo failed: %v", lastErr))
 }
 
 // handleSyncStatus returns current sync status for dashboard
