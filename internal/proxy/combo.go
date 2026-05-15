@@ -18,7 +18,7 @@ type ComboHandler struct {
 }
 
 type comboRotation struct {
-	index              int
+	index               int
 	consecutiveUseCount int
 }
 

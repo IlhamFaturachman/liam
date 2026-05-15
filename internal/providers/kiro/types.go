@@ -99,10 +99,10 @@ type KiroRequest struct {
 }
 
 type ConversationState struct {
-	ChatTriggerType string                  `json:"chatTriggerType"`
-	ConversationID  string                  `json:"conversationId"`
-	CurrentMessage  ChatMessage             `json:"currentMessage"`
-	History         []ChatMessage           `json:"history,omitempty"`
+	ChatTriggerType string        `json:"chatTriggerType"`
+	ConversationID  string        `json:"conversationId"`
+	CurrentMessage  ChatMessage   `json:"currentMessage"`
+	History         []ChatMessage `json:"history,omitempty"`
 }
 
 type ChatMessage struct {
@@ -116,12 +116,30 @@ type UserInputMessage struct {
 	Origin                  string                   `json:"origin"`
 	UserInputMessageContext *UserInputMessageContext `json:"userInputMessageContext,omitempty"`
 	UserIntent              string                   `json:"userIntent,omitempty"`
+	Images                  []KiroImage              `json:"images,omitempty"`
+}
+
+// KiroImage matches the AWS CodeWhisperer image attachment shape:
+//
+//	{ "format": "png", "source": { "bytes": "<base64>" } }
+//
+// "format" is the lowercase media subtype (png, jpeg, gif, webp). The bytes
+// MUST be raw base64 — no `data:...;base64,` prefix. We also enforce a 5 MB
+// post-base64 ceiling per image because the upstream rejects payloads
+// larger than that with an opaque "InvalidRequest" error.
+type KiroImage struct {
+	Format string          `json:"format"`
+	Source KiroImageSource `json:"source"`
+}
+
+type KiroImageSource struct {
+	Bytes string `json:"bytes"`
 }
 
 type UserInputMessageContext struct {
-	Tools             []KiroToolSpec    `json:"tools,omitempty"`
-	ToolResults       []KiroToolResult  `json:"toolResults,omitempty"`
-	EditorState       *EditorState      `json:"editorState,omitempty"`
+	Tools       []KiroToolSpec   `json:"tools,omitempty"`
+	ToolResults []KiroToolResult `json:"toolResults,omitempty"`
+	EditorState *EditorState     `json:"editorState,omitempty"`
 }
 
 type EditorState struct {
@@ -133,9 +151,9 @@ type KiroToolSpec struct {
 }
 
 type ToolSpecification struct {
-	Name        string             `json:"name"`
-	Description string             `json:"description"`
-	InputSchema *ToolInputSchema   `json:"inputSchema,omitempty"`
+	Name        string           `json:"name"`
+	Description string           `json:"description"`
+	InputSchema *ToolInputSchema `json:"inputSchema,omitempty"`
 }
 
 type ToolInputSchema struct {
@@ -143,8 +161,8 @@ type ToolInputSchema struct {
 }
 
 type KiroToolResult struct {
-	ToolUseID string                 `json:"toolUseId"`
-	Status    string                 `json:"status"`
+	ToolUseID string                  `json:"toolUseId"`
+	Status    string                  `json:"status"`
 	Content   []KiroToolResultContent `json:"content"`
 }
 
@@ -154,9 +172,9 @@ type KiroToolResultContent struct {
 }
 
 type AssistantResponseMessage struct {
-	Content   string             `json:"content"`
-	MessageID string             `json:"messageId,omitempty"`
-	ToolUses  []KiroToolUse      `json:"toolUses,omitempty"`
+	Content   string        `json:"content"`
+	MessageID string        `json:"messageId,omitempty"`
+	ToolUses  []KiroToolUse `json:"toolUses,omitempty"`
 }
 
 type KiroToolUse struct {

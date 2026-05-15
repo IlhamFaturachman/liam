@@ -814,33 +814,70 @@ func (d *Database) CleanOldLogs(olderThan time.Duration) (int64, error) {
 	return result.RowsAffected()
 }
 
-// UsageStats holds aggregated usage statistics
+// UsageStats summarises usage for a window. We expose input/output token
+// counts and an estimated cost separately because the dashboard renders
+// them as distinct cards (matching what users expect from 9router and
+// other proxy dashboards).
 type UsageStats struct {
-	TotalRequests int     `json:"total_requests"`
-	TotalTokens   int     `json:"total_tokens"`
-	AvgLatencyMs  int     `json:"avg_latency_ms"`
-	SuccessRate   float64 `json:"success_rate"`
-	ErrorCount    int     `json:"error_count"`
+	TotalRequests     int     `json:"total_requests"`
+	TotalInputTokens  int     `json:"total_input_tokens"`
+	TotalOutputTokens int     `json:"total_output_tokens"`
+	TotalTokens       int     `json:"total_tokens"`
+	EstimatedCost     float64 `json:"estimated_cost"`
+	AvgLatencyMs      int     `json:"avg_latency_ms"`
+	SuccessRate       float64 `json:"success_rate"`
+	ErrorCount        int     `json:"error_count"`
+	Period            string  `json:"period"`
 }
 
-// GetUsageStats returns aggregated stats for today
-func (d *Database) GetUsageStats() (*UsageStats, error) {
-	today := time.Now().UTC().Format("2006-01-02")
+// resolveUsagePeriod converts a human period token (today/24h/7d/30d/60d)
+// into a SQL-friendly RFC3339 lower bound. Unknown values fall back to
+// "today" so the dashboard never receives an empty payload.
+func resolveUsagePeriod(period string) (string, string) {
+	now := time.Now().UTC()
+	period = strings.ToLower(strings.TrimSpace(period))
+	if period == "" {
+		period = "today"
+	}
+	switch period {
+	case "today":
+		return period, now.Format("2006-01-02") + "T00:00:00Z"
+	case "24h":
+		return period, now.Add(-24 * time.Hour).Format(time.RFC3339)
+	case "7d":
+		return period, now.Add(-7 * 24 * time.Hour).Format(time.RFC3339)
+	case "30d":
+		return period, now.Add(-30 * 24 * time.Hour).Format(time.RFC3339)
+	case "60d":
+		return period, now.Add(-60 * 24 * time.Hour).Format(time.RFC3339)
+	default:
+		return "today", now.Format("2006-01-02") + "T00:00:00Z"
+	}
+}
 
-	var stats UsageStats
+// GetUsageStats returns aggregated stats for the requested period.
+// `period` accepts: today (default), 24h, 7d, 30d, 60d.
+func (d *Database) GetUsageStats(period string) (*UsageStats, error) {
+	resolvedPeriod, since := resolveUsagePeriod(period)
+
+	stats := &UsageStats{Period: resolvedPeriod}
 	var avgLat sql.NullFloat64
 	var totalReqs, successReqs int
 
 	err := d.db.QueryRow(`
-		SELECT COUNT(*), COALESCE(SUM(tokens_in + tokens_out), 0), AVG(latency_ms),
+		SELECT COUNT(*),
+			COALESCE(SUM(tokens_in), 0),
+			COALESCE(SUM(tokens_out), 0),
+			AVG(latency_ms),
 			SUM(CASE WHEN status_code >= 200 AND status_code < 400 THEN 1 ELSE 0 END)
-		FROM usage_logs WHERE created_at >= ?`, today+"T00:00:00Z").Scan(
-		&totalReqs, &stats.TotalTokens, &avgLat, &successReqs)
+		FROM usage_logs WHERE created_at >= ?`, since).Scan(
+		&totalReqs, &stats.TotalInputTokens, &stats.TotalOutputTokens, &avgLat, &successReqs)
 	if err != nil {
-		return &UsageStats{}, nil
+		return stats, nil
 	}
 
 	stats.TotalRequests = totalReqs
+	stats.TotalTokens = stats.TotalInputTokens + stats.TotalOutputTokens
 	if avgLat.Valid {
 		stats.AvgLatencyMs = int(avgLat.Float64)
 	}
@@ -849,41 +886,272 @@ func (d *Database) GetUsageStats() (*UsageStats, error) {
 	}
 	stats.ErrorCount = totalReqs - successReqs
 
-	return &stats, nil
+	// Per-model cost rollup. We average the per-1k-token prices for
+	// input + output across the canonical Claude/Gemini SKUs that LIAM
+	// proxies — see modelPricing below. Models not in the table are
+	// treated as free so the estimate doesn't double-count unknown
+	// custom models.
+	rows, err := d.db.Query(`
+		SELECT model, COALESCE(SUM(tokens_in), 0), COALESCE(SUM(tokens_out), 0)
+		FROM usage_logs WHERE created_at >= ?
+		GROUP BY model`, since)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var model string
+			var in, out int
+			if err := rows.Scan(&model, &in, &out); err != nil {
+				continue
+			}
+			pIn, pOut := modelPricing(model)
+			stats.EstimatedCost += float64(in)/1000.0*pIn + float64(out)/1000.0*pOut
+		}
+	}
+
+	return stats, nil
+}
+
+// modelPricing returns (input $ / 1k tokens, output $ / 1k tokens) for a
+// known model id. Numbers are an approximation of public Anthropic and
+// Google list prices at the time of writing — they're displayed in the
+// dashboard with a "Estimated, not actual billing" disclaimer.
+func modelPricing(model string) (float64, float64) {
+	// Strip provider prefix (kr/, ag/, kiro/) so we only care about the
+	// SKU name itself.
+	if idx := strings.Index(model, "/"); idx >= 0 {
+		model = model[idx+1:]
+	}
+	model = strings.ToLower(model)
+	switch {
+	case strings.Contains(model, "opus-4.7") || strings.Contains(model, "opus-4-7"):
+		return 0.015, 0.075 // Anthropic Opus pricing
+	case strings.Contains(model, "opus-4.6") || strings.Contains(model, "opus-4-6"):
+		return 0.015, 0.075
+	case strings.Contains(model, "sonnet-4.6") || strings.Contains(model, "sonnet-4-6"):
+		return 0.003, 0.015 // Anthropic Sonnet pricing
+	case strings.Contains(model, "sonnet-4.5") || strings.Contains(model, "sonnet-4-5"):
+		return 0.003, 0.015
+	case strings.Contains(model, "haiku-4.5") || strings.Contains(model, "haiku-4-5"):
+		return 0.0008, 0.004 // Anthropic Haiku pricing
+	case strings.Contains(model, "gemini-3.1-pro") || strings.Contains(model, "gemini-3-pro"):
+		return 0.00125, 0.005
+	case strings.Contains(model, "gemini-3-flash") || strings.Contains(model, "gemini-3.1-flash"):
+		return 0.000075, 0.0003
+	case strings.Contains(model, "gpt-oss-120b"):
+		return 0.0006, 0.0024
+	case strings.Contains(model, "deepseek"):
+		return 0.00027, 0.0011
+	case strings.Contains(model, "qwen"):
+		return 0.0004, 0.002
+	case strings.Contains(model, "glm-5"):
+		return 0.0003, 0.0015
+	case strings.Contains(model, "minimax"):
+		return 0.0002, 0.0011
+	}
+	return 0, 0
 }
 
 // ChartBucket holds data for one time bucket
 type ChartBucket struct {
-	Time     string `json:"time"`
+	Time      string `json:"time"`
+	Requests  int    `json:"requests"`
+	Tokens    int    `json:"tokens"`
+	InTokens  int    `json:"in_tokens"`
+	OutTokens int    `json:"out_tokens"`
+}
+
+// GetUsageChart returns time-series data sized to the requested period.
+// `period` matches GetUsageStats: today / 24h / 7d / 30d / 60d.
+//
+// We pick the bucket granularity automatically:
+//   - today, 24h     → 24 hourly buckets
+//   - 7d             → 7 daily buckets
+//   - 30d            → 30 daily buckets
+//   - 60d            → 60 daily buckets
+//
+// One SQL query (with strftime grouping) populates the buckets in O(N)
+// instead of N round trips.
+func (d *Database) GetUsageChart(period string) ([]ChartBucket, error) {
+	resolved, _ := resolveUsagePeriod(period)
+	now := time.Now().UTC()
+
+	type window struct {
+		count    int
+		key      func(t time.Time) string
+		fmt      string // strftime format used to bucket rows in SQL
+		labelFmt string // human-readable label per bucket
+		stride   time.Duration
+	}
+
+	var w window
+	switch resolved {
+	case "today", "24h":
+		w = window{count: 24, fmt: "%Y-%m-%d %H", labelFmt: "15:00", stride: time.Hour,
+			key: func(t time.Time) string { return t.Format("2006-01-02 15") }}
+	case "7d":
+		w = window{count: 7, fmt: "%Y-%m-%d", labelFmt: "Mon 02", stride: 24 * time.Hour,
+			key: func(t time.Time) string { return t.Format("2006-01-02") }}
+	case "30d":
+		w = window{count: 30, fmt: "%Y-%m-%d", labelFmt: "Jan 02", stride: 24 * time.Hour,
+			key: func(t time.Time) string { return t.Format("2006-01-02") }}
+	case "60d":
+		w = window{count: 60, fmt: "%Y-%m-%d", labelFmt: "Jan 02", stride: 24 * time.Hour,
+			key: func(t time.Time) string { return t.Format("2006-01-02") }}
+	default:
+		w = window{count: 24, fmt: "%Y-%m-%d %H", labelFmt: "15:00", stride: time.Hour,
+			key: func(t time.Time) string { return t.Format("2006-01-02 15") }}
+	}
+
+	// Pre-allocate buckets so empty periods still render nicely.
+	buckets := make([]ChartBucket, w.count)
+	keyToIdx := make(map[string]int, w.count)
+	for i := 0; i < w.count; i++ {
+		t := now.Add(-time.Duration(w.count-1-i) * w.stride)
+		buckets[i] = ChartBucket{Time: t.Format(w.labelFmt)}
+		keyToIdx[w.key(t)] = i
+	}
+
+	startKey := now.Add(-time.Duration(w.count-1) * w.stride)
+	rows, err := d.db.Query(`
+		SELECT strftime(?, created_at) AS bucket,
+			COUNT(*),
+			COALESCE(SUM(tokens_in), 0),
+			COALESCE(SUM(tokens_out), 0)
+		FROM usage_logs
+		WHERE created_at >= ?
+		GROUP BY bucket
+		ORDER BY bucket ASC`, w.fmt, startKey.Format(time.RFC3339))
+	if err != nil {
+		return buckets, nil
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var bucket string
+		var reqs, in, out int
+		if err := rows.Scan(&bucket, &reqs, &in, &out); err != nil {
+			continue
+		}
+		idx, ok := keyToIdx[bucket]
+		if !ok {
+			continue
+		}
+		buckets[idx].Requests = reqs
+		buckets[idx].InTokens = in
+		buckets[idx].OutTokens = out
+		buckets[idx].Tokens = in + out
+	}
+
+	return buckets, nil
+}
+
+// TopModelStat is a compact summary of one model's traffic for use on the
+// dashboard's overview page.
+type TopModelStat struct {
+	Model    string `json:"model"`
+	Provider string `json:"provider"`
 	Requests int    `json:"requests"`
 	Tokens   int    `json:"tokens"`
 }
 
-// GetUsageChart returns hourly bucketed data for the last N hours
-func (d *Database) GetUsageChart(hours int) ([]ChartBucket, error) {
-	buckets := make([]ChartBucket, hours)
+// GetTopModels returns the most-used models within the requested period
+// (default "today"). Ordered by request count, capped at `limit`.
+func (d *Database) GetTopModels(period string, limit int) ([]TopModelStat, error) {
+	if limit <= 0 {
+		limit = 5
+	}
+	_, since := resolveUsagePeriod(period)
+	rows, err := d.db.Query(`
+		SELECT model, provider, COUNT(*) AS reqs,
+			COALESCE(SUM(tokens_in + tokens_out), 0) AS tokens
+		FROM usage_logs
+		WHERE created_at >= ? AND model != ''
+		GROUP BY model, provider
+		ORDER BY reqs DESC
+		LIMIT ?`, since, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []TopModelStat
+	for rows.Next() {
+		var stat TopModelStat
+		if err := rows.Scan(&stat.Model, &stat.Provider, &stat.Requests, &stat.Tokens); err != nil {
+			continue
+		}
+		out = append(out, stat)
+	}
+	return out, nil
+}
+
+// RecentErrorEntry surfaces the most recent failed requests so the
+// overview page can call them out without forcing the user to dig
+// through the full Usage table.
+type RecentErrorEntry struct {
+	ID         string `json:"id"`
+	CreatedAt  string `json:"created_at"`
+	Model      string `json:"model"`
+	Provider   string `json:"provider"`
+	Account    string `json:"account_email"`
+	StatusCode int    `json:"status_code"`
+	LatencyMs  int    `json:"latency_ms"`
+	Error      string `json:"error,omitempty"`
+}
+
+// GetRecentErrors returns up to `limit` failed requests from the last
+// 24h. We hard-bound the lookback to avoid showing stale failures from
+// last week on the overview page.
+func (d *Database) GetRecentErrors(limit int) ([]RecentErrorEntry, error) {
+	if limit <= 0 {
+		limit = 5
+	}
+	since := time.Now().UTC().Add(-24 * time.Hour).Format(time.RFC3339)
+	rows, err := d.db.Query(`
+		SELECT id, created_at, model, provider, COALESCE(account_email, ''),
+			status_code, latency_ms, COALESCE(error, '')
+		FROM usage_logs
+		WHERE created_at >= ?
+			AND (status_code >= 400 OR error != '')
+		ORDER BY created_at DESC
+		LIMIT ?`, since, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []RecentErrorEntry
+	for rows.Next() {
+		var e RecentErrorEntry
+		if err := rows.Scan(&e.ID, &e.CreatedAt, &e.Model, &e.Provider, &e.Account,
+			&e.StatusCode, &e.LatencyMs, &e.Error); err != nil {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out, nil
+}
+
+// CountActiveModelLocks returns how many `(account, model)` pairs are
+// still in cooldown across all accounts. Useful as a quick health
+// signal: a high lock count means many accounts are throttled and the
+// system is degrading.
+func (d *Database) CountActiveModelLocks() (int, error) {
+	accounts, err := d.ListAccounts("")
+	if err != nil {
+		return 0, err
+	}
 	now := time.Now().UTC()
-
-	for i := hours - 1; i >= 0; i-- {
-		t := now.Add(-time.Duration(i) * time.Hour)
-		start := t.Format("2006-01-02T15") + ":00:00Z"
-		end := t.Format("2006-01-02T15") + ":59:59Z"
-
-		var reqs int
-		var tokens int
-		d.db.QueryRow(`
-			SELECT COUNT(*), COALESCE(SUM(tokens_in + tokens_out), 0)
-			FROM usage_logs WHERE created_at >= ? AND created_at <= ?`,
-			start, end).Scan(&reqs, &tokens)
-
-		buckets[hours-1-i] = ChartBucket{
-			Time:     t.Format("15:00"),
-			Requests: reqs,
-			Tokens:   tokens,
+	count := 0
+	for _, a := range accounts {
+		locks := d.GetModelLocks(a.ID)
+		for _, until := range locks {
+			if until.After(now) {
+				count++
+			}
 		}
 	}
-
-	return buckets, nil
+	return count, nil
 }
 
 // --- Combo Operations ---

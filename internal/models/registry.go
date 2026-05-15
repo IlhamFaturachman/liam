@@ -66,6 +66,13 @@ func BuiltInModels() []Model {
 		{ProviderAlias: "kr", ModelID: "qwen3-coder-next", DisplayName: "Qwen3 Coder Next", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
 		{ProviderAlias: "kr", ModelID: "glm-5", DisplayName: "GLM 5", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
 		{ProviderAlias: "kr", ModelID: "MiniMax-M2.5", DisplayName: "MiniMax M2.5", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		// NOTE on thinking: Kiro upstream rejects model SKUs with the
+		// `-thinking` suffix ("Invalid model" error from CodeWhisperer).
+		// Models like deepseek-3.2 emit reasoningContentEvent natively
+		// without any client-side flag, so we don't expose `-thinking`
+		// variants for Kiro at all — see internal/proxy/server.go where
+		// the suffix is preserved literally only if the user adds a
+		// custom Kiro model with that name.
 	}
 }
 

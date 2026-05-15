@@ -11,13 +11,13 @@ type Hermes struct{}
 
 var hermesModelBlockRE = regexp.MustCompile(`(?m)^model:[ \t]*\r?\n((?:[ \t]+.*\r?\n?|[ \t]*\r?\n)*)`)
 
-func (h *Hermes) Name() string             { return "hermes" }
-func (h *Hermes) DisplayName() string      { return "Hermes Agent" }
-func (h *Hermes) Description() string      { return "Nous Research self-improving AI agent" }
-func (h *Hermes) Icon() string             { return "auto_awesome" }
-func (h *Hermes) ConfigPath() string       { return "~/.hermes/config.yaml" }
-func (h *Hermes) BinaryName() string       { return "hermes" }
-func (h *Hermes) SupportsAutoApply() bool  { return true }
+func (h *Hermes) Name() string            { return "hermes" }
+func (h *Hermes) DisplayName() string     { return "Hermes Agent" }
+func (h *Hermes) Description() string     { return "Nous Research self-improving AI agent" }
+func (h *Hermes) Icon() string            { return "auto_awesome" }
+func (h *Hermes) ConfigPath() string      { return "~/.hermes/config.yaml" }
+func (h *Hermes) BinaryName() string      { return "hermes" }
+func (h *Hermes) SupportsAutoApply() bool { return true }
 
 func (h *Hermes) ModelSlots() []ModelSlot {
 	return []ModelSlot{
@@ -50,21 +50,29 @@ func (h *Hermes) Status() (*ToolStatus, error) {
 	return &ToolStatus{
 		Name: h.Name(), DisplayName: h.DisplayName(), Description: h.Description(), Icon: h.Icon(),
 		Installed: IsToolInstalled(h.BinaryName(), h.ConfigPath()),
-		HasLiam: hasLiam, ConfigPath: configPath, ConfigExists: FileExists(configPath),
+		HasLiam:   hasLiam, ConfigPath: configPath, ConfigExists: FileExists(configPath),
 		SupportsAutoApply: true, BinaryName: h.BinaryName(), ModelSlots: h.ModelSlots(),
 	}, nil
 }
 
 func (h *Hermes) Apply(cfg ToolConfig) error {
 	configPath := ExpandHome(h.ConfigPath())
-	if err := EnsureDir(h.ConfigPath()); err != nil { return err }
-	if err := BackupFile(h.ConfigPath()); err != nil { return err }
+	if err := EnsureDir(h.ConfigPath()); err != nil {
+		return err
+	}
+	if err := BackupFile(h.ConfigPath()); err != nil {
+		return err
+	}
 
 	model := cfg.Models["primary"]
-	if model == "" { model = "ag/claude-opus-4-6-thinking" }
+	if model == "" {
+		model = "ag/claude-opus-4-6-thinking"
+	}
 
 	existing := ""
-	if data, err := os.ReadFile(configPath); err == nil { existing = string(data) }
+	if data, err := os.ReadFile(configPath); err == nil {
+		existing = string(data)
+	}
 
 	newBlock := fmt.Sprintf("model:\n  default: \"%s\"\n  provider: \"custom\"\n  base_url: \"%s\"\n", model, cfg.BaseURL)
 	var newContent string
@@ -75,20 +83,30 @@ func (h *Hermes) Apply(cfg ToolConfig) error {
 	} else {
 		newContent = newBlock + "\n" + existing
 	}
-	if err := os.WriteFile(configPath, []byte(newContent), 0644); err != nil { return err }
+	if err := os.WriteFile(configPath, []byte(newContent), 0644); err != nil {
+		return err
+	}
 
 	envContent := ""
-	if data, err := os.ReadFile(h.envPath()); err == nil { envContent = string(data) }
+	if data, err := os.ReadFile(h.envPath()); err == nil {
+		envContent = string(data)
+	}
 	envContent = upsertEnvVar(envContent, "OPENAI_API_KEY", cfg.APIKey)
 	return os.WriteFile(h.envPath(), []byte(envContent), 0644)
 }
 
 func (h *Hermes) Reset() error {
 	configPath := ExpandHome(h.ConfigPath())
-	if !FileExists(configPath) { return nil }
-	if err := BackupFile(h.ConfigPath()); err != nil { return err }
+	if !FileExists(configPath) {
+		return nil
+	}
+	if err := BackupFile(h.ConfigPath()); err != nil {
+		return err
+	}
 	data, err := os.ReadFile(configPath)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	cleaned := hermesModelBlockRE.ReplaceAllString(string(data), "")
 	cleaned = strings.TrimLeft(cleaned, "\n")
 	return os.WriteFile(configPath, []byte(cleaned), 0644)
@@ -96,7 +114,9 @@ func (h *Hermes) Reset() error {
 
 func (h *Hermes) Snippet(cfg ToolConfig) string {
 	model := cfg.Models["primary"]
-	if model == "" { model = "ag/claude-opus-4-6-thinking" }
+	if model == "" {
+		model = "ag/claude-opus-4-6-thinking"
+	}
 	return fmt.Sprintf(`# ~/.hermes/config.yaml
 model:
   default: "%s"
@@ -119,11 +139,15 @@ func upsertEnvVar(envText, key, value string) string {
 		}
 	}
 	if !found {
-		if envText != "" && !strings.HasSuffix(envText, "\n") { envText += "\n" }
+		if envText != "" && !strings.HasSuffix(envText, "\n") {
+			envText += "\n"
+		}
 		envText += key + "=" + value + "\n"
 		return envText
 	}
 	result := strings.Join(lines, "\n")
-	if !strings.HasSuffix(result, "\n") { result += "\n" }
+	if !strings.HasSuffix(result, "\n") {
+		result += "\n"
+	}
 	return result
 }

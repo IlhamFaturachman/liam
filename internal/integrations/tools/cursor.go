@@ -8,13 +8,13 @@ import (
 
 type Cursor struct{}
 
-func (c *Cursor) Name() string             { return "cursor" }
-func (c *Cursor) DisplayName() string      { return "Cursor" }
-func (c *Cursor) Description() string      { return "Cursor AI Code Editor" }
-func (c *Cursor) Icon() string             { return "edit_note" }
-func (c *Cursor) ConfigPath() string       { return "" }
-func (c *Cursor) BinaryName() string       { return "" }
-func (c *Cursor) SupportsAutoApply() bool  { return false }
+func (c *Cursor) Name() string            { return "cursor" }
+func (c *Cursor) DisplayName() string     { return "Cursor" }
+func (c *Cursor) Description() string     { return "Cursor AI Code Editor" }
+func (c *Cursor) Icon() string            { return "edit_note" }
+func (c *Cursor) ConfigPath() string      { return "" }
+func (c *Cursor) BinaryName() string      { return "" }
+func (c *Cursor) SupportsAutoApply() bool { return false }
 
 func (c *Cursor) ModelSlots() []ModelSlot {
 	return []ModelSlot{

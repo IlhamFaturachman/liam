@@ -30,6 +30,7 @@ type Server struct {
 	pool          *AccountPool
 	ag            *antigravity.Executor
 	kiro          *kiro.Executor
+	providers     *providerRegistry
 	harvest       *harvest.HarvestService
 	registry      *models.Registry
 	aliases       *models.AliasStore
@@ -64,6 +65,30 @@ func Start(cfg *config.Config, database *db.Database) error {
 		integrations: integrations.NewService(),
 		combo:        NewComboHandler(database),
 	}
+
+	// Build the provider registry. New backends drop in here without
+	// touching server.go's request flow — the chat handler, refresh
+	// loop, stats endpoints, and dashboard now all source their list
+	// from this single registry.
+	s.providers = newProviderRegistry()
+	s.providers.Register(&ProviderInfo{
+		ID:             "antigravity",
+		Aliases:        []string{"ag", "antigravity"},
+		Label:          "Antigravity",
+		Icon:           "rocket_launch",
+		SupportsImport: true,
+		Executor:       s.ag,
+		Refresh:        RefreshIfNeeded,
+	})
+	s.providers.Register(&ProviderInfo{
+		ID:             "kiro",
+		Aliases:        []string{"kr", "kiro"},
+		Label:          "Kiro",
+		Icon:           "cloud",
+		SupportsImport: true,
+		Executor:       s.kiro,
+		Refresh:        RefreshKiroIfNeeded,
+	})
 
 	// Initialize Supabase sync first so the models handler can wire it
 	// for auto-sync of custom-model CRUD.
@@ -148,6 +173,7 @@ func Start(cfg *config.Config, database *db.Database) error {
 			r.Get("/usage/chart", s.HandleUsageChart)
 			r.Get("/usage/{id}", s.HandleUsageDetail)
 			r.Get("/providers/stats", s.HandleProviderStats)
+			r.Get("/overview", s.HandleOverview)
 
 			// Models
 			r.Get("/models", s.modelsHandler.HandleListModels)
@@ -306,14 +332,34 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		body, _ = json.Marshal(req)
 	}
 
-	// Option C Thinking: handle -thinking suffix (backward compat)
+	// Option C Thinking: handle -thinking suffix (backward compat).
+	//
+	// For Antigravity we map the suffix to reasoning_effort=high and route
+	// to the base model — that's how their generateContent API exposes
+	// thinking budgets.
+	//
+	// For Kiro we forward the suffixed modelId as-is to the upstream
+	// (codewhisperer.us-east-1.amazonaws.com): based on observation,
+	// Kiro accepts model SKUs like "claude-sonnet-4.5-thinking"
+	// directly. Stripping the suffix would silently downgrade thinking
+	// requests to the non-thinking variant.
 	if strings.HasSuffix(model, "-thinking") {
+		isKiro := strings.HasPrefix(model, "kr/") || strings.HasPrefix(model, "kiro/")
 		baseModel := strings.TrimSuffix(model, "-thinking")
 		// Check if base model exists in registry
-		if _, err := s.registry.Get(baseModel); err == nil {
+		_, baseErr := s.registry.Get(baseModel)
+
+		if isKiro {
+			// Pass-through: keep the suffix on the upstream modelId so
+			// Kiro can dispatch to the thinking-enabled SKU. Don't set
+			// reasoning_effort because Kiro ignores it on the wire.
+			// We still log the routing decision below for debugging.
+			_ = baseErr
+		} else if baseErr == nil {
+			// Antigravity (or any other registered base model): strip
+			// suffix and inject reasoning_effort.
 			model = baseModel
 			req["model"] = baseModel
-			// Set reasoning_effort = "high" if not already set
 			if _, ok := req["reasoning_effort"]; !ok {
 				req["reasoning_effort"] = "high"
 			}
@@ -329,8 +375,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	stream, _ := req["stream"].(bool)
 
-	// Determine provider from model
-	provider := resolveProvider(model)
+	// Determine provider from model. The registry resolves alias prefixes
+	// (`kr/`, `ag/`, …) into a single canonical id so the rest of the
+	// chat handler stays provider-agnostic.
+	provider := s.resolveProviderFromModel(model)
+	providerInfo := s.providers.ByID(provider)
 
 	// Extract session ID for session affinity
 	sessionID := extractSessionID(r, req)
@@ -352,13 +401,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Inline token refresh if needed
-		if provider == "antigravity" {
-			if refreshErr := RefreshIfNeeded(s.cfg, s.db, account); refreshErr != nil {
-				log.Printf("[REFRESH] Warning for %s: %v", account.Email, refreshErr)
-			}
-		} else if provider == "kiro" {
-			if refreshErr := RefreshKiroIfNeeded(s.cfg, s.db, account); refreshErr != nil {
+		// Inline token refresh if the provider registered a refresher.
+		if providerInfo != nil && providerInfo.Refresh != nil {
+			if refreshErr := providerInfo.Refresh(s.cfg, s.db, account); refreshErr != nil {
 				log.Printf("[REFRESH] Warning for %s: %v", account.Email, refreshErr)
 			}
 		}
@@ -366,17 +411,16 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		// Get stable session ID for this account
 		sessionID := s.pool.GetSessionID(account.ID)
 
-		// Execute request based on provider
+		// Execute the request via the registered executor. Unknown
+		// providers fall through to a clear 400 error so the operator
+		// can spot the misconfiguration rather than silently routing
+		// to the wrong backend.
 		var resp *http.Response
-		switch provider {
-		case "antigravity":
-			resp, err = s.ag.ExecuteWithSession(account, model, body, stream, sessionID)
-		case "kiro":
-			resp, err = s.kiro.ExecuteWithSession(account, model, body, stream, sessionID)
-		default:
+		if providerInfo == nil || providerInfo.Executor == nil {
 			writeError(w, http.StatusBadRequest, fmt.Sprintf("Unsupported provider: %s", provider))
 			return
 		}
+		resp, err = providerInfo.Executor.ExecuteWithSession(account, model, body, stream, sessionID)
 
 		if err != nil {
 			lastErr = err
@@ -492,10 +536,12 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 		// Stream or return response
 		if stream {
-			s.streamResponse(w, resp)
+			streamBody := s.streamResponse(w, resp)
+			usageLog.TokensIn, usageLog.TokensOut = extractTokenUsage(streamBody)
 			usageLog.ResponseBody = "(streaming response)"
 		} else {
 			respBody := s.forwardResponseCapture(w, resp)
+			usageLog.TokensIn, usageLog.TokensOut = extractTokenUsage(respBody)
 			if len(respBody) > 5120 {
 				usageLog.ResponseBody = respBody[:5120] + "\n...(truncated)"
 			} else {
@@ -526,8 +572,13 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	writeError(w, http.StatusBadGateway, fmt.Sprintf("All retries failed: %v", lastErr))
 }
 
-// streamResponse pipes SSE from upstream to client
-func (s *Server) streamResponse(w http.ResponseWriter, resp *http.Response) {
+// streamResponse pipes SSE from upstream to client. While forwarding, we
+// also tee the body into an in-memory buffer so the caller can extract
+// usage metadata (prompt/completion tokens) from the final chunk after the
+// stream finishes. Buffer is capped at 1 MB to avoid blowing memory on
+// long generations — the usage chunk always lands at the very end and the
+// last 64 KB is more than enough to recover it.
+func (s *Server) streamResponse(w http.ResponseWriter, resp *http.Response) string {
 	defer resp.Body.Close()
 
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -539,8 +590,11 @@ func (s *Server) streamResponse(w http.ResponseWriter, resp *http.Response) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
-		return
+		return ""
 	}
+
+	const maxCapture = 1 * 1024 * 1024 // 1 MB rolling capture
+	captured := make([]byte, 0, 64*1024)
 
 	buf := make([]byte, 4096)
 	for {
@@ -548,6 +602,14 @@ func (s *Server) streamResponse(w http.ResponseWriter, resp *http.Response) {
 		if n > 0 {
 			w.Write(buf[:n])
 			flusher.Flush()
+
+			// Append to capture, then trim to keep only the tail. The
+			// usage record is always emitted last so we just need the
+			// final ~64 KB to find it.
+			captured = append(captured, buf[:n]...)
+			if len(captured) > maxCapture {
+				captured = captured[len(captured)-maxCapture:]
+			}
 		}
 		if err != nil {
 			if err != io.EOF {
@@ -556,6 +618,7 @@ func (s *Server) streamResponse(w http.ResponseWriter, resp *http.Response) {
 			break
 		}
 	}
+	return string(captured)
 }
 
 // forwardResponseCapture returns non-streaming response and captures body for logging
@@ -566,6 +629,87 @@ func (s *Server) forwardResponseCapture(w http.ResponseWriter, resp *http.Respon
 	w.WriteHeader(resp.StatusCode)
 	w.Write(body)
 	return string(body)
+}
+
+// extractTokenUsage walks a captured response body (either a JSON object
+// for non-streaming responses, or an SSE chat.completion.chunk stream for
+// streamed responses) and returns the (input, output) token counts found
+// in the final usage record. Returns (0, 0) when no usage data is
+// present — the dashboard then renders the row as "0 in / 0 out" which
+// is acceptable for tool-only or aborted requests, but for normal
+// completions the providers always emit a metricsEvent / usage field
+// that this function picks up.
+func extractTokenUsage(body string) (in int, out int) {
+	if body == "" {
+		return 0, 0
+	}
+	trimmed := strings.TrimSpace(body)
+
+	// Non-streaming JSON: {"usage": {"prompt_tokens": N, "completion_tokens": M}}
+	if strings.HasPrefix(trimmed, "{") {
+		var probe struct {
+			Usage *struct {
+				PromptTokens     int `json:"prompt_tokens"`
+				CompletionTokens int `json:"completion_tokens"`
+				InputTokens      int `json:"input_tokens"`
+				OutputTokens     int `json:"output_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal([]byte(trimmed), &probe); err == nil && probe.Usage != nil {
+			in = probe.Usage.PromptTokens
+			if in == 0 {
+				in = probe.Usage.InputTokens
+			}
+			out = probe.Usage.CompletionTokens
+			if out == 0 {
+				out = probe.Usage.OutputTokens
+			}
+			return in, out
+		}
+	}
+
+	// SSE stream: scan every "data: ..." line, keep the LAST chunk that
+	// carries a usage record. Providers emit usage on the final chunk
+	// (right before [DONE]) so iterating to the end is correct.
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+		var chunk struct {
+			Usage *struct {
+				PromptTokens     int `json:"prompt_tokens"`
+				CompletionTokens int `json:"completion_tokens"`
+				InputTokens      int `json:"input_tokens"`
+				OutputTokens     int `json:"output_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			continue
+		}
+		if chunk.Usage == nil {
+			continue
+		}
+		// Capture the most recent non-zero usage. Some providers emit
+		// running totals before the final chunk; others only emit once.
+		if chunk.Usage.PromptTokens > 0 || chunk.Usage.InputTokens > 0 {
+			in = chunk.Usage.PromptTokens
+			if in == 0 {
+				in = chunk.Usage.InputTokens
+			}
+		}
+		if chunk.Usage.CompletionTokens > 0 || chunk.Usage.OutputTokens > 0 {
+			out = chunk.Usage.CompletionTokens
+			if out == 0 {
+				out = chunk.Usage.OutputTokens
+			}
+		}
+	}
+	return in, out
 }
 
 // --- Models endpoint ---
@@ -640,7 +784,8 @@ func (s *Server) handleComboRequest(w http.ResponseWriter, r *http.Request, req 
 		req["model"] = comboModel
 		body, _ := json.Marshal(req)
 
-		provider := resolveProvider(comboModel)
+		provider := s.resolveProviderFromModel(comboModel)
+		providerInfo := s.providers.ByID(provider)
 		account, err := s.pool.PickForModel(provider, comboModel)
 		if err != nil {
 			lastErr = err
@@ -648,25 +793,21 @@ func (s *Server) handleComboRequest(w http.ResponseWriter, r *http.Request, req 
 			continue // Try next model in combo
 		}
 
-		// Inline token refresh
-		if provider == "antigravity" {
-			RefreshIfNeeded(s.cfg, s.db, account)
-		} else if provider == "kiro" {
-			RefreshKiroIfNeeded(s.cfg, s.db, account)
+		// Inline token refresh via the registered hook (no-op when the
+		// provider doesn't need one).
+		if providerInfo != nil && providerInfo.Refresh != nil {
+			providerInfo.Refresh(s.cfg, s.db, account)
 		}
 
 		sessionID := s.pool.GetSessionID(account.ID)
 
-		// Execute
+		// Execute. Unknown providers in a combo are skipped — the
+		// outer loop falls through to the next combo entry.
 		var resp *http.Response
-		switch provider {
-		case "antigravity":
-			resp, err = s.ag.ExecuteWithSession(account, comboModel, body, stream, sessionID)
-		case "kiro":
-			resp, err = s.kiro.ExecuteWithSession(account, comboModel, body, stream, sessionID)
-		default:
+		if providerInfo == nil || providerInfo.Executor == nil {
 			continue
 		}
+		resp, err = providerInfo.Executor.ExecuteWithSession(account, comboModel, body, stream, sessionID)
 
 		if err != nil {
 			lastErr = err
@@ -724,10 +865,12 @@ func (s *Server) handleComboRequest(w http.ResponseWriter, r *http.Request, req 
 		})
 
 		if stream {
-			s.streamResponse(w, resp)
+			streamBody := s.streamResponse(w, resp)
+			usageLog.TokensIn, usageLog.TokensOut = extractTokenUsage(streamBody)
 			usageLog.ResponseBody = "(streaming response)"
 		} else {
 			respBody := s.forwardResponseCapture(w, resp)
+			usageLog.TokensIn, usageLog.TokensOut = extractTokenUsage(respBody)
 			if len(respBody) > 5120 {
 				usageLog.ResponseBody = respBody[:5120] + "\n...(truncated)"
 			} else {
@@ -1000,12 +1143,20 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func resolveProvider(model string) string {
-	if strings.HasPrefix(model, "ag/") {
+// resolveProviderFromModel turns a model id ("kr/claude-sonnet-4.5",
+// "ag/gemini-3-flash") into the canonical provider id ("kiro",
+// "antigravity"). Built on top of the provider registry so adding a new
+// backend automatically picks up its alias here without further code
+// changes. Falls back to the first registered provider for ambiguous
+// model strings (preserves the legacy behaviour where unknown models
+// went to Antigravity).
+func (s *Server) resolveProviderFromModel(model string) string {
+	if s == nil || s.providers == nil {
 		return "antigravity"
 	}
-	if strings.HasPrefix(model, "kr/") || strings.HasPrefix(model, "kiro/") {
-		return "kiro"
+	info, _ := s.providers.ResolveModel(model)
+	if info != nil {
+		return info.ID
 	}
 	return "antigravity"
 }

@@ -81,6 +81,14 @@ type streamState struct {
 	created   int64
 	toolCalls map[string]*toolCallAccum
 	usage     *OpenAIUsage
+
+	// outputCharCount tracks the total characters of assistant content
+	// we forwarded downstream, so we can synthesize a completion-tokens
+	// estimate when Kiro's metricsEvent reports outputTokens=0 (a known
+	// upstream quirk for short replies and certain models like Opus 4.7).
+	// We use a 4 chars/token rule of thumb that matches OpenAI's tokenizer
+	// closely enough for usage tracking purposes.
+	outputCharCount int
 }
 
 type toolCallAccum struct {
@@ -109,6 +117,7 @@ func handleFrame(w io.Writer, state *streamState, frame *eventFrame) {
 			content = ev.AssistantResponseEvent.Content
 		}
 		if content != "" {
+			state.outputCharCount += len(content)
 			emitChunk(w, state, &OpenAIMsg{Content: &content}, nil)
 		}
 
@@ -151,6 +160,7 @@ func handleFrame(w io.Writer, state *streamState, frame *eventFrame) {
 			content = ev.CodeEvent.Content
 		}
 		if content != "" {
+			state.outputCharCount += len(content)
 			emitChunk(w, state, &OpenAIMsg{Content: &content}, nil)
 		}
 
@@ -274,8 +284,22 @@ func emitChunk(w io.Writer, state *streamState, delta *OpenAIMsg, finishReason *
 			FinishReason: finishReason,
 		}},
 	}
-	if finishReason != nil && state.usage != nil {
-		chunk.Usage = state.usage
+	if finishReason != nil {
+		// Synthesize usage on the final chunk. Kiro's metricsEvent often
+		// reports outputTokens=0 even when content was clearly streamed
+		// (Opus 4.7 in particular). Fall back to a conservative 4 chars
+		// per token estimate so the dashboard shows a sane number.
+		usage := state.usage
+		if usage == nil && state.outputCharCount > 0 {
+			usage = &OpenAIUsage{}
+		}
+		if usage != nil {
+			if usage.CompletionTokens == 0 && state.outputCharCount > 0 {
+				usage.CompletionTokens = (state.outputCharCount + 3) / 4
+				usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+			}
+			chunk.Usage = usage
+		}
 	}
 
 	data, _ := json.Marshal(chunk)

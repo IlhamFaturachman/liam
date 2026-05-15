@@ -71,8 +71,11 @@ type Config struct {
 
 func Load() *Config {
 	port, _ := strconv.Atoi(getEnv("LIAM_PORT", "666"))
-	accountRPM, _ := strconv.Atoi(getEnv("LIAM_ACCOUNT_RPM", "10"))
-	accountMinGap, _ := strconv.Atoi(getEnv("LIAM_ACCOUNT_MIN_GAP", "6"))
+	// Pre-emptive throttle: 0 = disabled (default). Only opt-in users
+	// who really want client-side rate limiting set these. The reactive
+	// 429/401 cooldown still runs regardless.
+	accountRPM, _ := strconv.Atoi(getEnv("LIAM_ACCOUNT_RPM", "0"))
+	accountMinGap, _ := strconv.Atoi(getEnv("LIAM_ACCOUNT_MIN_GAP", "0"))
 	cooldownBase, _ := strconv.Atoi(getEnv("LIAM_COOLDOWN_BASE", "60"))
 	cooldownMax, _ := strconv.Atoi(getEnv("LIAM_COOLDOWN_MAX", "1800"))
 	disableAfter, _ := strconv.Atoi(getEnv("LIAM_DISABLE_AFTER_ERRORS", "10"))
@@ -107,12 +110,15 @@ func Load() *Config {
 
 		// Anti-ban (conservative defaults for longevity)
 		MaxRetriesPerRequest: 3,
-		AccountRPM:           accountRPM,   // 10 req/min per account (safe: AG allows ~20-30)
-		AccountMinGapSec:     accountMinGap, // 6 seconds minimum between uses
-		CooldownBaseSec:      cooldownBase,  // 60s first cooldown
-		CooldownMaxSec:       cooldownMax,   // 30 min max cooldown
-		DisableAfterErrors:   disableAfter,  // Disable after 10 consecutive errors
-		StickyRequests:       stickyReqs,    // Use same account for 3 requests then rotate
+		// Reactive cooldown still runs unconditionally; pre-emptive
+		// throttling is opt-in via these knobs. Default 0 = unlimited
+		// (matches 9router's "non-stop coding" UX).
+		AccountRPM:         accountRPM,
+		AccountMinGapSec:   accountMinGap,
+		CooldownBaseSec:    cooldownBase, // 60s first cooldown
+		CooldownMaxSec:     cooldownMax,  // 30 min max cooldown
+		DisableAfterErrors: disableAfter, // Disable after 10 consecutive errors
+		StickyRequests:     stickyReqs,   // Use same account for 3 requests then rotate
 
 		// Token refresh
 		RefreshLeadMin: 5,

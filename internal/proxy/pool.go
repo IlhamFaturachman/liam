@@ -21,8 +21,8 @@ type AccountPool struct {
 	mu       sync.Mutex
 
 	// Strategy config (loaded from DB settings)
-	strategy    string // "fill-first" | "round-robin"
-	stickyLimit int
+	strategy          string // "fill-first" | "round-robin"
+	stickyLimit       int
 	providerOverrides map[string]providerStrategy
 
 	// Per-account tracking (in-memory, fast)
@@ -30,7 +30,7 @@ type AccountPool struct {
 	sessionIDs map[string]string
 
 	// Session affinity (sessionID → accountID)
-	sessionMap    map[string]*sessionEntry
+	sessionMap     map[string]*sessionEntry
 	sessionMaxSize int
 }
 
@@ -308,23 +308,37 @@ func (p *AccountPool) Count(provider string) int {
 
 // --- Internal helpers ---
 
+// canUse returns whether an account is currently eligible for selection.
+//
+// Historical note: this previously enforced pre-emptive client-side rate
+// limits (RPM cap + minimum gap between requests). That made LIAM trip on
+// itself during long coding sessions even when the upstream was perfectly
+// happy — 9router's reference implementation has no such caps and was the
+// gold-standard "non-stop coding" experience to match. We now rely
+// exclusively on the upstream's own rate-limit signal: when Kiro / AG
+// return 429/401/etc, the call site cools the account down via
+// MarkAccountError + a model lock. Setting LIAM_ACCOUNT_RPM=0 (the new
+// default) keeps that behaviour available for users who really want a
+// pre-emptive throttle without forcing it on everyone.
 func (p *AccountPool) canUse(account *db.Account, now time.Time) bool {
 	id := account.ID
 
-	// Check minimum gap since last use
-	timestamps := p.usageCount[id]
-	if len(timestamps) > 0 {
-		lastUse := timestamps[len(timestamps)-1]
-		gap := now.Sub(lastUse)
-		if gap < time.Duration(p.cfg.AccountMinGapSec)*time.Second {
-			return false
+	// Optional pre-emptive throttling. Both knobs default to 0 (disabled)
+	// and only kick in when the operator explicitly opts in via env vars.
+	if p.cfg.AccountMinGapSec > 0 {
+		timestamps := p.usageCount[id]
+		if len(timestamps) > 0 {
+			lastUse := timestamps[len(timestamps)-1]
+			if now.Sub(lastUse) < time.Duration(p.cfg.AccountMinGapSec)*time.Second {
+				return false
+			}
 		}
 	}
-
-	// Check RPM
-	recentCount := p.countRecentRequests(id, now, 60*time.Second)
-	if recentCount >= p.cfg.AccountRPM {
-		return false
+	if p.cfg.AccountRPM > 0 {
+		recentCount := p.countRecentRequests(id, now, 60*time.Second)
+		if recentCount >= p.cfg.AccountRPM {
+			return false
+		}
 	}
 
 	return true

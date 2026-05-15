@@ -27,6 +27,20 @@ function app() {
     chartData: [],
     liveRequests: [],
     overviewStats: [],
+
+    // Bundled overview data fetched from /api/overview. Keeps the
+    // homepage to a single round-trip per refresh instead of fanning
+    // out to /stats + /providers/stats + /usage/recent + /sync/status.
+    overview: {
+      providers: [],
+      stats: {},
+      top_models: [],
+      recent_errors: [],
+      active_locks: 0,
+      api_keys_total: 0,
+      sync: {},
+    },
+    overviewRefreshInterval: null,
     registryModels: [],
     integrations: [],
 
@@ -136,6 +150,18 @@ function app() {
     usagePage: 0,
     usagePageSize: 10,
 
+    // Usage period filter — drives both the stats card row and the chart.
+    // Default "today" matches the previous behaviour. Persisted in
+    // localStorage so a refresh keeps the user on the same window.
+    usagePeriod: 'today',
+    usagePeriods: [
+      { id: 'today', label: 'Today' },
+      { id: '24h',   label: '24h' },
+      { id: '7d',    label: '7 days' },
+      { id: '30d',   label: '30 days' },
+      { id: '60d',   label: '60 days' },
+    ],
+
     // Harvest
     harvest: { provider: 'ag', concurrency: '4', headless: 'false', accounts: '' },
     harvestStatus: { running: false, success: 0, failed: 0, total: 0, logs: [], accounts: [] },
@@ -146,6 +172,15 @@ function app() {
 
     // UI
     copied: false,
+
+    // Toast notifications + confirm dialog. Stored on the Alpine state so
+    // every component can call `this.toast(...)` / `this.confirmDialog(...)`
+    // and the rendered modal/stack lives in the page shell. The dashboard
+    // used to lean on browser-native alert/confirm which is jarring and
+    // hard to style; these helpers replace all 23 call sites with one
+    // consistent UX.
+    toasts: [],         // { id, kind: "info"|"success"|"error"|"warn", title, message }
+    confirmState: null, // { title, message, confirmLabel, cancelLabel, danger, resolve }
     endpoint: '',
     chart: null,
     usageChart: null,
@@ -190,6 +225,11 @@ function app() {
       // so a fresh dashboard refreshes quotas automatically.
       const storedAR = localStorage.getItem('liam_account_auto_refresh');
       this.accountAutoRefresh = storedAR === null ? true : storedAR === '1';
+      // Restore the user's last picked usage period.
+      const storedPeriod = localStorage.getItem('liam_usage_period');
+      if (storedPeriod && this.usagePeriods.some(p => p.id === storedPeriod)) {
+        this.usagePeriod = storedPeriod;
+      }
       this.loadPresets();
       // Bind URL hash routing so refreshing the browser keeps the user on
       // the same page/sub-page. Format: #/<page> or #/<page>/<detail>.
@@ -243,7 +283,6 @@ function app() {
       }
 
       this.$nextTick(() => {
-        if (this.page === 'overview') this.renderChart();
         if (this.page === 'usage') this.renderUsageChart();
         if (this.page === 'integrations') this.fetchIntegrations();
         this.openSubpageFromHash();
@@ -287,6 +326,48 @@ function app() {
         const saved = localStorage.getItem('liam_endpoint_presets');
         if (saved) this.savedPresets = JSON.parse(saved);
       } catch (e) { this.savedPresets = []; }
+    },
+
+    // ---- Toast notifications ----
+    // Replaces window.alert(...) across the dashboard. Returns the toast
+    // id so callers can dismiss programmatically if needed.
+    toast(message, opts = {}) {
+      const id = Date.now() + Math.random();
+      const kind = opts.kind || 'info';
+      const t = {
+        id,
+        kind,
+        title: opts.title || (kind === 'error' ? 'Error' : kind === 'success' ? 'Success' : kind === 'warn' ? 'Warning' : 'Info'),
+        message: typeof message === 'string' ? message : String(message),
+      };
+      this.toasts.push(t);
+      const ttl = opts.ttl ?? (kind === 'error' ? 8000 : 4000);
+      setTimeout(() => this.dismissToast(id), ttl);
+      return id;
+    },
+    dismissToast(id) {
+      this.toasts = this.toasts.filter(t => t.id !== id);
+    },
+
+    // ---- Confirm dialog ----
+    // Returns a Promise<boolean>. Replaces window.confirm(...).
+    confirmDialog(message, opts = {}) {
+      return new Promise(resolve => {
+        this.confirmState = {
+          title: opts.title || 'Are you sure?',
+          message: typeof message === 'string' ? message : String(message),
+          confirmLabel: opts.confirmLabel || (opts.danger ? 'Delete' : 'OK'),
+          cancelLabel: opts.cancelLabel || 'Cancel',
+          danger: !!opts.danger,
+          resolve,
+        };
+      });
+    },
+    closeConfirm(answer) {
+      if (this.confirmState && typeof this.confirmState.resolve === 'function') {
+        this.confirmState.resolve(answer);
+      }
+      this.confirmState = null;
     },
 
     savePreset(url) {
@@ -334,6 +415,7 @@ function app() {
     async loadAll() {
       await Promise.all([
         this.fetchStats(),
+        this.fetchOverview(),
         this.fetchAccounts(),
         this.fetchKeys(),
         this.fetchProviders(),
@@ -349,7 +431,10 @@ function app() {
       this.buildOverviewStats();
       this.startSSE();
       this.startHarvestPoll();
-      this.$nextTick(() => this.renderChart());
+      // Kick off page-specific handlers (Overview's polling + chart on
+      // Usage). The chart on the old Overview page is gone now — we
+      // bundle everything via /api/overview instead.
+      this.onPageChange();
       // Initial data is now in memory — re-run the deep link handler so
       // refreshing on #/providers/kiro lands on that detail page.
       if (this._pendingSubpage) {
@@ -363,13 +448,61 @@ function app() {
       this.providerDetail = null;
       this.expandedUsageId = null;
       this.integrationDetail = null;
+
+      // Auto-refresh overview every 30s while the user sits on it.
+      // Cleared when they navigate elsewhere so we don't poll forever.
+      if (this.overviewRefreshInterval) {
+        clearInterval(this.overviewRefreshInterval);
+        this.overviewRefreshInterval = null;
+      }
+      if (this.page === 'overview') {
+        this.fetchOverview();
+        this.overviewRefreshInterval = setInterval(() => this.fetchOverview(), 30000);
+      }
+
       this.$nextTick(() => {
-        if (this.page === 'overview') this.renderChart();
         if (this.page === 'usage') this.renderUsageChart();
         if (this.page === 'integrations') this.fetchIntegrations();
       });
     },
     async fetchStats() { try { const r = await fetch('/api/stats'); if (r.ok) this.stats = await r.json(); } catch (e) {} },
+
+    // Single bundled fetch used to render the Overview homepage. We keep
+    // this separate from the per-tab fetches above so the dashboard can
+    // poll just this one endpoint while the user sits on the overview.
+    async fetchOverview() {
+      try {
+        const r = await fetch('/api/overview');
+        if (r.ok) this.overview = await r.json();
+      } catch (e) {}
+    },
+
+    // Friendly time-of-day greeting used as the Overview hero header.
+    // Falls back to "Hello" when the clock check is somehow off.
+    overviewGreeting() {
+      const h = new Date().getHours();
+      if (h >= 5 && h < 12) return 'Good morning';
+      if (h >= 12 && h < 17) return 'Good afternoon';
+      if (h >= 17 && h < 22) return 'Good evening';
+      return 'Hi there';
+    },
+
+    // Look up the registered icon name for a provider id. Driven by
+    // the same /api/overview payload that powers the homepage cards,
+    // so a new provider added on the backend automatically gets the
+    // right Material Symbols icon everywhere it's rendered. Falls back
+    // to "cloud" so unregistered providers still render something
+    // sensible.
+    providerIcon(name) {
+      const providers = (this.overview && this.overview.providers) || [];
+      const match = providers.find(p => p.name === name);
+      return (match && match.icon) || 'cloud';
+    },
+    providerLabel(name) {
+      const providers = (this.overview && this.overview.providers) || [];
+      const match = providers.find(p => p.name === name);
+      return (match && match.label) || name;
+    },
     async fetchAccounts() { try { const r = await fetch('/api/accounts'); if (r.ok) { const d = await r.json(); this.accounts = d || []; } } catch (e) {} },
     async fetchKeys() {
       try {
@@ -378,9 +511,36 @@ function app() {
       } catch (e) {}
     },
     async fetchProviders() { try { const r = await fetch('/api/providers/stats'); if (r.ok) { const d = await r.json(); this.providerStats = d || []; } } catch (e) {} },
-    async fetchUsageStats() { try { const r = await fetch('/api/usage/stats'); if (r.ok) this.usageStats = await r.json(); } catch (e) {} },
+    async fetchUsageStats() {
+      try {
+        const r = await fetch('/api/usage/stats?period=' + encodeURIComponent(this.usagePeriod));
+        if (r.ok) this.usageStats = await r.json();
+      } catch (e) {}
+    },
     async fetchRecentUsage() { try { const r = await fetch('/api/usage/recent'); if (r.ok) { const d = await r.json(); this.recentUsage = d || []; } } catch (e) {} },
-    async fetchChart() { try { const r = await fetch('/api/usage/chart'); if (r.ok) { const d = await r.json(); this.chartData = d || []; } } catch (e) {} },
+    async fetchChart() {
+      try {
+        const r = await fetch('/api/usage/chart?period=' + encodeURIComponent(this.usagePeriod));
+        if (r.ok) { const d = await r.json(); this.chartData = d || []; }
+      } catch (e) {}
+    },
+
+    // Switch the usage period filter. Persists to localStorage and refreshes
+    // both the stat cards and the time-series chart so they stay aligned.
+    async setUsagePeriod(id) {
+      if (this.usagePeriod === id) return;
+      this.usagePeriod = id;
+      try { localStorage.setItem('liam_usage_period', id); } catch (_) {}
+      await Promise.all([this.fetchUsageStats(), this.fetchChart()]);
+      this.$nextTick(() => this.renderUsageChart());
+    },
+
+    // Human label for the current period — shown next to the page title
+    // and the chart header so it's always obvious which window is in view.
+    usagePeriodLabel() {
+      const opt = (this.usagePeriods || []).find(p => p.id === this.usagePeriod);
+      return opt ? opt.label : 'Today';
+    },
     async fetchRegistryModels() { try { const r = await fetch('/api/models'); if (r.ok) { const d = await r.json(); this.registryModels = d || []; } } catch (e) {} },
     async fetchBaseURL() {
       try {
@@ -411,9 +571,9 @@ function app() {
           await this.fetchAccounts();
           await this.fetchKeys();
         } else {
-          alert(d.error?.message || 'Sync failed');
+          this.toast(d.error?.message || 'Sync failed', {kind:'error'});
         }
-      } catch (e) { alert('Connection error'); }
+      } catch (e) { this.toast('Connection error', {kind:'error'}); }
     },
 
     // Combos
@@ -446,7 +606,7 @@ function app() {
       this.comboForm.models[newIdx] = temp;
     },
     async saveCombo() {
-      if (!this.comboForm.name || this.comboForm.models.length === 0) { alert('Name and at least 1 model required'); return; }
+      if (!this.comboForm.name || this.comboForm.models.length === 0) { this.toast('Name and at least 1 model required', {kind:'warn'}); return; }
       try {
         let r;
         if (this.editingCombo) {
@@ -454,13 +614,13 @@ function app() {
         } else {
           r = await fetch('/api/combos', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(this.comboForm) });
         }
-        if (!r.ok) { const d = await r.json(); alert(d.error?.message || 'Failed'); return; }
+        if (!r.ok) { const d = await r.json(); this.toast(d.error?.message || 'Failed', {kind:'error'}); return; }
         await this.fetchCombos();
         this.closeComboModal();
-      } catch (e) { alert('Error: ' + e.message); }
+      } catch (e) { this.toast('Error: ' + e.message, {kind:'error'}); }
     },
     async deleteCombo(id) {
-      if (!confirm('Delete this combo?')) return;
+      if (!await this.confirmDialog('Delete this combo? This cannot be undone.', {title:'Delete combo', danger:true, confirmLabel:'Delete'})) return;
       try { await fetch('/api/combos/' + id, { method: 'DELETE' }); await this.fetchCombos(); } catch (e) {}
     },
 
@@ -687,7 +847,7 @@ function app() {
       return r.error || 'Test failed';
     },
     async deleteAccountById(id) {
-      if (!confirm('Delete this account? This cannot be undone.')) return;
+      if (!await this.confirmDialog('Delete this account? This cannot be undone.', {title:'Delete account', danger:true, confirmLabel:'Delete'})) return;
       try {
         await fetch('/api/accounts/' + id, { method: 'DELETE' });
         await this.fetchAccounts();
@@ -822,7 +982,7 @@ function app() {
       this.newModelTesting = false;
     },
     async submitAddModel() {
-      if (!this.newModel.model_id) { alert('Model ID required'); return; }
+      if (!this.newModel.model_id) { this.toast('Model ID required', {kind:'warn'}); return; }
       try {
         const r = await fetch('/api/models/custom', {
           method: 'POST',
@@ -830,14 +990,14 @@ function app() {
           body: JSON.stringify(this.newModel)
         });
         const d = await r.json();
-        if (!r.ok) { alert(d.error?.message || 'Failed'); return; }
+        if (!r.ok) { this.toast(d.error?.message || 'Failed', {kind:'error'}); return; }
         await this.fetchRegistryModels();
         if (this.providerDetail) await this.openProvider(this.providerDetail);
         this.closeAddModel();
-      } catch (e) { alert('Error: ' + e.message); }
+      } catch (e) { this.toast('Error: ' + e.message, {kind:'error'}); }
     },
     async removeModel(modelId) {
-      if (!confirm('Remove ' + modelId + '?')) return;
+      if (!await this.confirmDialog('Remove ' + modelId + ' from the registry?', {title:'Remove model', danger:true, confirmLabel:'Remove'})) return;
       try {
         await fetch('/api/models/custom/' + modelId, { method: 'DELETE' });
         await this.fetchRegistryModels();
@@ -850,10 +1010,10 @@ function app() {
       try {
         const r = await fetch('/api/providers/' + alias + '/refresh-models', { method: 'POST' });
         const d = await r.json();
-        if (!r.ok) { alert(d.error?.message || 'Failed to fetch'); return; }
-        if (d.new_models && d.new_models.length > 0) alert(d.new_models.length + ' new models found upstream');
-        else alert('No new models found');
-      } catch (e) { alert('Error: ' + e.message); }
+        if (!r.ok) { this.toast(d.error?.message || 'Failed to fetch', {kind:'error'}); return; }
+        if (d.new_models && d.new_models.length > 0) this.toast(d.new_models.length + ' new models found upstream', {kind:'success'});
+        else this.toast('No new models found', {kind:'info'});
+      } catch (e) { this.toast('Error: ' + e.message, {kind:'error'}); }
     },
     copyModelId(modelId) { navigator.clipboard.writeText(modelId); },
 
@@ -877,16 +1037,52 @@ function app() {
           body: JSON.stringify({name: this.newKeyName.trim()})
         });
         const d = await r.json();
-        if (!r.ok) { alert(d.error?.message || 'Failed'); return; }
+        if (!r.ok) { this.toast(d.error?.message || 'Failed', {kind:'error'}); return; }
         this.createdKey = d.key;
+        // Stash the raw key locally keyed by id so the Integrations page
+        // can auto-fill the apply request without making the user paste
+        // it manually. Backend never returns the raw key again — this is
+        // the only chance to capture it.
+        try {
+          const cache = JSON.parse(localStorage.getItem('liam_raw_keys') || '{}');
+          cache[d.id] = d.key;
+          localStorage.setItem('liam_raw_keys', JSON.stringify(cache));
+        } catch (_) { /* ignore quota / privacy mode */ }
         await this.fetchKeys();
-      } catch (e) { alert('Error: ' + e.message); }
+      } catch (e) { this.toast('Error: ' + e.message, {kind:'error'}); }
+    },
+
+    // ---- Raw key cache helpers ----
+    // Backend hashes API keys and only ever shows the raw value at create
+    // time. We stash that raw value in localStorage so the Integrations
+    // tab can apply it without the user pasting manually. Helpers below
+    // hide the cache implementation from callers.
+    getRawApiKey(keyId) {
+      if (!keyId) return '';
+      try {
+        const cache = JSON.parse(localStorage.getItem('liam_raw_keys') || '{}');
+        return cache[keyId] || '';
+      } catch (_) { return ''; }
+    },
+    forgetRawApiKey(keyId) {
+      try {
+        const cache = JSON.parse(localStorage.getItem('liam_raw_keys') || '{}');
+        if (cache[keyId]) {
+          delete cache[keyId];
+          localStorage.setItem('liam_raw_keys', JSON.stringify(cache));
+        }
+      } catch (_) { /* noop */ }
     },
     async deleteKey(id) {
-      if (!confirm('Delete this key? This cannot be undone.')) return;
+      if (!await this.confirmDialog('Delete this API key? This cannot be undone.', {title:'Delete API key', danger:true, confirmLabel:'Delete'})) return;
       try {
         const r = await fetch('/api/keys/' + id, { method: 'DELETE' });
-        if (r.ok) await this.fetchKeys();
+        if (r.ok) {
+          // Drop the cached raw key (if any) so the dropdown doesn't
+          // keep handing it to integrations after the key is gone.
+          this.forgetRawApiKey(id);
+          await this.fetchKeys();
+        }
       } catch (e) {}
     },
     toggleKeyVisibility(id) {
@@ -1054,18 +1250,66 @@ function app() {
     },
     renderUsageChart() {
       const canvas = document.getElementById('usageChartCanvas');
-      if (!canvas || !this.chartData || !this.chartData.length) return;
-      if (this.usageChart) this.usageChart.destroy();
+      if (!canvas) return;
+      if (this.usageChart) {
+        this.usageChart.destroy();
+        this.usageChart = null;
+      }
+      // Treat empty data as a valid render — Chart.js still draws axes,
+      // which is way better UX than a blank card. Previously we returned
+      // early when chartData was empty and the canvas just disappeared.
+      const buckets = Array.isArray(this.chartData) ? this.chartData : [];
+      const labels = buckets.map(b => b.time);
+      const reqs = buckets.map(b => b.requests || 0);
+      const inK = buckets.map(b => Math.round(((b.in_tokens || 0)) / 1000));
+      const outK = buckets.map(b => Math.round(((b.out_tokens || 0)) / 1000));
       this.usageChart = new Chart(canvas, {
         type: 'line',
         data: {
-          labels: this.chartData.map(b => b.time),
+          labels,
           datasets: [
-            { label: 'Requests', data: this.chartData.map(b => b.requests), borderColor: '#922b21', backgroundColor: 'rgba(146,43,33,0.08)', borderWidth: 2, fill: true, tension: 0.4, pointRadius: 0 },
-            { label: 'Tokens (k)', data: this.chartData.map(b => Math.round(b.tokens / 1000)), borderColor: '#27ae60', backgroundColor: 'rgba(39,174,96,0.05)', borderWidth: 1.5, fill: false, tension: 0.4, pointRadius: 0 }
-          ]
+            { label: 'Requests', data: reqs, yAxisID: 'y',
+              borderColor: '#922b21', backgroundColor: 'rgba(146,43,33,0.10)',
+              borderWidth: 2, fill: true, tension: 0.4, pointRadius: 0 },
+            { label: 'Input tokens (K)', data: inK, yAxisID: 'y1',
+              borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,0.05)',
+              borderWidth: 1.5, fill: false, tension: 0.4, pointRadius: 0 },
+            { label: 'Output tokens (K)', data: outK, yAxisID: 'y1',
+              borderColor: '#27ae60', backgroundColor: 'rgba(39,174,96,0.05)',
+              borderWidth: 1.5, fill: false, tension: 0.4, pointRadius: 0 },
+          ],
         },
-        options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { labels: { color: '#71717a', font: { size: 10 } } } }, scales: { x: { grid: { color: 'rgba(63,63,70,0.3)' }, ticks: { color: '#71717a', font: { size: 10 } } }, y: { grid: { color: 'rgba(63,63,70,0.3)' }, ticks: { color: '#71717a', font: { size: 10 } }, beginAtZero: true } } }
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: { mode: 'index', intersect: false },
+          plugins: {
+            legend: { labels: { color: '#a1a1aa', font: { size: 10 } } },
+            tooltip: { intersect: false, mode: 'index' },
+          },
+          scales: {
+            x: {
+              grid: { color: 'rgba(63,63,70,0.3)' },
+              ticks: { color: '#71717a', font: { size: 10 }, maxRotation: 0, autoSkipPadding: 12 },
+            },
+            y: {
+              type: 'linear',
+              position: 'left',
+              grid: { color: 'rgba(63,63,70,0.3)' },
+              ticks: { color: '#71717a', font: { size: 10 } },
+              beginAtZero: true,
+              title: { display: true, text: 'Requests', color: '#a1a1aa', font: { size: 10 } },
+            },
+            y1: {
+              type: 'linear',
+              position: 'right',
+              grid: { drawOnChartArea: false },
+              ticks: { color: '#71717a', font: { size: 10 } },
+              beginAtZero: true,
+              title: { display: true, text: 'Tokens (K)', color: '#a1a1aa', font: { size: 10 } },
+            },
+          },
+        },
       });
     },
 
@@ -1086,12 +1330,15 @@ function app() {
       // Mirror selection into URL hash so refresh keeps the same tool open.
       this.setHash('integrations', toolName);
 
-      // Initialize config
+      // Initialize config. Pre-fill the API key from localStorage when
+      // we still have the raw value from creation; otherwise leave the
+      // dropdown unselected so the user knows they need to reveal one.
       const firstKey = this.keys.length > 0 ? this.keys[0] : null;
+      const cachedRaw = firstKey ? this.getRawApiKey(firstKey.id) : '';
       this.integrationConfig = {
         base_url: this.baseURL || ('http://localhost:' + location.port + '/v1'),
-        api_key: firstKey ? firstKey.key_prefix + '...' : '',
         api_key_id: firstKey ? firstKey.id : '',
+        api_key: cachedRaw, // raw key when available, empty otherwise
         api_key_custom: false,
         models: {},
         agent_models: {},
@@ -1145,19 +1392,37 @@ function app() {
     },
     getActualApiKey() {
       const k = this.integrationConfig.api_key || '';
-      // Custom mode: use as-is (must start with li-)
+      // Custom mode: use the value as-is (user pasted manually).
       if (this.integrationConfig.api_key_custom) {
         return k;
       }
-      // Selected from dropdown (ends with '...'): user must switch to custom mode for actual full key
-      // Return prefix as-is (apply will reject if invalid)
-      return k || '<YOUR_KEY>';
+      // Dropdown mode: prefer the cached raw key (saved at creation
+      // time). Fall back to whatever is in the field — which may still
+      // be a placeholder; the caller validates before sending.
+      const fromCache = this.getRawApiKey(this.integrationConfig.api_key_id);
+      return fromCache || k || '';
+    },
+    // Called when the user picks a different key from the dropdown.
+    // Refreshes the cached raw value so the snippet preview shows the
+    // real key (or warns when it's not available).
+    onIntegrationKeyChange() {
+      const id = this.integrationConfig.api_key_id;
+      const raw = this.getRawApiKey(id);
+      this.integrationConfig.api_key = raw;
+      this.refreshSnippet();
     },
     async applyIntegration() {
       if (!this.integrationDetail) return;
       const apiKey = this.getActualApiKey();
-      if (!apiKey || apiKey === '<YOUR_KEY>' || apiKey.endsWith('...')) {
-        alert('Please enter a real API key (or create one in Keys page)');
+      // Reject obvious placeholders. The full raw key always starts with
+      // `li-` and is far longer than the prefix; if we can't find it we
+      // tell the user how to recover instead of failing silently.
+      if (!apiKey || apiKey === '<YOUR_KEY>' || apiKey.endsWith('...') || !apiKey.startsWith('li-')) {
+        if (!this.integrationConfig.api_key_custom && this.integrationConfig.api_key_id) {
+          this.toast("We don't have the raw value for this key on this device. Click 'Custom Key' and paste the full key, or create a new one in the Keys page (the raw value is shown once at creation).", {kind:'warn', title:'Raw key unavailable'});
+        } else {
+          this.toast('Please enter a real API key (or create one in the Keys page).', {kind:'warn'});
+        }
         return;
       }
       const baseURL = this.integrationConfig.use_custom_url
@@ -1197,7 +1462,7 @@ function app() {
       setTimeout(() => { this.integrationApplyMsg = ''; }, 5000);
     },
     async resetIntegration() {
-      if (!confirm('Remove LIAM config from ' + this.integrationDetail + '?')) return;
+      if (!await this.confirmDialog('Remove LIAM config from ' + this.integrationDetail + '?', {title:'Reset integration', danger:true, confirmLabel:'Reset'})) return;
       try {
         const r = await fetch('/api/integrations/' + this.integrationDetail + '/reset', { method: 'POST' });
         if (r.ok) {
@@ -1301,10 +1566,10 @@ function app() {
 
     // Harvest
     async startHarvest() {
-      if (!this.harvest.accounts.trim()) { alert('Paste accounts first'); return; }
+      if (!this.harvest.accounts.trim()) { this.toast('Paste accounts first', {kind:'warn'}); return; }
       const r = await fetch('/api/harvest/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ provider: this.harvest.provider, accounts: this.harvest.accounts, concurrency: parseInt(this.harvest.concurrency), headless: this.harvest.headless === 'true' }) });
       const d = await r.json();
-      if (!r.ok) { alert(d.error || 'Failed'); return; }
+      if (!r.ok) { this.toast(d.error || 'Failed', {kind:'error'}); return; }
     },
     async stopHarvest() { await fetch('/api/harvest/stop', { method: 'POST' }); },
     startHarvestPoll() {
@@ -1343,6 +1608,15 @@ function app() {
 
     // Helpers
     formatNum(n) { if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M'; if (n >= 1000) return (n / 1000).toFixed(1) + 'K'; return String(n); },
+
+    // Compact token formatter for the recent-requests row. Returns '—'
+    // for zero/missing values so the column visually reads "no data"
+    // instead of an ambiguous "0".
+    formatTokenCount(n) {
+      const v = Number(n) || 0;
+      if (v <= 0) return '—';
+      return this.formatNum(v);
+    },
     quotaPercent(a) { return a.quota_total > 0 ? Math.round((a.quota_remaining / a.quota_total) * 100) : 0; },
     quotaColor(a) { const p = this.quotaPercent(a); return p > 50 ? 'bg-ok' : p > 20 ? 'bg-warn' : 'bg-err'; },
 

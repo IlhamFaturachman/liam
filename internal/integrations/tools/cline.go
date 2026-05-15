@@ -8,13 +8,13 @@ import (
 
 type Cline struct{}
 
-func (c *Cline) Name() string             { return "cline" }
-func (c *Cline) DisplayName() string      { return "Cline" }
-func (c *Cline) Description() string      { return "Cline AI Coding Assistant (VSCode)" }
-func (c *Cline) Icon() string             { return "extension" }
-func (c *Cline) ConfigPath() string       { return "" }
-func (c *Cline) BinaryName() string       { return "" }
-func (c *Cline) SupportsAutoApply() bool  { return false }
+func (c *Cline) Name() string            { return "cline" }
+func (c *Cline) DisplayName() string     { return "Cline" }
+func (c *Cline) Description() string     { return "Cline AI Coding Assistant (VSCode)" }
+func (c *Cline) Icon() string            { return "extension" }
+func (c *Cline) ConfigPath() string      { return "" }
+func (c *Cline) BinaryName() string      { return "" }
+func (c *Cline) SupportsAutoApply() bool { return false }
 
 func (c *Cline) ModelSlots() []ModelSlot {
 	return []ModelSlot{

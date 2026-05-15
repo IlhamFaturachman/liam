@@ -9,13 +9,13 @@ import (
 
 type OpenClaw struct{}
 
-func (o *OpenClaw) Name() string             { return "openclaw" }
-func (o *OpenClaw) DisplayName() string      { return "Open Claw" }
-func (o *OpenClaw) Description() string      { return "Open Claw AI Assistant" }
-func (o *OpenClaw) Icon() string             { return "smart_toy" }
-func (o *OpenClaw) ConfigPath() string       { return "~/.openclaw/openclaw.json" }
-func (o *OpenClaw) BinaryName() string       { return "openclaw" }
-func (o *OpenClaw) SupportsAutoApply() bool  { return true }
+func (o *OpenClaw) Name() string            { return "openclaw" }
+func (o *OpenClaw) DisplayName() string     { return "Open Claw" }
+func (o *OpenClaw) Description() string     { return "Open Claw AI Assistant" }
+func (o *OpenClaw) Icon() string            { return "smart_toy" }
+func (o *OpenClaw) ConfigPath() string      { return "~/.openclaw/openclaw.json" }
+func (o *OpenClaw) BinaryName() string      { return "openclaw" }
+func (o *OpenClaw) SupportsAutoApply() bool { return true }
 
 func (o *OpenClaw) ModelSlots() []ModelSlot {
 	return []ModelSlot{
@@ -33,7 +33,9 @@ func (o *OpenClaw) Status() (*ToolStatus, error) {
 			if json.Unmarshal(data, &cfg) == nil {
 				if mod, ok := cfg["models"].(map[string]interface{}); ok {
 					if providers, ok := mod["providers"].(map[string]interface{}); ok {
-						if _, ok := providers["liam"]; ok { hasLiam = true }
+						if _, ok := providers["liam"]; ok {
+							hasLiam = true
+						}
 					}
 				}
 			}
@@ -42,31 +44,45 @@ func (o *OpenClaw) Status() (*ToolStatus, error) {
 	return &ToolStatus{
 		Name: o.Name(), DisplayName: o.DisplayName(), Description: o.Description(), Icon: o.Icon(),
 		Installed: IsToolInstalled(o.BinaryName(), o.ConfigPath()),
-		HasLiam: hasLiam, ConfigPath: configPath, ConfigExists: FileExists(configPath),
+		HasLiam:   hasLiam, ConfigPath: configPath, ConfigExists: FileExists(configPath),
 		SupportsAutoApply: true, BinaryName: o.BinaryName(), ModelSlots: o.ModelSlots(),
 	}, nil
 }
 
 func (o *OpenClaw) Apply(cfg ToolConfig) error {
 	configPath := ExpandHome(o.ConfigPath())
-	if err := EnsureDir(o.ConfigPath()); err != nil { return err }
-	if err := BackupFile(o.ConfigPath()); err != nil { return err }
+	if err := EnsureDir(o.ConfigPath()); err != nil {
+		return err
+	}
+	if err := BackupFile(o.ConfigPath()); err != nil {
+		return err
+	}
 
 	cfgMap := map[string]interface{}{}
-	if data, err := os.ReadFile(configPath); err == nil { json.Unmarshal(data, &cfgMap) }
+	if data, err := os.ReadFile(configPath); err == nil {
+		json.Unmarshal(data, &cfgMap)
+	}
 
 	model := cfg.Models["primary"]
-	if model == "" { model = "ag/claude-opus-4-6-thinking" }
+	if model == "" {
+		model = "ag/claude-opus-4-6-thinking"
+	}
 
 	mod, _ := cfgMap["models"].(map[string]interface{})
-	if mod == nil { mod = map[string]interface{}{} }
+	if mod == nil {
+		mod = map[string]interface{}{}
+	}
 	providers, _ := mod["providers"].(map[string]interface{})
-	if providers == nil { providers = map[string]interface{}{} }
+	if providers == nil {
+		providers = map[string]interface{}{}
+	}
 
 	// Collect all unique models (primary + per-agent)
 	allModels := map[string]bool{model: true}
 	for _, m := range cfg.AgentModels {
-		if m != "" { allModels[m] = true }
+		if m != "" {
+			allModels[m] = true
+		}
 	}
 	modelsList := []map[string]interface{}{}
 	for m := range allModels {
@@ -83,18 +99,28 @@ func (o *OpenClaw) Apply(cfg ToolConfig) error {
 	cfgMap["models"] = mod
 
 	agents, _ := cfgMap["agents"].(map[string]interface{})
-	if agents == nil { agents = map[string]interface{}{} }
+	if agents == nil {
+		agents = map[string]interface{}{}
+	}
 	defaults, _ := agents["defaults"].(map[string]interface{})
-	if defaults == nil { defaults = map[string]interface{}{} }
+	if defaults == nil {
+		defaults = map[string]interface{}{}
+	}
 	dmodel, _ := defaults["model"].(map[string]interface{})
-	if dmodel == nil { dmodel = map[string]interface{}{} }
+	if dmodel == nil {
+		dmodel = map[string]interface{}{}
+	}
 	dmodel["primary"] = "liam/" + model
 	defaults["model"] = dmodel
 
 	dmodels, _ := defaults["models"].(map[string]interface{})
-	if dmodels == nil { dmodels = map[string]interface{}{} }
+	if dmodels == nil {
+		dmodels = map[string]interface{}{}
+	}
 	for k := range dmodels {
-		if strings.HasPrefix(k, "liam/") { delete(dmodels, k) }
+		if strings.HasPrefix(k, "liam/") {
+			delete(dmodels, k)
+		}
 	}
 	for m := range allModels {
 		dmodels["liam/"+m] = map[string]interface{}{}
@@ -118,40 +144,64 @@ func (o *OpenClaw) Apply(cfg ToolConfig) error {
 	}
 	cfgMap["agents"] = agents
 
-	out, err := json.MarshalIndent(cfgMap, "", "  ")
-	if err != nil { return err }
-	return os.WriteFile(configPath, out, 0644)
+	return SafeWriteJSON(configPath, cfgMap)
 }
 
 func (o *OpenClaw) Reset() error {
 	configPath := ExpandHome(o.ConfigPath())
-	if !FileExists(configPath) { return nil }
-	if err := BackupFile(o.ConfigPath()); err != nil { return err }
+	if !FileExists(configPath) {
+		return nil
+	}
+	if err := BackupFile(o.ConfigPath()); err != nil {
+		return err
+	}
 	data, err := os.ReadFile(configPath)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	cfgMap := map[string]interface{}{}
-	if err := json.Unmarshal(data, &cfgMap); err != nil { return err }
+	if err := json.Unmarshal(data, &cfgMap); err != nil {
+		return err
+	}
 
 	if mod, ok := cfgMap["models"].(map[string]interface{}); ok {
 		if providers, ok := mod["providers"].(map[string]interface{}); ok {
 			delete(providers, "liam")
-			if len(providers) == 0 { delete(mod, "providers") } else { mod["providers"] = providers }
-			if len(mod) == 0 { delete(cfgMap, "models") } else { cfgMap["models"] = mod }
+			if len(providers) == 0 {
+				delete(mod, "providers")
+			} else {
+				mod["providers"] = providers
+			}
+			if len(mod) == 0 {
+				delete(cfgMap, "models")
+			} else {
+				cfgMap["models"] = mod
+			}
 		}
 	}
 	if agents, ok := cfgMap["agents"].(map[string]interface{}); ok {
 		if defaults, ok := agents["defaults"].(map[string]interface{}); ok {
 			if dmodels, ok := defaults["models"].(map[string]interface{}); ok {
 				for k := range dmodels {
-					if strings.HasPrefix(k, "liam/") { delete(dmodels, k) }
+					if strings.HasPrefix(k, "liam/") {
+						delete(dmodels, k)
+					}
 				}
-				if len(dmodels) == 0 { delete(defaults, "models") } else { defaults["models"] = dmodels }
+				if len(dmodels) == 0 {
+					delete(defaults, "models")
+				} else {
+					defaults["models"] = dmodels
+				}
 			}
 			if dmodel, ok := defaults["model"].(map[string]interface{}); ok {
 				if p, ok := dmodel["primary"].(string); ok && strings.HasPrefix(p, "liam/") {
 					delete(dmodel, "primary")
 				}
-				if len(dmodel) == 0 { delete(defaults, "model") } else { defaults["model"] = dmodel }
+				if len(dmodel) == 0 {
+					delete(defaults, "model")
+				} else {
+					defaults["model"] = dmodel
+				}
 			}
 		}
 		// Reset per-agent models
@@ -168,13 +218,14 @@ func (o *OpenClaw) Reset() error {
 		}
 	}
 
-	out, _ := json.MarshalIndent(cfgMap, "", "  ")
-	return os.WriteFile(configPath, out, 0644)
+	return SafeWriteJSON(configPath, cfgMap)
 }
 
 func (o *OpenClaw) Snippet(cfg ToolConfig) string {
 	model := cfg.Models["primary"]
-	if model == "" { model = "ag/claude-opus-4-6-thinking" }
+	if model == "" {
+		model = "ag/claude-opus-4-6-thinking"
+	}
 	return fmt.Sprintf(`{
   "agents": {
     "defaults": {

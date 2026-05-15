@@ -75,35 +75,216 @@ tailwind.config={theme:{extend:{colors:{
 
     <!-- Overview -->
     <div x-show="page==='overview'" x-transition:enter="transition ease-out duration-250" x-transition:enter-start="opacity-0 translate-y-2" x-transition:enter-end="opacity-100 translate-y-0">
-      <div class="mb-6"><h1 class="text-xl font-semibold">Overview</h1><p class="text-xs text-txt-3 mt-1">System status and quick actions</p></div>
-      <div class="grid grid-cols-5 gap-3 mb-6">
-        <template x-for="s in overviewStats" :key="s.label">
-          <div class="bg-surface-2 border border-bdr rounded-xl p-4 hover:border-bdr/50 transition-all">
-            <div class="text-[10px] text-txt-3 uppercase tracking-wider mb-1" x-text="s.label"></div>
-            <div class="text-2xl font-bold font-mono" :class="s.color" x-text="s.value"></div>
+      <!-- Hero header: greeting + endpoint with copy. Endpoint is the
+           single most-used thing on this page so we keep it prominent. -->
+      <div class="mb-6 flex flex-col lg:flex-row lg:items-end lg:justify-between gap-4">
+        <div>
+          <h1 class="text-2xl font-semibold" x-text="overviewGreeting()"></h1>
+          <p class="text-xs text-txt-3 mt-1">Quick health, today's traffic, and shortcuts</p>
+        </div>
+        <div class="bg-surface-2 border border-bdr rounded-xl px-4 py-2.5 flex items-center justify-between gap-3 lg:min-w-[480px]">
+          <div class="flex items-center gap-2 min-w-0">
+            <span class="material-symbols-outlined text-[16px] text-brand-light">link</span>
+            <code class="text-xs text-brand-light truncate" x-text="endpoint"></code>
+          </div>
+          <button @click="copyEndpoint()" class="text-[11px] text-txt-2 hover:text-brand-light border border-bdr rounded px-2.5 py-1 flex items-center gap-1 flex-shrink-0">
+            <span class="material-symbols-outlined text-[12px]" x-text="copied ? 'check' : 'content_copy'"></span>
+            <span x-text="copied ? 'Copied' : 'Copy'"></span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Provider Health row + Quick Actions sidebar -->
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-3 mb-3">
+        <template x-for="p in (overview.providers||[])" :key="p.name">
+          <div class="bg-surface-2 border border-bdr rounded-xl p-4">
+            <div class="flex items-center justify-between mb-3">
+              <div class="flex items-center gap-2">
+                <span class="material-symbols-outlined text-[18px] text-brand-light"
+                      x-text="p.icon || 'cloud'"></span>
+                <span class="text-sm font-semibold capitalize" x-text="p.label || p.name"></span>
+              </div>
+              <span class="w-2 h-2 rounded-full"
+                    :class="p.active>0 ? 'bg-ok animate-pulse' : p.cooldown>0 ? 'bg-warn' : 'bg-txt-3'"
+                    :title="p.active>0 ? 'Healthy' : p.cooldown>0 ? 'Degraded' : 'No active accounts'"></span>
+            </div>
+            <div class="grid grid-cols-2 gap-2 text-[11px]">
+              <div>
+                <div class="text-txt-3 uppercase tracking-wider text-[9px] mb-0.5">Active</div>
+                <div class="font-mono font-semibold" :class="p.active>0?'text-ok':'text-txt-3'" x-text="p.active + ' / ' + p.total"></div>
+              </div>
+              <div>
+                <div class="text-txt-3 uppercase tracking-wider text-[9px] mb-0.5">Cooldown</div>
+                <div class="font-mono font-semibold" :class="p.cooldown>0?'text-warn':'text-txt-3'" x-text="p.cooldown"></div>
+              </div>
+              <div>
+                <div class="text-txt-3 uppercase tracking-wider text-[9px] mb-0.5">Disabled</div>
+                <div class="font-mono font-semibold" :class="p.disabled>0?'text-err':'text-txt-3'" x-text="p.disabled"></div>
+              </div>
+              <div>
+                <div class="text-txt-3 uppercase tracking-wider text-[9px] mb-0.5">Total</div>
+                <div class="font-mono font-semibold" x-text="p.total"></div>
+              </div>
+            </div>
+            <div class="mt-3 flex items-center justify-between">
+              <button @click="navigateTo('providers'); $nextTick(() => openProvider(p.name))"
+                      class="text-[10px] text-brand-light hover:text-brand transition-colors flex items-center gap-1">
+                Manage <span class="material-symbols-outlined text-[12px]">arrow_forward</span>
+              </button>
+              <span x-show="p.total===0" class="text-[10px] text-txt-3 italic">no accounts yet</span>
+            </div>
           </div>
         </template>
-      </div>
-      <div class="bg-surface-2 border border-bdr rounded-xl px-4 py-3 mb-6 flex items-center justify-between">
-        <code class="text-sm text-brand-light" x-text="endpoint"></code>
-        <button @click="copyEndpoint()" class="text-xs text-txt-3 hover:text-brand-light border border-bdr rounded px-2 py-1" x-text="copied?'Copied!':'Copy'"></button>
-      </div>
-      <div class="grid grid-cols-3 gap-4 mb-6">
-        <div class="col-span-2 bg-surface-2 border border-bdr rounded-xl p-5">
-          <div class="text-xs text-txt-3 uppercase tracking-wider mb-3">Requests (24h)</div>
-          <canvas id="chartCanvas" height="120"></canvas>
+
+        <!-- Quick Actions -->
+        <div class="bg-surface-2 border border-bdr rounded-xl p-4">
+          <div class="flex items-center gap-2 mb-3">
+            <span class="material-symbols-outlined text-[18px] text-brand-light">bolt</span>
+            <span class="text-sm font-semibold">Quick Actions</span>
+          </div>
+          <div class="space-y-1.5">
+            <!-- One "Add account" button per registered provider. The
+                 list is sourced from /api/overview so future providers
+                 (claude/codex/gemini-cli/etc) auto-appear here without
+                 frontend changes. -->
+            <template x-for="p in (overview.providers||[])" :key="'qa-'+p.name">
+              <button @click="navigateTo('providers'); $nextTick(() => { openProvider(p.name); openAddAccount(); })"
+                      class="w-full text-left px-3 py-2 bg-surface-1 border border-bdr rounded-lg hover:border-brand hover:text-brand-light transition-all flex items-center gap-2 text-[12px]">
+                <span class="material-symbols-outlined text-[14px]" x-text="p.icon || 'add_circle'"></span>
+                <span class="flex-1" x-text="'Add ' + (p.label || p.name) + ' account'"></span>
+              </button>
+            </template>
+            <button @click="navigateTo('keys'); $nextTick(() => openCreateKey())"
+                    class="w-full text-left px-3 py-2 bg-surface-1 border border-bdr rounded-lg hover:border-brand hover:text-brand-light transition-all flex items-center gap-2 text-[12px]">
+              <span class="material-symbols-outlined text-[14px]">key</span>
+              <span class="flex-1">Generate API key</span>
+            </button>
+            <button @click="navigateTo('integrations')"
+                    class="w-full text-left px-3 py-2 bg-surface-1 border border-bdr rounded-lg hover:border-brand hover:text-brand-light transition-all flex items-center gap-2 text-[12px]">
+              <span class="material-symbols-outlined text-[14px]">integration_instructions</span>
+              <span class="flex-1">Apply to OpenCode / CLIs</span>
+            </button>
+          </div>
         </div>
-        <div class="bg-surface-2 border border-bdr rounded-xl p-5">
-          <div class="text-xs text-txt-3 uppercase tracking-wider mb-3">Live Feed</div>
-          <div class="space-y-2 max-h-[200px] overflow-y-auto">
-            <template x-for="(req, i) in liveRequests.slice(0,15)" :key="i">
-              <div class="flex items-center gap-2 text-[11px] py-1 border-b border-bdr-light/50 animate-fadeIn">
-                <span class="text-txt-3 font-mono" x-text="req.time"></span>
-                <span class="text-brand-light font-mono truncate flex-1" x-text="req.model"></span>
-                <span :class="req.status===200?'text-ok':'text-err'" x-text="req.status===200?'OK':req.status"></span>
+      </div>
+
+      <!-- Today's snapshot strip -->
+      <div class="bg-surface-2 border border-bdr rounded-xl p-4 mb-3">
+        <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
+          <div class="flex items-center gap-2">
+            <span class="material-symbols-outlined text-[18px] text-brand-light">today</span>
+            <span class="text-sm font-semibold">Today's Snapshot</span>
+          </div>
+          <button @click="navigateTo('usage')" class="text-[10px] text-brand-light hover:text-brand transition-colors flex items-center gap-1">
+            Full usage <span class="material-symbols-outlined text-[12px]">arrow_forward</span>
+          </button>
+        </div>
+        <div class="grid grid-cols-2 lg:grid-cols-6 gap-3">
+          <div>
+            <div class="text-[10px] text-txt-3 uppercase mb-1">Requests</div>
+            <div class="text-lg font-bold font-mono" x-text="(overview.stats?.total_requests||0).toLocaleString()"></div>
+          </div>
+          <div>
+            <div class="text-[10px] text-txt-3 uppercase mb-1 flex items-center gap-1">
+              <span class="material-symbols-outlined text-[12px]">arrow_upward</span> Input
+            </div>
+            <div class="text-lg font-bold font-mono" x-text="(overview.stats?.total_input_tokens||0).toLocaleString()"></div>
+          </div>
+          <div>
+            <div class="text-[10px] text-txt-3 uppercase mb-1 flex items-center gap-1">
+              <span class="material-symbols-outlined text-[12px]">arrow_downward</span> Output
+            </div>
+            <div class="text-lg font-bold font-mono" x-text="(overview.stats?.total_output_tokens||0).toLocaleString()"></div>
+          </div>
+          <div>
+            <div class="text-[10px] text-txt-3 uppercase mb-1">Est. Cost</div>
+            <div class="text-lg font-bold font-mono" x-text="'~$' + (overview.stats?.estimated_cost||0).toFixed(2)"></div>
+          </div>
+          <div>
+            <div class="text-[10px] text-txt-3 uppercase mb-1">Success</div>
+            <div class="text-lg font-bold font-mono"
+                 :class="(overview.stats?.success_rate||0)>=95?'text-ok':(overview.stats?.success_rate||0)>=80?'text-warn':'text-err'"
+                 x-text="(overview.stats?.success_rate||0).toFixed(1)+'%'"></div>
+          </div>
+          <div>
+            <div class="text-[10px] text-txt-3 uppercase mb-1">Active Locks</div>
+            <div class="text-lg font-bold font-mono"
+                 :class="(overview.active_locks||0)>0?'text-warn':'text-txt-2'"
+                 x-text="overview.active_locks||0"
+                 title="Active per-(account,model) cooldown locks. High counts mean accounts are throttled."></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Top Models + Recent Errors + Live Ticker -->
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-3 mb-6">
+        <!-- Top models -->
+        <div class="bg-surface-2 border border-bdr rounded-xl p-4">
+          <div class="flex items-center gap-2 mb-3">
+            <span class="material-symbols-outlined text-[18px] text-brand-light">trending_up</span>
+            <span class="text-sm font-semibold">Top Models Today</span>
+          </div>
+          <div class="space-y-1.5">
+            <template x-for="(m, i) in (overview.top_models||[])" :key="i">
+              <div class="flex items-center gap-2 text-[11px]">
+                <span class="text-txt-3 font-mono w-3" x-text="(i+1)+'.'"></span>
+                <span class="text-brand-light font-mono truncate flex-1" x-text="m.model"></span>
+                <span class="text-txt-2 font-mono" x-text="m.requests + ' req'"></span>
               </div>
             </template>
-            <div x-show="liveRequests.length===0" class="text-txt-3 text-xs text-center py-4">No requests yet</div>
+            <div x-show="!(overview.top_models||[]).length" class="text-txt-3 text-xs text-center py-4">No requests yet today</div>
+          </div>
+        </div>
+
+        <!-- Recent errors -->
+        <div class="bg-surface-2 border border-bdr rounded-xl p-4">
+          <div class="flex items-center justify-between mb-3">
+            <div class="flex items-center gap-2">
+              <span class="material-symbols-outlined text-[18px]"
+                    :class="(overview.recent_errors||[]).length>0?'text-err':'text-txt-3'">error</span>
+              <span class="text-sm font-semibold">Recent Errors (24h)</span>
+            </div>
+            <span x-show="(overview.recent_errors||[]).length>0"
+                  class="text-[10px] text-err font-mono"
+                  x-text="(overview.recent_errors||[]).length"></span>
+          </div>
+          <div class="space-y-1.5 max-h-[160px] overflow-y-auto">
+            <template x-for="(e, i) in (overview.recent_errors||[])" :key="e.id || i">
+              <div @click="navigateTo('usage'); $nextTick(() => openUsageDetail(e.id))"
+                   class="flex items-center gap-2 text-[11px] cursor-pointer hover:bg-surface-hover/30 rounded px-1.5 py-1">
+                <span class="text-txt-3 font-mono" x-text="new Date(e.created_at).toLocaleTimeString().slice(0,5)"></span>
+                <span class="text-brand-light font-mono truncate flex-1" x-text="e.model"></span>
+                <span class="font-mono text-err" x-text="e.status_code"></span>
+              </div>
+            </template>
+            <div x-show="!(overview.recent_errors||[]).length" class="text-txt-3 text-xs text-center py-4 flex items-center justify-center gap-1">
+              <span class="material-symbols-outlined text-[14px] text-ok">check_circle</span>
+              All clear
+            </div>
+          </div>
+        </div>
+
+        <!-- Live ticker mini (real-time SSE feed) -->
+        <div class="bg-surface-2 border border-bdr rounded-xl p-4">
+          <div class="flex items-center justify-between mb-3">
+            <div class="flex items-center gap-2">
+              <span class="material-symbols-outlined text-[18px] text-brand-light">radio_button_checked</span>
+              <span class="text-sm font-semibold">Live Feed</span>
+            </div>
+            <span class="text-[10px] text-txt-3 flex items-center gap-1">
+              <span class="w-1.5 h-1.5 rounded-full bg-ok animate-pulse"></span> live
+            </span>
+          </div>
+          <div class="space-y-1.5 max-h-[160px] overflow-y-auto">
+            <template x-for="(req, i) in liveRequests.slice(0,8)" :key="i">
+              <div class="flex items-center gap-2 text-[11px] py-0.5">
+                <span class="text-txt-3 font-mono" x-text="req.time"></span>
+                <span class="text-brand-light font-mono truncate flex-1" x-text="req.model"></span>
+                <span class="font-mono" :class="req.status===200?'text-ok':'text-err'"
+                      x-text="req.status===200?'OK':req.status"></span>
+              </div>
+            </template>
+            <div x-show="liveRequests.length===0" class="text-txt-3 text-xs text-center py-4">Waiting for traffic…</div>
           </div>
         </div>
       </div>
@@ -216,7 +397,7 @@ tailwind.config={theme:{extend:{colors:{
                 <div class="flex items-start justify-between mb-3">
                   <div class="flex items-center gap-2.5 min-w-0">
                     <div class="w-8 h-8 bg-surface-2 border border-bdr rounded-lg flex items-center justify-center flex-shrink-0">
-                      <span class="material-symbols-outlined text-brand-light text-[16px]" x-text="providerDetail==='antigravity'?'rocket_launch':'cloud'"></span>
+                      <span class="material-symbols-outlined text-brand-light text-[16px]" x-text="providerIcon(providerDetail)"></span>
                     </div>
                     <div class="min-w-0">
                       <div class="flex items-center gap-1.5 flex-wrap">
@@ -378,19 +559,71 @@ tailwind.config={theme:{extend:{colors:{
 
     <!-- Usage -->
     <div x-show="page==='usage'" x-transition:enter="transition ease-out duration-250" x-transition:enter-start="opacity-0 translate-y-2" x-transition:enter-end="opacity-100 translate-y-0">
-      <div class="flex items-center justify-between mb-6">
-        <div><h1 class="text-xl font-semibold">Usage</h1><p class="text-xs text-txt-3 mt-1">Today's request statistics</p></div>
+      <div class="flex items-center justify-between mb-6 flex-wrap gap-3">
+        <div>
+          <h1 class="text-xl font-semibold">Usage</h1>
+          <p class="text-xs text-txt-3 mt-1" x-text="'Stats for ' + usagePeriodLabel()"></p>
+        </div>
+        <!-- Period filter buttons. Switching a period re-fetches both
+             stats and chart, so the cards + canvas stay in sync. -->
+        <div class="inline-flex rounded-lg bg-surface-2 border border-bdr overflow-hidden text-[11px]">
+          <template x-for="opt in usagePeriods" :key="opt.id">
+            <button @click="setUsagePeriod(opt.id)"
+                    class="px-3 py-1.5 transition-colors"
+                    :class="usagePeriod===opt.id ? 'bg-brand text-white' : 'text-txt-2 hover:bg-surface-hover hover:text-txt-1'"
+                    x-text="opt.label"></button>
+          </template>
+        </div>
       </div>
-      <div class="grid grid-cols-5 gap-3 mb-6">
-        <div class="bg-surface-2 border border-bdr rounded-xl p-4"><div class="text-[10px] text-txt-3 uppercase mb-1">Requests</div><div class="text-xl font-bold font-mono" x-text="usageStats.total_requests||0"></div></div>
-        <div class="bg-surface-2 border border-bdr rounded-xl p-4"><div class="text-[10px] text-txt-3 uppercase mb-1">Tokens</div><div class="text-xl font-bold font-mono" x-text="formatNum(usageStats.total_tokens||0)"></div></div>
-        <div class="bg-surface-2 border border-bdr rounded-xl p-4"><div class="text-[10px] text-txt-3 uppercase mb-1">Avg Latency</div><div class="text-xl font-bold font-mono" x-text="(usageStats.avg_latency_ms||0)+'ms'"></div></div>
-        <div class="bg-surface-2 border border-bdr rounded-xl p-4"><div class="text-[10px] text-txt-3 uppercase mb-1">Success</div><div class="text-xl font-bold font-mono text-ok" x-text="(usageStats.success_rate||0).toFixed(1)+'%'"></div></div>
-        <div class="bg-surface-2 border border-bdr rounded-xl p-4"><div class="text-[10px] text-txt-3 uppercase mb-1">Errors</div><div class="text-xl font-bold font-mono text-err" x-text="usageStats.error_count||0"></div></div>
+
+      <!-- Top stats: 4 prominent cards (Requests / Input / Output / Cost)
+           plus 2 secondary metrics (latency, errors). The cost card has a
+           subscript explaining it's an estimate so users don't think
+           we're billing them. -->
+      <div class="grid grid-cols-2 lg:grid-cols-6 gap-3 mb-6">
+        <div class="bg-surface-2 border border-bdr rounded-xl p-4">
+          <div class="text-[10px] text-txt-3 uppercase mb-1">Total Requests</div>
+          <div class="text-xl font-bold font-mono" x-text="(usageStats.total_requests||0).toLocaleString()"></div>
+        </div>
+        <div class="bg-surface-2 border border-bdr rounded-xl p-4">
+          <div class="text-[10px] text-txt-3 uppercase mb-1 flex items-center gap-1">
+            <span class="material-symbols-outlined text-[12px]">arrow_upward</span> Input Tokens
+          </div>
+          <div class="text-xl font-bold font-mono" x-text="(usageStats.total_input_tokens||0).toLocaleString()"></div>
+        </div>
+        <div class="bg-surface-2 border border-bdr rounded-xl p-4">
+          <div class="text-[10px] text-txt-3 uppercase mb-1 flex items-center gap-1">
+            <span class="material-symbols-outlined text-[12px]">arrow_downward</span> Output Tokens
+          </div>
+          <div class="text-xl font-bold font-mono" x-text="(usageStats.total_output_tokens||0).toLocaleString()"></div>
+        </div>
+        <div class="bg-surface-2 border border-bdr rounded-xl p-4">
+          <div class="text-[10px] text-txt-3 uppercase mb-1">Est. Cost</div>
+          <div class="text-xl font-bold font-mono" x-text="'~$' + (usageStats.estimated_cost||0).toFixed(2)"></div>
+          <div class="text-[9px] text-txt-3 mt-0.5">Estimated, not actual billing</div>
+        </div>
+        <div class="bg-surface-2 border border-bdr rounded-xl p-4">
+          <div class="text-[10px] text-txt-3 uppercase mb-1">Avg Latency</div>
+          <div class="text-xl font-bold font-mono" x-text="(usageStats.avg_latency_ms||0)+'ms'"></div>
+          <div class="text-[9px] text-ok mt-0.5" x-text="(usageStats.success_rate||0).toFixed(1) + '% success'"></div>
+        </div>
+        <div class="bg-surface-2 border border-bdr rounded-xl p-4">
+          <div class="text-[10px] text-txt-3 uppercase mb-1">Errors</div>
+          <div class="text-xl font-bold font-mono" :class="(usageStats.error_count||0)>0 ? 'text-err' : 'text-txt-2'" x-text="(usageStats.error_count||0).toLocaleString()"></div>
+        </div>
       </div>
+
       <div class="bg-surface-2 border border-bdr rounded-xl p-5 mb-6">
-        <div class="text-xs text-txt-3 uppercase tracking-wider mb-3">Requests Over Time</div>
-        <canvas id="usageChartCanvas" height="100"></canvas>
+        <div class="flex items-center justify-between mb-3">
+          <div class="text-xs text-txt-3 uppercase tracking-wider">Requests Over Time</div>
+          <div class="text-[10px] text-txt-3" x-text="usagePeriodLabel()"></div>
+        </div>
+        <!-- Wrapper provides explicit height so the chart never collapses
+             to 0 (was broken before because Chart.js couldn't find a parent
+             height when canvas didn't have an aspect ratio set). -->
+        <div class="relative h-[260px]">
+          <canvas id="usageChartCanvas"></canvas>
+        </div>
       </div>
       <div class="bg-surface-2 border border-bdr rounded-xl overflow-hidden">
         <div class="px-4 py-3 border-b border-bdr flex items-center justify-between">
@@ -405,6 +638,24 @@ tailwind.config={theme:{extend:{colors:{
             </button>
           </div>
         </div>
+        <!-- Column header so users can map "↑ 1234" + "↓ 56" tokens
+             back to their meaning at a glance. The grid template mirrors
+             the row body below to keep alignment perfect. -->
+        <div x-show="recentUsage.length>0" class="grid grid-cols-6 gap-4 px-4 py-2 border-b border-bdr-light bg-surface-1/30 text-[10px] uppercase tracking-wider text-txt-3 select-none">
+          <div>Time</div>
+          <div>Model</div>
+          <div>Account</div>
+          <div class="flex items-center gap-3">
+            <span class="flex items-center gap-0.5" title="Input tokens">
+              <span class="material-symbols-outlined text-[12px]">arrow_upward</span> in
+            </span>
+            <span class="flex items-center gap-0.5" title="Output tokens">
+              <span class="material-symbols-outlined text-[12px]">arrow_downward</span> out
+            </span>
+          </div>
+          <div>Latency</div>
+          <div>Status</div>
+        </div>
         <div x-show="recentUsage.length>0" class="divide-y divide-bdr-light">
           <template x-for="u in pagedUsage()" :key="u.id">
             <div>
@@ -412,7 +663,17 @@ tailwind.config={theme:{extend:{colors:{
                 <div class="font-mono text-xs text-txt-3" x-text="new Date(u.created_at).toLocaleTimeString()"></div>
                 <div class="font-mono text-xs text-brand-light" x-text="u.model"></div>
                 <div class="text-xs text-txt-2 truncate" x-text="u.account_email||'-'"></div>
-                <div class="font-mono text-xs" x-text="(u.tokens_in+u.tokens_out)||'-'"></div>
+                <div class="flex items-center gap-2 text-[11px] font-mono"
+                     :title="(u.tokens_in||0)+' input · '+(u.tokens_out||0)+' output tokens'">
+                  <span class="flex items-center gap-0.5 text-txt-3" :class="(u.tokens_in||0) > 0 ? 'text-txt-2' : ''">
+                    <span class="material-symbols-outlined text-[12px]">arrow_upward</span>
+                    <span x-text="formatTokenCount(u.tokens_in)"></span>
+                  </span>
+                  <span class="flex items-center gap-0.5 text-txt-3" :class="(u.tokens_out||0) > 0 ? 'text-txt-2' : ''">
+                    <span class="material-symbols-outlined text-[12px]">arrow_downward</span>
+                    <span x-text="formatTokenCount(u.tokens_out)"></span>
+                  </span>
+                </div>
                 <div class="font-mono text-xs" x-text="u.latency_ms+'ms'"></div>
                 <div><span class="font-mono text-xs" :class="u.status_code>=200&&u.status_code<400?'text-ok':'text-err'" x-text="u.status_code"></span></div>
               </div>
@@ -697,14 +958,19 @@ tailwind.config={theme:{extend:{colors:{
               <label class="text-xs text-txt-2 flex items-center gap-1">API Key <span class="material-symbols-outlined text-[14px] text-txt-3">arrow_forward</span></label>
               <div>
                 <div x-show="!integrationConfig.api_key_custom" class="flex gap-2">
-                  <select x-model="integrationConfig.api_key" @change="refreshSnippet()" class="flex-1 px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm font-mono text-txt-1 focus:outline-none focus:border-brand">
+                  <select x-model="integrationConfig.api_key_id" @change="onIntegrationKeyChange()" class="flex-1 px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm font-mono text-txt-1 focus:outline-none focus:border-brand">
                     <option value="">-- Select an API key --</option>
                     <template x-for="k in keys" :key="k.id">
-                      <option :value="k.key_prefix+'...'" x-text="k.key_prefix+'... ('+k.name+')'"></option>
+                      <option :value="k.id" x-text="k.key_prefix+'... ('+k.name+')'"></option>
                     </template>
                   </select>
                   <button @click="integrationConfig.api_key_custom=true;integrationConfig.api_key='';" class="px-3 py-2 bg-surface-1 border border-bdr text-txt-2 hover:text-brand-light hover:border-brand text-xs rounded-lg transition-all whitespace-nowrap">Custom Key</button>
                 </div>
+                <p x-show="!integrationConfig.api_key_custom && integrationConfig.api_key_id && !getRawApiKey(integrationConfig.api_key_id)"
+                   class="text-[11px] text-warn mt-1 flex items-start gap-1">
+                  <span class="material-symbols-outlined text-[12px] mt-0.5">warning</span>
+                  <span>Raw key not stored on this device (created elsewhere or before this update). Use <strong>Custom Key</strong> to paste it manually, or create a new one.</span>
+                </p>
                 <div x-show="integrationConfig.api_key_custom" class="flex gap-2">
                   <input x-model="integrationConfig.api_key" @input.debounce.500ms="refreshSnippet()" placeholder="li-..." class="flex-1 px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm font-mono text-txt-1 focus:outline-none focus:border-brand">
                   <button @click="integrationConfig.api_key_custom=false;integrationConfig.api_key='';refreshSnippet();" class="px-3 py-2 bg-surface-1 border border-bdr text-txt-3 hover:text-txt-1 text-xs rounded-lg whitespace-nowrap">Cancel</button>
@@ -818,113 +1084,181 @@ tailwind.config={theme:{extend:{colors:{
 
     <!-- Settings -->
     <div x-show="page==='settings'" x-transition:enter="transition ease-out duration-250" x-transition:enter-start="opacity-0 translate-y-2" x-transition:enter-end="opacity-100 translate-y-0">
-      <div class="mb-6"><h1 class="text-xl font-semibold">Settings</h1><p class="text-xs text-txt-3 mt-1">Dashboard configuration</p></div>
+      <div class="mb-6">
+        <h1 class="text-xl font-semibold">Settings</h1>
+        <p class="text-xs text-txt-3 mt-1">Configure routing, sync, and dashboard access</p>
+      </div>
 
-      <!-- Routing Strategy -->
-      <div class="bg-surface-2 border border-bdr rounded-xl p-6 max-w-2xl mb-4">
-        <div class="text-xs text-txt-3 uppercase tracking-wider mb-2">Routing Strategy</div>
-        <p class="text-[12px] text-txt-3 mb-4 leading-relaxed">
-          Controls how accounts are selected for requests. <strong class="text-txt-2">Fill First</strong> always uses highest-priority account.
-          <strong class="text-txt-2">Round Robin</strong> distributes across accounts with sticky rotation.
-        </p>
-        <div class="grid grid-cols-2 gap-4 mb-4">
-          <div>
-            <label class="text-[10px] text-txt-3 uppercase mb-1.5 block">Default Strategy</label>
-            <select x-model="routing.strategy" class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm text-txt-1 focus:outline-none focus:border-brand">
-              <option value="round-robin">Round Robin</option>
-              <option value="fill-first">Fill First</option>
-            </select>
+      <!-- Two-column responsive grid: cards span equal heights and stack
+           on smaller screens. Each card is its own self-contained
+           settings panel — no more vertical wall of unrelated forms. -->
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+
+        <!-- Routing Strategy -->
+        <div class="bg-surface-2 border border-bdr rounded-xl p-5 lg:col-span-2">
+          <div class="flex items-start justify-between mb-3">
+            <div>
+              <div class="flex items-center gap-2">
+                <span class="material-symbols-outlined text-[18px] text-brand-light">alt_route</span>
+                <h2 class="text-sm font-semibold">Routing Strategy</h2>
+              </div>
+              <p class="text-[12px] text-txt-3 mt-1.5 leading-relaxed">
+                <strong class="text-txt-2">Fill First</strong> always uses the highest-priority account.
+                <strong class="text-txt-2">Round Robin</strong> distributes across accounts with sticky rotation.
+              </p>
+            </div>
+            <button @click="saveRouting()" class="px-3.5 py-1.5 bg-brand hover:bg-brand-dark text-white text-xs font-medium rounded-lg transition-all flex items-center gap-1.5 flex-shrink-0">
+              <span class="material-symbols-outlined text-[14px]">save</span> Save
+              <span x-show="routingMsg" class="text-[11px] text-white/80" x-text="routingMsg"></span>
+            </button>
           </div>
+
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-4">
+            <div>
+              <label class="text-[10px] text-txt-3 uppercase mb-1.5 block">Default Strategy</label>
+              <select x-model="routing.strategy" class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm text-txt-1 focus:outline-none focus:border-brand">
+                <option value="round-robin">Round Robin</option>
+                <option value="fill-first">Fill First</option>
+              </select>
+            </div>
+            <div>
+              <label class="text-[10px] text-txt-3 uppercase mb-1.5 block">Sticky Limit</label>
+              <input type="number" x-model="routing.sticky_limit" min="1" max="20" class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm text-txt-1 focus:outline-none focus:border-brand">
+              <p class="text-[10px] text-txt-3 mt-1">Requests per account before rotating</p>
+            </div>
+          </div>
+
           <div>
-            <label class="text-[10px] text-txt-3 uppercase mb-1.5 block">Sticky Limit</label>
-            <input type="number" x-model="routing.sticky_limit" min="1" max="20" class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm text-txt-1 focus:outline-none focus:border-brand">
-            <p class="text-[10px] text-txt-3 mt-1">Requests per account before rotating</p>
+            <label class="text-[10px] text-txt-3 uppercase mb-2 block">Per-Provider Overrides</label>
+            <div class="bg-surface-1 border border-bdr rounded-lg overflow-hidden">
+              <table class="w-full text-xs">
+                <thead class="bg-surface-1 border-b border-bdr-light">
+                  <tr>
+                    <th class="text-left px-3 py-2 font-medium text-txt-3 uppercase tracking-wider text-[10px]">Provider</th>
+                    <th class="text-left px-3 py-2 font-medium text-txt-3 uppercase tracking-wider text-[10px]">Strategy</th>
+                    <th class="text-left px-3 py-2 font-medium text-txt-3 uppercase tracking-wider text-[10px]">Sticky Limit</th>
+                  </tr>
+                </thead>
+                <tbody class="divide-y divide-bdr-light">
+                  <template x-for="p in providerStats" :key="p.name">
+                    <tr>
+                      <td class="px-3 py-2 capitalize text-txt-1" x-text="p.name"></td>
+                      <td class="px-3 py-2">
+                        <select @change="setProviderRouting(p.name, $event.target.value, routing.provider_overrides?.[p.name]?.sticky_limit || routing.sticky_limit)" :value="routing.provider_overrides?.[p.name]?.strategy || ''" class="px-2 py-1 bg-surface-2 border border-bdr rounded text-xs text-txt-1 focus:outline-none focus:border-brand">
+                          <option value="">Use default</option>
+                          <option value="round-robin">Round Robin</option>
+                          <option value="fill-first">Fill First</option>
+                        </select>
+                      </td>
+                      <td class="px-3 py-2">
+                        <input type="number" :value="routing.provider_overrides?.[p.name]?.sticky_limit || ''" @change="setProviderRouting(p.name, routing.provider_overrides?.[p.name]?.strategy || routing.strategy, $event.target.value)" min="1" max="20" placeholder="—" class="w-20 px-2 py-1 bg-surface-2 border border-bdr rounded text-xs text-txt-1 focus:outline-none focus:border-brand">
+                      </td>
+                    </tr>
+                  </template>
+                  <tr x-show="providerStats.length === 0">
+                    <td colspan="3" class="px-3 py-4 text-center text-txt-3 text-[11px]">No providers configured yet</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
-        <div class="mb-4">
-          <label class="text-[10px] text-txt-3 uppercase mb-2 block">Per-Provider Overrides</label>
-          <div class="bg-surface-1 border border-bdr rounded-lg p-3 space-y-2">
-            <template x-for="p in providerStats" :key="p.name">
-              <div class="flex items-center gap-3">
-                <span class="text-xs text-txt-2 w-24 capitalize" x-text="p.name"></span>
-                <select @change="setProviderRouting(p.name, $event.target.value, routing.provider_overrides?.[p.name]?.sticky_limit || routing.sticky_limit)" :value="routing.provider_overrides?.[p.name]?.strategy || ''" class="px-2 py-1 bg-surface-2 border border-bdr rounded text-xs text-txt-1 focus:outline-none focus:border-brand">
-                  <option value="">Default</option>
-                  <option value="round-robin">Round Robin</option>
-                  <option value="fill-first">Fill First</option>
-                </select>
-                <input type="number" :value="routing.provider_overrides?.[p.name]?.sticky_limit || ''" @change="setProviderRouting(p.name, routing.provider_overrides?.[p.name]?.strategy || routing.strategy, $event.target.value)" min="1" max="20" placeholder="—" class="w-16 px-2 py-1 bg-surface-2 border border-bdr rounded text-xs text-txt-1 focus:outline-none focus:border-brand">
+
+        <!-- Supabase Sync -->
+        <div class="bg-surface-2 border border-bdr rounded-xl p-5">
+          <div class="flex items-center gap-2 mb-3">
+            <span class="material-symbols-outlined text-[18px] text-brand-light">cloud_sync</span>
+            <h2 class="text-sm font-semibold">Supabase Sync</h2>
+          </div>
+          <p class="text-[12px] text-txt-3 mb-4 leading-relaxed">
+            Sync accounts, API keys, and custom models across devices. Set
+            <code class="text-txt-2 text-[11px]">SUPABASE_URL</code> and
+            <code class="text-txt-2 text-[11px]">SUPABASE_KEY</code> env vars to enable.
+          </p>
+
+          <div class="bg-surface-1 border border-bdr rounded-lg p-3 mb-3">
+            <div class="flex items-center justify-between mb-1.5">
+              <div class="flex items-center gap-2">
+                <span class="w-2 h-2 rounded-full" :class="syncStatus.connected?'bg-ok animate-pulse':syncStatus.enabled?'bg-warn':'bg-txt-3'"></span>
+                <span class="text-xs font-medium" :class="syncStatus.connected?'text-ok':syncStatus.enabled?'text-warn':'text-txt-3'"
+                  x-text="syncStatus.enabled?(syncStatus.connected?'Connected':'Disconnected'):'Not configured'"></span>
+              </div>
+              <span x-show="syncStatus.last_sync" class="text-[10px] text-txt-3" x-text="'Synced '+new Date(syncStatus.last_sync).toLocaleTimeString()"></span>
+            </div>
+            <div x-show="syncStatus.supabase_url" class="text-[10px] font-mono text-txt-3 truncate" x-text="syncStatus.supabase_url"></div>
+          </div>
+
+          <div class="flex gap-2">
+            <button x-show="syncStatus.enabled" @click="triggerSync()" class="px-3.5 py-1.5 bg-brand hover:bg-brand-dark text-white text-xs font-medium rounded-lg transition-all flex items-center gap-1.5">
+              <span class="material-symbols-outlined text-[14px]">refresh</span> Sync Now
+            </button>
+            <span x-show="!syncStatus.enabled" class="text-[11px] text-txt-3 italic">Set env vars and restart LIAM to enable.</span>
+          </div>
+        </div>
+
+        <!-- Public Base URL -->
+        <div class="bg-surface-2 border border-bdr rounded-xl p-5">
+          <div class="flex items-center gap-2 mb-3">
+            <span class="material-symbols-outlined text-[18px] text-brand-light">link</span>
+            <h2 class="text-sm font-semibold">Public Base URL</h2>
+          </div>
+          <p class="text-[12px] text-txt-3 mb-4 leading-relaxed">
+            Used when generating CLI tool configs. Set this if LIAM is exposed via VPS, reverse proxy, or tunnel.
+            Leave empty to use localhost (default for local setups).
+          </p>
+
+          <div class="flex flex-col sm:flex-row gap-2 mb-2">
+            <input x-model="baseURL" placeholder="http://localhost:666/v1" class="flex-1 px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm font-mono text-txt-1 placeholder-txt-3 focus:outline-none focus:border-brand">
+            <div class="flex gap-2">
+              <button @click="saveSettingsBaseURL()" class="flex-1 sm:flex-none px-3.5 py-2 bg-brand hover:bg-brand-dark text-white text-xs font-medium rounded-lg transition-all">Save</button>
+              <button @click="resetSettingsBaseURL()" class="flex-1 sm:flex-none px-3.5 py-2 bg-surface-1 border border-bdr text-txt-2 hover:text-txt-1 text-xs rounded-lg transition-all">Reset</button>
+            </div>
+          </div>
+          <p class="text-[10px] text-txt-3">Default: <code class="text-txt-2" x-text="defaultBaseURL"></code></p>
+          <div x-show="baseURLMsg" class="mt-2 text-[11px]" :class="baseURLOk?'text-ok':'text-err'" x-text="baseURLMsg"></div>
+        </div>
+
+        <!-- Saved URL Presets -->
+        <div x-show="savedPresets.length > 0" class="bg-surface-2 border border-bdr rounded-xl p-5">
+          <div class="flex items-center gap-2 mb-3">
+            <span class="material-symbols-outlined text-[18px] text-brand-light">bookmark</span>
+            <h2 class="text-sm font-semibold">Saved URL Presets</h2>
+          </div>
+          <p class="text-[12px] text-txt-3 mb-3">URLs available in the Integrations endpoint dropdown.</p>
+          <div class="space-y-1.5 max-h-[200px] overflow-y-auto">
+            <template x-for="(p, i) in savedPresets" :key="i">
+              <div class="flex items-center gap-1.5 group">
+                <code class="flex-1 px-2.5 py-1.5 bg-surface-1 border border-bdr rounded text-[11px] font-mono text-txt-1 truncate" x-text="p"></code>
+                <button @click="deletePreset(p)" class="text-txt-3 hover:text-err p-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                  <span class="material-symbols-outlined text-[14px]">delete</span>
+                </button>
               </div>
             </template>
           </div>
         </div>
-        <div class="flex items-center gap-3">
-          <button @click="saveRouting()" class="px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg transition-all">Save</button>
-          <span x-show="routingMsg" class="text-xs text-ok" x-text="routingMsg"></span>
-        </div>
-      </div>
 
-      <!-- Supabase Sync -->
-      <div class="bg-surface-2 border border-bdr rounded-xl p-6 max-w-2xl mb-4">
-        <div class="text-xs text-txt-3 uppercase tracking-wider mb-2">Supabase Sync</div>
-        <p class="text-[12px] text-txt-3 mb-4 leading-relaxed">
-          Sync accounts, API keys, and custom models across devices via Supabase.
-          Set <code class="text-txt-2">SUPABASE_URL</code> and <code class="text-txt-2">SUPABASE_KEY</code> env vars to enable.
-        </p>
-        <div class="flex items-center gap-4 mb-3">
-          <div class="flex items-center gap-2">
-            <span class="w-2 h-2 rounded-full" :class="syncStatus.connected?'bg-ok animate-pulse':'bg-txt-3'"></span>
-            <span class="text-sm" :class="syncStatus.connected?'text-ok':'text-txt-3'" x-text="syncStatus.enabled?(syncStatus.connected?'Connected':'Disconnected'):'Not configured'"></span>
+        <!-- Change Password -->
+        <div class="bg-surface-2 border border-bdr rounded-xl p-5">
+          <div class="flex items-center gap-2 mb-3">
+            <span class="material-symbols-outlined text-[18px] text-brand-light">lock</span>
+            <h2 class="text-sm font-semibold">Dashboard Password</h2>
           </div>
-          <span x-show="syncStatus.last_sync" class="text-[11px] text-txt-3" x-text="'Last sync: '+new Date(syncStatus.last_sync).toLocaleTimeString()"></span>
-        </div>
-        <div x-show="syncStatus.supabase_url" class="text-[11px] font-mono text-txt-3 mb-3" x-text="syncStatus.supabase_url"></div>
-        <div class="flex gap-2">
-          <button x-show="syncStatus.enabled" @click="triggerSync()" class="px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg transition-all">Sync Now</button>
-          <span x-show="!syncStatus.enabled" class="text-[12px] text-txt-3">Set SUPABASE_URL and SUPABASE_KEY env vars, then restart LIAM.</span>
-        </div>
-      </div>
+          <p class="text-[12px] text-txt-3 mb-4 leading-relaxed">Change the password used to log into this dashboard.</p>
 
-      <!-- Base URL -->
-      <div class="bg-surface-2 border border-bdr rounded-xl p-6 max-w-2xl mb-4">
-        <div class="text-xs text-txt-3 uppercase tracking-wider mb-2">Public Base URL</div>
-        <p class="text-[12px] text-txt-3 mb-4 leading-relaxed">
-          Used when generating CLI tool configs (Integrations page). Set this when LIAM is exposed
-          via VPS, reverse proxy, or tunnel (e.g. <code class="text-txt-2">https://liam.myserver.com/v1</code>)
-          so external tools can reach LIAM. Leave empty to use localhost (default for local-only setups).
-        </p>
-        <div class="flex gap-2 mb-2">
-          <input x-model="baseURL" placeholder="http://localhost:666/v1" class="flex-1 px-4 py-2.5 bg-surface-1 border border-bdr rounded-lg text-sm font-mono text-txt-1 placeholder-txt-3 focus:outline-none focus:border-brand">
-          <button @click="saveSettingsBaseURL()" class="px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg transition-all">Save</button>
-          <button @click="resetSettingsBaseURL()" class="px-4 py-2 bg-surface-1 border border-bdr text-txt-2 hover:text-txt-1 text-sm rounded-lg transition-all">Reset</button>
-        </div>
-        <p class="text-[11px] text-txt-3">Default: <code class="text-txt-2" x-text="defaultBaseURL"></code></p>
-        <div x-show="baseURLMsg" class="mt-3 text-xs" :class="baseURLOk?'text-ok':'text-err'" x-text="baseURLMsg"></div>
-      </div>
+          <div class="space-y-2 mb-3">
+            <input type="password" x-model="settings.currentPw" placeholder="Current password" autocomplete="current-password" class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm text-txt-1 placeholder-txt-3 focus:outline-none focus:border-brand">
+            <input type="password" x-model="settings.newPw" placeholder="New password" autocomplete="new-password" class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm text-txt-1 placeholder-txt-3 focus:outline-none focus:border-brand">
+          </div>
 
-      <!-- Saved Presets -->
-      <div x-show="savedPresets.length > 0" class="bg-surface-2 border border-bdr rounded-xl p-6 max-w-2xl mb-4">
-        <div class="text-xs text-txt-3 uppercase tracking-wider mb-3">Saved URL Presets</div>
-        <p class="text-[12px] text-txt-3 mb-3">URLs you've saved (used in Integrations endpoint dropdown).</p>
-        <div class="space-y-2">
-          <template x-for="(p, i) in savedPresets" :key="i">
-            <div class="flex items-center gap-2">
-              <code class="flex-1 px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-xs font-mono text-txt-1" x-text="p"></code>
-              <button @click="deletePreset(p)" class="text-txt-3 hover:text-err p-1.5">
-                <span class="material-symbols-outlined text-[16px]">delete</span>
-              </button>
-            </div>
-          </template>
+          <div class="flex items-center gap-2 flex-wrap">
+            <button @click="changePassword()" class="px-3.5 py-1.5 bg-brand hover:bg-brand-dark text-white text-xs font-medium rounded-lg transition-all flex items-center gap-1.5">
+              <span class="material-symbols-outlined text-[14px]">vpn_key</span> Update
+            </button>
+            <span x-show="settings.msg" class="text-[11px]" :class="settings.ok?'text-ok':'text-err'" x-text="settings.msg"></span>
+          </div>
         </div>
-      </div>
 
-      <!-- Password -->
-      <div class="bg-surface-2 border border-bdr rounded-xl p-6 max-w-2xl">
-        <div class="text-xs text-txt-3 uppercase tracking-wider mb-4">Change Password</div>
-        <input type="password" x-model="settings.currentPw" placeholder="Current password" class="w-full px-4 py-2.5 bg-surface-1 border border-bdr rounded-lg text-sm text-txt-1 placeholder-txt-3 focus:outline-none focus:border-brand mb-3">
-        <input type="password" x-model="settings.newPw" placeholder="New password" class="w-full px-4 py-2.5 bg-surface-1 border border-bdr rounded-lg text-sm text-txt-1 placeholder-txt-3 focus:outline-none focus:border-brand mb-3">
-        <button @click="changePassword()" class="px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg transition-all">Update</button>
-        <div x-show="settings.msg" class="mt-3 text-xs" :class="settings.ok?'text-ok':'text-err'" x-text="settings.msg"></div>
-      </div>
+      </div> <!-- /grid -->
     </div>
 
     </div>
@@ -1205,6 +1539,86 @@ tailwind.config={theme:{extend:{colors:{
         <span class="material-symbols-outlined text-[16px]">content_copy</span> Copy to Clipboard
       </button>
       <button @click="showManualConfigModal=false" class="px-4 py-2 bg-surface-1 border border-bdr text-txt-2 text-sm rounded-lg hover:text-txt-1">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Toast notifications: stacked top-right, auto-dismiss. Replaces every
+     window.alert() call across the dashboard. -->
+<div x-show="toasts.length > 0" x-cloak class="fixed top-4 right-4 z-[60] flex flex-col gap-2 w-[360px] max-w-[calc(100vw-2rem)] pointer-events-none">
+  <template x-for="t in toasts" :key="t.id">
+    <div x-transition:enter="transition ease-out duration-200"
+         x-transition:enter-start="opacity-0 translate-y-2 scale-95"
+         x-transition:enter-end="opacity-100 translate-y-0 scale-100"
+         x-transition:leave="transition ease-in duration-150"
+         x-transition:leave-start="opacity-100"
+         x-transition:leave-end="opacity-0"
+         class="pointer-events-auto rounded-xl border shadow-2xl overflow-hidden flex"
+         :class="{
+           'bg-surface-2 border-bdr': t.kind==='info',
+           'bg-ok/10 border-ok/40': t.kind==='success',
+           'bg-warn/10 border-warn/40': t.kind==='warn',
+           'bg-err/10 border-err/40': t.kind==='error',
+         }">
+      <div class="w-1"
+           :class="{
+             'bg-brand': t.kind==='info',
+             'bg-ok': t.kind==='success',
+             'bg-warn': t.kind==='warn',
+             'bg-err': t.kind==='error',
+           }"></div>
+      <div class="flex-1 px-3 py-2.5 flex items-start gap-2 min-w-0">
+        <span class="material-symbols-outlined text-[18px] mt-0.5 flex-shrink-0"
+              :class="{
+                'text-brand-light': t.kind==='info',
+                'text-ok': t.kind==='success',
+                'text-warn': t.kind==='warn',
+                'text-err': t.kind==='error',
+              }"
+              x-text="t.kind==='success' ? 'check_circle' : t.kind==='warn' ? 'warning' : t.kind==='error' ? 'error' : 'info'"></span>
+        <div class="flex-1 min-w-0">
+          <div class="text-xs font-semibold mb-0.5"
+               :class="{
+                 'text-txt-1': t.kind==='info',
+                 'text-ok': t.kind==='success',
+                 'text-warn': t.kind==='warn',
+                 'text-err': t.kind==='error',
+               }"
+               x-text="t.title"></div>
+          <div class="text-[11px] text-txt-2 break-words whitespace-pre-wrap" x-text="t.message"></div>
+        </div>
+        <button @click="dismissToast(t.id)" class="text-txt-3 hover:text-txt-1 flex-shrink-0 -mr-0.5 -mt-0.5">
+          <span class="material-symbols-outlined text-[16px]">close</span>
+        </button>
+      </div>
+    </div>
+  </template>
+</div>
+
+<!-- Confirm dialog: replaces every window.confirm() call. The state is
+     populated by `confirmDialog()` which returns a Promise<boolean>. -->
+<div x-show="confirmState" x-cloak class="fixed inset-0 bg-black/60 backdrop-blur-sm z-[55] flex items-center justify-center"
+     @keydown.escape.window="confirmState && closeConfirm(false)"
+     @click.self="closeConfirm(false)">
+  <div class="bg-surface-2 border border-bdr rounded-xl p-6 w-[440px] max-w-[calc(100vw-2rem)] shadow-2xl"
+       x-transition:enter="transition ease-out duration-200"
+       x-transition:enter-start="opacity-0 scale-95"
+       x-transition:enter-end="opacity-100 scale-100">
+    <div class="flex items-start gap-3 mb-4">
+      <div class="w-10 h-10 rounded-full flex items-center justify-center flex-shrink-0"
+           :class="confirmState?.danger ? 'bg-err/15 text-err' : 'bg-brand/15 text-brand-light'">
+        <span class="material-symbols-outlined text-[22px]" x-text="confirmState?.danger ? 'warning' : 'help'"></span>
+      </div>
+      <div class="flex-1 min-w-0">
+        <h2 class="text-base font-semibold mb-1" x-text="confirmState?.title"></h2>
+        <p class="text-xs text-txt-2 whitespace-pre-wrap break-words" x-text="confirmState?.message"></p>
+      </div>
+    </div>
+    <div class="flex justify-end gap-2 mt-5">
+      <button @click="closeConfirm(false)" class="px-4 py-2 bg-surface-1 border border-bdr text-txt-2 hover:text-txt-1 text-sm rounded-lg transition-all" x-text="confirmState?.cancelLabel || 'Cancel'"></button>
+      <button @click="closeConfirm(true)" class="px-4 py-2 text-white text-sm font-medium rounded-lg transition-all"
+              :class="confirmState?.danger ? 'bg-err hover:bg-err/85' : 'bg-brand hover:bg-brand-dark'"
+              x-text="confirmState?.confirmLabel || 'OK'"></button>
     </div>
   </div>
 </div>
