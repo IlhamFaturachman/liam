@@ -5,10 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
-	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/google/uuid"
 	"github.com/liam-auto/liam/internal/db"
 )
 
@@ -224,5 +222,3 @@ func (s *Server) handleReorderAccounts(w http.ResponseWriter, r *http.Request) {
 }
 
 // Suppress unused import
-var _ = uuid.New
-var _ = time.Now

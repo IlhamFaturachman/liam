@@ -216,18 +216,6 @@ func (r *Registry) SetEnabledForProvider(providerAlias string, enabled bool) err
 	return err
 }
 
-// Resolve handles aliases and returns the canonical full model ID
-func (r *Registry) Resolve(input string) string {
-	// Check alias first
-	var target string
-	err := r.db.QueryRow("SELECT target FROM model_aliases WHERE alias = ?", input).Scan(&target)
-	if err == nil && target != "" {
-		return target
-	}
-	// Not an alias, return as-is
-	return input
-}
-
 // GetEnabledIDs returns all enabled model IDs (for /v1/models endpoint)
 func (r *Registry) GetEnabledIDs() ([]string, error) {
 	rows, err := r.db.Query("SELECT id FROM model_registry WHERE is_enabled = 1 ORDER BY provider_alias, model_id")

@@ -540,6 +540,12 @@ func (d *Database) DeleteAPIKey(id string) error {
 	return err
 }
 
+// DeleteAccount hard-deletes an account by ID
+func (d *Database) DeleteAccount(id string) error {
+	_, err := d.db.Exec("DELETE FROM accounts WHERE id = ?", id)
+	return err
+}
+
 // ImportAPIKey imports a key from remote (Supabase sync) — inserts if not exists
 func (d *Database) ImportAPIKey(id, keyHash, keyPrefix, name string, isActive bool, createdAt time.Time) error {
 	active := 0

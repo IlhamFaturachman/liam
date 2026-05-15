@@ -10,7 +10,11 @@ import (
 	"github.com/liam-auto/liam/internal/db"
 )
 
-// RefreshToken refreshes an expired AWS SSO OIDC access token
+// Kiro desktop auth endpoint (doesn't require clientId/clientSecret)
+const kiroDesktopRefreshURL = "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken"
+
+// RefreshToken refreshes a Kiro access token using the desktop auth endpoint
+// This endpoint only requires the refresh token — no clientId/clientSecret needed
 func RefreshToken(account *db.Account) (*KiroCredentials, error) {
 	var creds KiroCredentials
 	if err := json.Unmarshal(account.Credentials, &creds); err != nil {
@@ -20,26 +24,13 @@ func RefreshToken(account *db.Account) (*KiroCredentials, error) {
 	if creds.RefreshToken == "" {
 		return nil, fmt.Errorf("no refresh token")
 	}
-	if creds.ClientID == "" || creds.ClientSecret == "" {
-		return nil, fmt.Errorf("missing OIDC client_id or client_secret")
-	}
 
-	region := creds.Region
-	if region == "" {
-		region = "us-east-1"
-	}
-
-	url := fmt.Sprintf("https://oidc.%s.amazonaws.com/token", region)
-
-	body := map[string]string{
-		"clientId":     creds.ClientID,
-		"clientSecret": creds.ClientSecret,
-		"grantType":    "refresh_token",
+	// Use desktop auth endpoint (no clientId/clientSecret required)
+	body, _ := json.Marshal(map[string]string{
 		"refreshToken": creds.RefreshToken,
-	}
-	bodyJSON, _ := json.Marshal(body)
+	})
 
-	req, err := http.NewRequest("POST", url, strings.NewReader(string(bodyJSON)))
+	req, err := http.NewRequest("POST", kiroDesktopRefreshURL, strings.NewReader(string(body)))
 	if err != nil {
 		return nil, err
 	}
@@ -59,19 +50,22 @@ func RefreshToken(account *db.Account) (*KiroCredentials, error) {
 	var tokenResp struct {
 		AccessToken  string `json:"accessToken"`
 		RefreshToken string `json:"refreshToken"`
-		ExpiresIn    int    `json:"expiresIn"`
-		TokenType    string `json:"tokenType"`
+		ProfileArn   string `json:"profileArn"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
 		return nil, fmt.Errorf("parse response: %w", err)
 	}
 
+	// Update credentials
 	creds.AccessToken = tokenResp.AccessToken
 	if tokenResp.RefreshToken != "" {
 		creds.RefreshToken = tokenResp.RefreshToken
 	}
-	expiresAt := time.Now().UTC().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
-	creds.ExpiresAt = expiresAt.Format(time.RFC3339)
+	if tokenResp.ProfileArn != "" {
+		creds.ProfileARN = tokenResp.ProfileArn
+	}
+	// Desktop auth doesn't return expiresIn — assume 1 hour
+	creds.ExpiresAt = time.Now().UTC().Add(1 * time.Hour).Format(time.RFC3339)
 
 	return &creds, nil
 }

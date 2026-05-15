@@ -94,6 +94,13 @@ func (s *Syncer) PullAccounts() error {
 		return err
 	}
 
+	// Load all local accounts into map ONCE (O(n) instead of O(n²))
+	localAccounts, _ := s.database.ListAccounts("")
+	localMap := make(map[string]*db.Account, len(localAccounts))
+	for i := range localAccounts {
+		localMap[localAccounts[i].ID] = &localAccounts[i]
+	}
+
 	for _, row := range rows {
 		remoteUpdated := parseTime(row["updated_at"])
 		id, _ := row["id"].(string)
@@ -102,14 +109,7 @@ func (s *Syncer) PullAccounts() error {
 		}
 
 		// Check if local version is newer
-		localAccounts, _ := s.database.ListAccounts("")
-		var localAccount *db.Account
-		for i := range localAccounts {
-			if localAccounts[i].ID == id {
-				localAccount = &localAccounts[i]
-				break
-			}
-		}
+		localAccount := localMap[id]
 
 		// If local is newer, skip (will be pushed later)
 		if localAccount != nil && localAccount.UpdatedAt.After(remoteUpdated) {

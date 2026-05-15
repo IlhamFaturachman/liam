@@ -8,6 +8,7 @@ import (
 	"github.com/liam-auto/liam/internal/config"
 	"github.com/liam-auto/liam/internal/db"
 	"github.com/liam-auto/liam/internal/providers/antigravity"
+	"github.com/liam-auto/liam/internal/providers/kiro"
 )
 
 // StartAll launches all background workers as goroutines
@@ -34,35 +35,42 @@ func tokenRefresher(cfg *config.Config, database *db.Database) {
 }
 
 func refreshTokens(cfg *config.Config, database *db.Database) {
-	// Get AG accounts with tokens expiring within 10 minutes
-	accounts, err := database.GetAccountsNeedingRefresh("antigravity", 10)
+	// Refresh AG accounts with tokens expiring within 10 minutes
+	agAccounts, err := database.GetAccountsNeedingRefresh("antigravity", 10)
 	if err != nil {
-		log.Printf("[REFRESH] Error getting accounts: %v", err)
-		return
+		log.Printf("[REFRESH] Error getting AG accounts: %v", err)
+	} else if len(agAccounts) > 0 {
+		log.Printf("[REFRESH] Refreshing %d AG tokens", len(agAccounts))
+		for _, account := range agAccounts {
+			newCreds, err := antigravity.RefreshToken(cfg, &account)
+			if err != nil {
+				log.Printf("[REFRESH] AG failed for %s: %v", account.Email, err)
+				database.MarkAccountError(account.ID, "refresh_failed: "+err.Error(), 0)
+				continue
+			}
+			credsJSON, _ := json.Marshal(newCreds)
+			database.UpdateAccountCredentials(account.ID, credsJSON)
+			log.Printf("[REFRESH] AG refreshed: %s", account.Email)
+		}
 	}
 
-	if len(accounts) == 0 {
-		return
-	}
-
-	log.Printf("[REFRESH] Refreshing %d expiring tokens", len(accounts))
-
-	for _, account := range accounts {
-		newCreds, err := antigravity.RefreshToken(cfg, &account)
-		if err != nil {
-			log.Printf("[REFRESH] Failed for %s: %v", account.Email, err)
-			database.MarkAccountError(account.ID, "refresh_failed: "+err.Error(), 0)
-			continue
+	// Refresh Kiro accounts with tokens expiring within 10 minutes
+	kiroAccounts, err := database.GetAccountsNeedingRefresh("kiro", 10)
+	if err != nil {
+		log.Printf("[REFRESH] Error getting Kiro accounts: %v", err)
+	} else if len(kiroAccounts) > 0 {
+		log.Printf("[REFRESH] Refreshing %d Kiro tokens", len(kiroAccounts))
+		for _, account := range kiroAccounts {
+			newCreds, err := kiro.RefreshToken(&account)
+			if err != nil {
+				log.Printf("[REFRESH] Kiro failed for %s: %v", account.Email, err)
+				database.MarkAccountError(account.ID, "refresh_failed: "+err.Error(), 0)
+				continue
+			}
+			credsJSON, _ := json.Marshal(newCreds)
+			database.UpdateAccountCredentials(account.ID, credsJSON)
+			log.Printf("[REFRESH] Kiro refreshed: %s", account.Email)
 		}
-
-		// Save updated credentials
-		credsJSON, _ := json.Marshal(newCreds)
-		if err := database.UpdateAccountCredentials(account.ID, credsJSON); err != nil {
-			log.Printf("[REFRESH] Failed to save creds for %s: %v", account.Email, err)
-			continue
-		}
-
-		log.Printf("[REFRESH] Refreshed token for %s (expires: %s)", account.Email, newCreds.ExpiresAt)
 	}
 }
 
@@ -77,25 +85,51 @@ func healthChecker(cfg *config.Config, database *db.Database) {
 }
 
 func checkHealth(cfg *config.Config, database *db.Database) {
-	accounts, err := database.GetActiveAccounts("antigravity")
+	// Check AG accounts
+	agAccounts, err := database.GetActiveAccounts("antigravity")
 	if err != nil {
-		log.Printf("[HEALTH] Error getting accounts: %v", err)
-		return
+		log.Printf("[HEALTH] Error getting AG accounts: %v", err)
+	} else {
+		for _, account := range agAccounts {
+			var creds db.AGCredentials
+			if err := json.Unmarshal(account.Credentials, &creds); err != nil {
+				continue
+			}
+			_, _, err := antigravity.LoadCodeAssist(creds.AccessToken)
+			if err != nil {
+				log.Printf("[HEALTH] AG %s unhealthy: %v", account.Email, err)
+				database.MarkAccountError(account.ID, "health_check_failed: "+err.Error(), 0)
+			} else {
+				database.MarkAccountSuccess(account.ID)
+			}
+		}
 	}
 
-	for _, account := range accounts {
-		var creds db.AGCredentials
-		if err := json.Unmarshal(account.Credentials, &creds); err != nil {
-			continue
-		}
-
-		// Quick health check: try loadCodeAssist
-		_, _, err := antigravity.LoadCodeAssist(creds.AccessToken)
-		if err != nil {
-			log.Printf("[HEALTH] Account %s unhealthy: %v", account.Email, err)
-			database.MarkAccountError(account.ID, "health_check_failed: "+err.Error(), 0)
-		} else {
-			database.MarkAccountSuccess(account.ID)
+	// Check Kiro accounts
+	kiroAccounts, err := database.GetActiveAccounts("kiro")
+	if err != nil {
+		log.Printf("[HEALTH] Error getting Kiro accounts: %v", err)
+	} else {
+		for _, account := range kiroAccounts {
+			var creds kiro.KiroCredentials
+			if err := json.Unmarshal(account.Credentials, &creds); err != nil {
+				continue
+			}
+			if creds.AccessToken == "" {
+				continue
+			}
+			// Simple health check: try to refresh (validates token is still valid)
+			if kiro.IsTokenExpired(&creds, 0) {
+				_, err := kiro.RefreshToken(&account)
+				if err != nil {
+					log.Printf("[HEALTH] Kiro %s unhealthy: %v", account.Email, err)
+					database.MarkAccountError(account.ID, "health_check_failed: "+err.Error(), 0)
+				} else {
+					database.MarkAccountSuccess(account.ID)
+				}
+			} else {
+				database.MarkAccountSuccess(account.ID)
+			}
 		}
 	}
 }

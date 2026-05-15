@@ -113,12 +113,16 @@ func Start(cfg *config.Config, database *db.Database) error {
 	r.Get("/dashboard", dash.ServeStatic)
 	r.Get("/dashboard/*", dash.ServeStatic)
 
-	// Management API
+	// Management API (protected: localhost OR valid dashboard token)
 	r.Route("/api", func(r chi.Router) {
-		// Auth
+		// Auth endpoints are exempt from auth middleware (login needs to work without token)
 		r.Post("/auth/login", dash.HandleLogin)
 		r.Post("/auth/verify", dash.HandleVerify)
 		r.Post("/auth/password", dash.HandleChangePassword)
+
+		// All other /api routes require auth
+		r.Group(func(r chi.Router) {
+			r.Use(apiAuthMiddleware(database))
 
 		// Accounts
 		r.Get("/accounts", s.handleListAccounts)
@@ -193,7 +197,8 @@ func Start(cfg *config.Config, database *db.Database) error {
 		r.Post("/harvest/start", s.harvest.HandleStart)
 		r.Get("/harvest/status", s.harvest.HandleStatus)
 		r.Post("/harvest/stop", s.harvest.HandleStop)
-	})
+		}) // end r.Group (auth-protected)
+	}) // end r.Route("/api")
 
 	// SSE live feed (outside /api route group)
 	r.Get("/sse/requests", s.HandleSSE)
@@ -537,14 +542,6 @@ func (s *Server) streamResponse(w http.ResponseWriter, resp *http.Response) {
 	}
 }
 
-// forwardResponse returns non-streaming response
-func (s *Server) forwardResponse(w http.ResponseWriter, resp *http.Response) {
-	defer resp.Body.Close()
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
-}
-
 // forwardResponseCapture returns non-streaming response and captures body for logging
 func (s *Server) forwardResponseCapture(w http.ResponseWriter, resp *http.Response) string {
 	defer resp.Body.Close()
@@ -849,7 +846,15 @@ func (s *Server) handleAddAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
-	// TODO: implement delete
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		writeError(w, 400, "missing id")
+		return
+	}
+	if err := s.db.DeleteAccount(id); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 

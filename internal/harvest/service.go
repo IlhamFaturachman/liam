@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -352,4 +351,3 @@ func boolToPython(b bool) string {
 }
 
 // Ensure io import is used
-var _ = io.EOF
