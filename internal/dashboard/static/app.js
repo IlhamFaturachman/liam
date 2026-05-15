@@ -84,6 +84,15 @@ function app() {
 
     // Drag-and-drop
     dragAccountId: null,
+
+    // Add Account
+    showAddAccountModal: false,
+    addAccountTab: 'oauth', // 'oauth' | 'token'
+    addAccountForm: { refresh_token: '', email: '', callback_url: '' },
+    addAccountOAuthURL: '',
+    addAccountLoading: false,
+    addAccountMsg: '',
+    addAccountOk: null,
     savedPresets: [],
 
     // Model Select Modal
@@ -360,7 +369,6 @@ function app() {
     async dropAccount(e, targetId) {
       e.preventDefault();
       if (!this.dragAccountId || this.dragAccountId === targetId) return;
-      // Reorder: move dragged to target position
       const ids = this.providerAccounts.map(a => a.id);
       const fromIdx = ids.indexOf(this.dragAccountId);
       const toIdx = ids.indexOf(targetId);
@@ -368,11 +376,94 @@ function app() {
       ids.splice(fromIdx, 1);
       ids.splice(toIdx, 0, this.dragAccountId);
       this.dragAccountId = null;
-      // Save new order
       try {
         await fetch('/api/accounts/reorder', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ ids }) });
         if (this.providerDetail) await this.openProvider(this.providerDetail);
       } catch (e) {}
+    },
+
+    // Add Account
+    async openAddAccount() {
+      this.showAddAccountModal = true;
+      this.addAccountTab = 'oauth';
+      this.addAccountForm = { refresh_token: '', email: '', callback_url: '' };
+      this.addAccountOAuthURL = '';
+      this.addAccountMsg = '';
+      this.addAccountLoading = false;
+
+      // If AG provider, fetch OAuth URL
+      if (this.providerDetail === 'antigravity') {
+        try {
+          const r = await fetch('/api/oauth/ag/authorize');
+          if (r.ok) {
+            const d = await r.json();
+            this.addAccountOAuthURL = d.auth_url;
+          }
+        } catch (e) {}
+      } else {
+        // Kiro: default to token tab
+        this.addAccountTab = 'token';
+      }
+    },
+    closeAddAccount() { this.showAddAccountModal = false; this.addAccountMsg = ''; },
+
+    async submitAddAccountOAuth() {
+      if (!this.addAccountForm.callback_url) { this.addAccountMsg = 'Paste the callback URL'; this.addAccountOk = false; return; }
+      this.addAccountLoading = true;
+      this.addAccountMsg = '';
+      try {
+        const r = await fetch('/api/oauth/ag/exchange', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ callback_url: this.addAccountForm.callback_url })
+        });
+        const d = await r.json();
+        if (r.ok && d.success) {
+          this.addAccountMsg = 'Account added: ' + d.email;
+          this.addAccountOk = true;
+          await this.fetchAccounts();
+          await this.fetchProviders();
+          if (this.providerDetail) await this.openProvider(this.providerDetail);
+          setTimeout(() => this.closeAddAccount(), 2000);
+        } else {
+          this.addAccountMsg = d.error?.message || d.error || 'Failed';
+          this.addAccountOk = false;
+        }
+      } catch (e) { this.addAccountMsg = 'Connection error'; this.addAccountOk = false; }
+      this.addAccountLoading = false;
+    },
+
+    async submitAddAccountToken() {
+      if (!this.addAccountForm.refresh_token) { this.addAccountMsg = 'Refresh token required'; this.addAccountOk = false; return; }
+      this.addAccountLoading = true;
+      this.addAccountMsg = '';
+
+      const provider = this.providerDetail === 'antigravity' ? 'ag' : 'kiro';
+      const endpoint = '/api/accounts/import/' + provider;
+      const body = provider === 'kiro'
+        ? { refresh_token: this.addAccountForm.refresh_token }
+        : { refresh_token: this.addAccountForm.refresh_token, email: this.addAccountForm.email || '' };
+
+      try {
+        const r = await fetch(endpoint, {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify(body)
+        });
+        const d = await r.json();
+        if (r.ok && d.success) {
+          this.addAccountMsg = 'Account added: ' + d.email;
+          this.addAccountOk = true;
+          await this.fetchAccounts();
+          await this.fetchProviders();
+          if (this.providerDetail) await this.openProvider(this.providerDetail);
+          setTimeout(() => this.closeAddAccount(), 2000);
+        } else {
+          this.addAccountMsg = d.error?.message || d.error || 'Failed';
+          this.addAccountOk = false;
+        }
+      } catch (e) { this.addAccountMsg = 'Connection error'; this.addAccountOk = false; }
+      this.addAccountLoading = false;
     },
 
     buildOverviewStats() {

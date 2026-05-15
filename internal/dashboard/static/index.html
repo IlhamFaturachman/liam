@@ -193,7 +193,12 @@ tailwind.config={theme:{extend:{colors:{
         <div class="bg-surface-2 border border-bdr rounded-xl overflow-hidden">
           <div class="px-4 py-3 border-b border-bdr flex items-center justify-between">
             <span class="text-xs text-txt-3 uppercase tracking-wider">Accounts</span>
-            <span class="text-[11px] text-txt-3">Drag to reorder priority</span>
+            <div class="flex items-center gap-3">
+              <span class="text-[11px] text-txt-3">Drag to reorder priority</span>
+              <button @click="openAddAccount()" class="px-3 py-1.5 bg-brand hover:bg-brand-dark text-white text-xs font-medium rounded-lg transition-all flex items-center gap-1.5">
+                <span class="material-symbols-outlined text-[14px]">add</span> Add Account
+              </button>
+            </div>
           </div>
           <table x-show="providerAccounts.length>0" class="w-full text-sm">
             <thead><tr class="border-b border-bdr text-[11px] text-txt-3 uppercase tracking-wider">
@@ -790,6 +795,62 @@ tailwind.config={theme:{extend:{colors:{
         <button @click="closeCreateKey()" class="px-4 py-2 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg">Done</button>
       </div>
     </div>
+  </div>
+</div>
+
+<!-- Add Account Modal -->
+<div x-show="showAddAccountModal" x-cloak class="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center" @click.self="closeAddAccount()">
+  <div class="bg-surface-2 border border-bdr rounded-xl p-6 w-[520px] shadow-2xl">
+    <div class="flex items-center justify-between mb-5">
+      <h2 class="text-base font-semibold" x-text="'Add ' + (providerDetail==='antigravity'?'Antigravity':'Kiro') + ' Account'"></h2>
+      <button @click="closeAddAccount()" class="text-txt-3 hover:text-txt-1"><span class="material-symbols-outlined text-[20px]">close</span></button>
+    </div>
+
+    <!-- Tabs (AG only — Kiro just shows token tab) -->
+    <div x-show="providerDetail==='antigravity'" class="flex gap-2 mb-4">
+      <button @click="addAccountTab='oauth'" :class="addAccountTab==='oauth'?'bg-brand text-white':'bg-surface-1 border border-bdr text-txt-2'" class="px-3 py-1.5 text-xs font-medium rounded-lg transition-all">OAuth Flow</button>
+      <button @click="addAccountTab='token'" :class="addAccountTab==='token'?'bg-brand text-white':'bg-surface-1 border border-bdr text-txt-2'" class="px-3 py-1.5 text-xs font-medium rounded-lg transition-all">Paste Token</button>
+    </div>
+
+    <!-- OAuth Flow Tab (AG only) -->
+    <div x-show="addAccountTab==='oauth' && providerDetail==='antigravity'" class="space-y-4">
+      <div>
+        <div class="text-xs text-txt-2 mb-2">Step 1: Open this URL in your browser</div>
+        <div class="flex gap-2">
+          <input readonly :value="addAccountOAuthURL" class="flex-1 px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-[11px] font-mono text-txt-2 truncate">
+          <button @click="copyText(addAccountOAuthURL)" class="px-3 py-2 bg-surface-1 border border-bdr text-txt-2 hover:text-brand-light text-xs rounded-lg">Copy</button>
+          <button @click="window.open(addAccountOAuthURL,'_blank')" class="px-3 py-2 bg-surface-1 border border-bdr text-txt-2 hover:text-brand-light text-xs rounded-lg">Open</button>
+        </div>
+      </div>
+      <div>
+        <div class="text-xs text-txt-2 mb-2">Step 2: After login, paste the callback URL here</div>
+        <input x-model="addAccountForm.callback_url" placeholder="http://localhost:666/callback?code=...&state=..." class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm font-mono text-txt-1 placeholder-txt-3 focus:outline-none focus:border-brand">
+        <p class="text-[10px] text-txt-3 mt-1">Copy the full URL from your browser's address bar after Google redirects</p>
+      </div>
+      <button @click="submitAddAccountOAuth()" :disabled="addAccountLoading" class="w-full py-2.5 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg transition-all disabled:opacity-50">
+        <span x-text="addAccountLoading?'Connecting...':'Connect'"></span>
+      </button>
+    </div>
+
+    <!-- Paste Token Tab (AG + Kiro) -->
+    <div x-show="addAccountTab==='token' || providerDetail!=='antigravity'" class="space-y-4">
+      <div>
+        <label class="text-xs text-txt-2 mb-1.5 block">Refresh Token <span class="text-err">*</span></label>
+        <input x-model="addAccountForm.refresh_token" :placeholder="providerDetail==='antigravity'?'1//xxx...':'aorAAAAAG...'" class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm font-mono text-txt-1 placeholder-txt-3 focus:outline-none focus:border-brand">
+        <p x-show="providerDetail==='kiro'" class="text-[10px] text-txt-3 mt-1">Must start with "aorAAAAAG". Token will be auto-validated.</p>
+        <p x-show="providerDetail==='antigravity'" class="text-[10px] text-txt-3 mt-1">Access token and project ID will be auto-derived from refresh token.</p>
+      </div>
+      <div x-show="providerDetail==='antigravity'">
+        <label class="text-xs text-txt-2 mb-1.5 block">Email (optional)</label>
+        <input x-model="addAccountForm.email" placeholder="user@gmail.com" class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm text-txt-1 placeholder-txt-3 focus:outline-none focus:border-brand">
+      </div>
+      <button @click="submitAddAccountToken()" :disabled="addAccountLoading" class="w-full py-2.5 bg-brand hover:bg-brand-dark text-white text-sm font-medium rounded-lg transition-all disabled:opacity-50">
+        <span x-text="addAccountLoading?'Importing...':'Import Account'"></span>
+      </button>
+    </div>
+
+    <!-- Status message -->
+    <div x-show="addAccountMsg" class="mt-3 px-3 py-2 rounded-lg text-xs" :class="addAccountOk?'bg-ok/10 text-ok':'bg-err/10 text-err'" x-text="addAccountMsg"></div>
   </div>
 </div>
 

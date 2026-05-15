@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -328,3 +329,148 @@ func extractEmailFromJWT(token string) string {
 }
 
 // Suppress unused imports
+
+// handleAGAuthorize generates an OAuth URL for AG account addition
+func (s *Server) handleAGAuthorize(w http.ResponseWriter, r *http.Request) {
+	state := uuid.New().String()
+	redirectURI := fmt.Sprintf("http://localhost:%d/callback", s.cfg.Port)
+
+	scopes := strings.Join(s.cfg.AGScopes, " ")
+	authURL := fmt.Sprintf(
+		"https://accounts.google.com/o/oauth2/v2/auth?client_id=%s&response_type=code&redirect_uri=%s&scope=%s&state=%s&access_type=offline&prompt=consent",
+		s.cfg.AGClientID,
+		redirectURI,
+		strings.ReplaceAll(scopes, " ", "+"),
+		state,
+	)
+
+	writeJSON(w, 200, map[string]interface{}{
+		"auth_url":     authURL,
+		"state":        state,
+		"redirect_uri": redirectURI,
+	})
+}
+
+// handleAGExchange exchanges a callback URL for tokens and saves the account
+func (s *Server) handleAGExchange(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		CallbackURL string `json:"callback_url"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid JSON")
+		return
+	}
+	if req.CallbackURL == "" {
+		writeError(w, 400, "callback_url required")
+		return
+	}
+
+	// Parse code from callback URL
+	callbackURL := req.CallbackURL
+	// Handle case where user pastes just the query params
+	if !strings.Contains(callbackURL, "?") {
+		writeError(w, 400, "Invalid callback URL — must contain ?code=...")
+		return
+	}
+
+	parts := strings.SplitN(callbackURL, "?", 2)
+	params := map[string]string{}
+	for _, pair := range strings.Split(parts[1], "&") {
+		kv := strings.SplitN(pair, "=", 2)
+		if len(kv) == 2 {
+			params[kv[0]] = kv[1]
+		}
+	}
+
+	code := params["code"]
+	if code == "" {
+		if errMsg := params["error"]; errMsg != "" {
+			writeError(w, 400, fmt.Sprintf("OAuth error: %s", errMsg))
+			return
+		}
+		writeError(w, 400, "No authorization code found in URL")
+		return
+	}
+
+	redirectURI := fmt.Sprintf("http://localhost:%d/callback", s.cfg.Port)
+
+	// Exchange code for tokens
+	tokenResp, err := http.Post("https://oauth2.googleapis.com/token",
+		"application/x-www-form-urlencoded",
+		strings.NewReader(fmt.Sprintf(
+			"grant_type=authorization_code&code=%s&client_id=%s&client_secret=%s&redirect_uri=%s",
+			code, s.cfg.AGClientID, s.cfg.AGClientSecret, redirectURI,
+		)))
+	if err != nil {
+		writeError(w, 502, fmt.Sprintf("Token exchange failed: %v", err))
+		return
+	}
+	defer tokenResp.Body.Close()
+
+	if tokenResp.StatusCode != 200 {
+		body, _ := io.ReadAll(tokenResp.Body)
+		writeError(w, 400, fmt.Sprintf("Token exchange error: %s", string(body[:min(len(body), 200)])))
+		return
+	}
+
+	var tokens struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresIn    int    `json:"expires_in"`
+		Scope        string `json:"scope"`
+	}
+	json.NewDecoder(tokenResp.Body).Decode(&tokens)
+
+	if tokens.AccessToken == "" {
+		writeError(w, 400, "No access token in response")
+		return
+	}
+
+	// Fetch email
+	email := ""
+	userResp, err := http.Get("https://www.googleapis.com/oauth2/v1/userinfo?alt=json&access_token=" + tokens.AccessToken)
+	if err == nil && userResp.StatusCode == 200 {
+		var userInfo struct{ Email string `json:"email"` }
+		json.NewDecoder(userResp.Body).Decode(&userInfo)
+		userResp.Body.Close()
+		email = userInfo.Email
+	}
+	if email == "" {
+		email = "ag-" + uuid.New().String()[:8] + "@oauth"
+	}
+
+	// Fetch projectId
+	projectID, _, _ := antigravity.LoadCodeAssist(tokens.AccessToken)
+	if projectID == "" {
+		projectID = "auto-" + uuid.New().String()[:5]
+	}
+
+	// Save account
+	creds := db.AGCredentials{
+		AccessToken:  tokens.AccessToken,
+		RefreshToken: tokens.RefreshToken,
+		ExpiresAt:    time.Now().UTC().Add(time.Duration(tokens.ExpiresIn) * time.Second).Format(time.RFC3339),
+		ProjectID:    projectID,
+		TierID:       "legacy-tier",
+		Scope:        tokens.Scope,
+	}
+	credsJSON, _ := json.Marshal(creds)
+
+	account := &db.Account{
+		Provider:    "antigravity",
+		Email:       email,
+		Status:      "active",
+		Credentials: credsJSON,
+	}
+
+	if err := s.db.UpsertAccount(account); err != nil {
+		writeError(w, 500, fmt.Sprintf("Failed to save: %v", err))
+		return
+	}
+
+	writeJSON(w, 201, map[string]interface{}{
+		"success":    true,
+		"email":      email,
+		"project_id": projectID,
+	})
+}

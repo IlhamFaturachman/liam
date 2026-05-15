@@ -187,6 +187,8 @@ func Start(cfg *config.Config, database *db.Database) error {
 		// Account import (manual add)
 		r.Post("/accounts/import/ag", s.handleImportAG)
 		r.Post("/accounts/import/kiro", s.handleImportKiro)
+		r.Get("/oauth/ag/authorize", s.handleAGAuthorize)
+		r.Post("/oauth/ag/exchange", s.handleAGExchange)
 
 		// Account actions
 		r.Post("/accounts/{id}/refresh-quota", s.handleRefreshQuota)
