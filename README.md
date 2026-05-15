@@ -1,8 +1,8 @@
 <p align="center">
   <h1 align="center">LIAM</h1>
-  <p align="center"><strong>Living Intelligent Automation Machine</strong></p>
+  <p align="center"><em>Lightweight Infrastructure for AI Models</em></p>
   <p align="center">
-    Self-hosted, OpenAI-compatible AI proxy gateway with multi-account rotation, anti-ban protection, and CLI tool integrations.
+    Self-hosted AI proxy gateway with multi-account rotation, anti-ban protection, and CLI tool integrations.
   </p>
   <p align="center">
     <a href="#features">Features</a> •
