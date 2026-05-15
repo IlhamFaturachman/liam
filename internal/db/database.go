@@ -538,12 +538,12 @@ func (d *Database) GetAccountsNeedingRefresh(provider string, withinMinutes int)
 
 // CreateAPIKey generates a new API key and returns the key object + raw key
 func (d *Database) CreateAPIKey(name string) (*APIKey, string, error) {
-	// Generate random key: li-<32 random bytes hex>
+	// Generate random key with the canonical lyd- prefix (32-byte hex).
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
 		return nil, "", err
 	}
-	rawKey := "li-" + hex.EncodeToString(raw)
+	rawKey := "lyd-" + hex.EncodeToString(raw)
 
 	// Hash for storage
 	hash := sha256.Sum256([]byte(rawKey))

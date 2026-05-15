@@ -972,7 +972,7 @@ tailwind.config={theme:{extend:{colors:{
                   <span>Raw key not stored on this device (created elsewhere or before this update). Use <strong>Custom Key</strong> to paste it manually, or create a new one.</span>
                 </p>
                 <div x-show="integrationConfig.api_key_custom" class="flex gap-2">
-                  <input x-model="integrationConfig.api_key" @input.debounce.500ms="refreshSnippet()" placeholder="li-..." class="flex-1 px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm font-mono text-txt-1 focus:outline-none focus:border-brand">
+                  <input x-model="integrationConfig.api_key" @input.debounce.500ms="refreshSnippet()" placeholder="lyd-..." class="flex-1 px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm font-mono text-txt-1 focus:outline-none focus:border-brand">
                   <button @click="integrationConfig.api_key_custom=false;integrationConfig.api_key='';refreshSnippet();" class="px-3 py-2 bg-surface-1 border border-bdr text-txt-3 hover:text-txt-1 text-xs rounded-lg whitespace-nowrap">Cancel</button>
                 </div>
                 <p x-show="keys.length === 0 && !integrationConfig.api_key_custom" class="text-[11px] text-txt-3 mt-1">No API keys yet. Create one in the Keys page or click "Custom Key" to enter manually.</p>

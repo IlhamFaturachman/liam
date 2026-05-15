@@ -1415,9 +1415,9 @@ function app() {
       if (!this.integrationDetail) return;
       const apiKey = this.getActualApiKey();
       // Reject obvious placeholders. The full raw key always starts with
-      // `li-` and is far longer than the prefix; if we can't find it we
+      // `lyd-` and is far longer than the prefix; if we can't find it we
       // tell the user how to recover instead of failing silently.
-      if (!apiKey || apiKey === '<YOUR_KEY>' || apiKey.endsWith('...') || !apiKey.startsWith('li-')) {
+      if (!apiKey || apiKey === '<YOUR_KEY>' || apiKey.endsWith('...') || !apiKey.startsWith('lyd-')) {
         if (!this.integrationConfig.api_key_custom && this.integrationConfig.api_key_id) {
           this.toast("We don't have the raw value for this key on this device. Click 'Custom Key' and paste the full key, or create a new one in the Keys page (the raw value is shown once at creation).", {kind:'warn', title:'Raw key unavailable'});
         } else {

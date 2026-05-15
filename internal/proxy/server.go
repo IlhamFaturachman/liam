@@ -252,7 +252,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 
 		rawKey := strings.TrimPrefix(auth, "Bearer ")
 		if rawKey == auth {
-			writeError(w, http.StatusUnauthorized, "Invalid Authorization format. Use: Bearer li-xxx")
+			writeError(w, http.StatusUnauthorized, "Invalid Authorization format. Use: Bearer lyd-xxx")
 			return
 		}
 
