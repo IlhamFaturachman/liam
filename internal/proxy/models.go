@@ -14,6 +14,7 @@ import (
 	"github.com/liam-auto/liam/internal/db"
 	"github.com/liam-auto/liam/internal/models"
 	"github.com/liam-auto/liam/internal/providers/antigravity"
+	liamsync "github.com/liam-auto/liam/internal/sync"
 )
 
 // ModelsHandler handles model registry, aliases, test, and refresh
@@ -24,6 +25,7 @@ type ModelsHandler struct {
 	aliases  *models.AliasStore
 	pool     *AccountPool
 	ag       *antigravity.Executor
+	syncer   *liamsync.Syncer
 }
 
 // ServerConfig is a small interface to avoid circular dependencies
@@ -32,8 +34,8 @@ type ServerConfig interface {
 }
 
 // NewModelsHandler creates a new models handler
-func NewModelsHandler(cfg ServerConfig, database *db.Database, registry *models.Registry, aliases *models.AliasStore, pool *AccountPool, ag *antigravity.Executor) *ModelsHandler {
-	return &ModelsHandler{cfg: cfg, db: database, registry: registry, aliases: aliases, pool: pool, ag: ag}
+func NewModelsHandler(cfg ServerConfig, database *db.Database, registry *models.Registry, aliases *models.AliasStore, pool *AccountPool, ag *antigravity.Executor, syncer *liamsync.Syncer) *ModelsHandler {
+	return &ModelsHandler{cfg: cfg, db: database, registry: registry, aliases: aliases, pool: pool, ag: ag, syncer: syncer}
 }
 
 // HandleListModels returns all models, optionally filtered by provider
@@ -73,6 +75,9 @@ func (h *ModelsHandler) HandleAddCustomModel(w http.ResponseWriter, r *http.Requ
 		writeError(w, 400, fmt.Sprintf("failed to add model: %v", err))
 		return
 	}
+	if h.syncer != nil {
+		h.syncer.PushCustomModelAsync(model.ID, model.ProviderAlias, model.ModelID, model.DisplayName, model.Type, model.IsEnabled, model.Metadata)
+	}
 	writeJSON(w, 201, model)
 }
 
@@ -86,6 +91,9 @@ func (h *ModelsHandler) HandleRemoveModel(w http.ResponseWriter, r *http.Request
 	if err := h.registry.Remove(id); err != nil {
 		writeError(w, 500, err.Error())
 		return
+	}
+	if h.syncer != nil {
+		h.syncer.DeleteCustomModelAsync(id)
 	}
 	writeJSON(w, 200, map[string]string{"status": "removed"})
 }
@@ -101,6 +109,12 @@ func (h *ModelsHandler) HandleToggleModel(w http.ResponseWriter, r *http.Request
 	if err := h.registry.Toggle(id, req.Enabled); err != nil {
 		writeError(w, 500, err.Error())
 		return
+	}
+	// Mirror the toggle upstream so other devices see the new state.
+	if h.syncer != nil {
+		if m, mErr := h.registry.Get(id); mErr == nil && m != nil {
+			h.syncer.PushCustomModelAsync(m.ID, m.ProviderAlias, m.ModelID, m.DisplayName, m.Type, m.IsEnabled, m.Metadata)
+		}
 	}
 	writeJSON(w, 200, map[string]interface{}{"status": "ok", "enabled": req.Enabled})
 }
@@ -177,10 +191,10 @@ func (h *ModelsHandler) HandleTestModel(w http.ResponseWriter, r *http.Request) 
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
-	var parsed map[string]interface{}
-	json.Unmarshal(body, &parsed)
 
 	if resp.StatusCode != 200 {
+		var parsed map[string]interface{}
+		json.Unmarshal(body, &parsed)
 		detail := extractErrorDetail(parsed, body)
 		writeJSON(w, 200, map[string]interface{}{
 			"ok":         false,
@@ -190,6 +204,35 @@ func (h *ModelsHandler) HandleTestModel(w http.ResponseWriter, r *http.Request) 
 		})
 		return
 	}
+
+	// Detect SSE stream response. Kiro's executor always streams (even
+	// when stream=false) so the body looks like
+	//   data: {...}\n\ndata: {...}\n\ndata: [DONE]\n\n
+	// Treat any chunk with content/finish_reason as success.
+	bodyStr := string(body)
+	if strings.HasPrefix(strings.TrimSpace(bodyStr), "data:") {
+		ok, sseErr := parseSSESuccess(bodyStr)
+		if !ok {
+			writeJSON(w, 200, map[string]interface{}{
+				"ok":         false,
+				"latency_ms": latency,
+				"error":      truncStr(sseErr, 240),
+				"status":     resp.StatusCode,
+			})
+			return
+		}
+		writeJSON(w, 200, map[string]interface{}{
+			"ok":         true,
+			"latency_ms": latency,
+			"error":      nil,
+			"status":     resp.StatusCode,
+		})
+		return
+	}
+
+	// Non-streaming JSON response.
+	var parsed map[string]interface{}
+	json.Unmarshal(body, &parsed)
 
 	// Check provider-level error in body
 	if errField, ok := parsed["error"]; ok && errField != nil {
@@ -221,6 +264,73 @@ func (h *ModelsHandler) HandleTestModel(w http.ResponseWriter, r *http.Request) 
 		"error":      nil,
 		"status":     resp.StatusCode,
 	})
+}
+
+// parseSSESuccess scans an OpenAI-compatible SSE body and returns true when
+// at least one chunk carried delta content, a finish_reason, or a tool call.
+// Returns (false, errMessage) when the only chunks were errors / empty.
+func parseSSESuccess(body string) (bool, string) {
+	lines := strings.Split(body, "\n")
+	sawContent := false
+	sawFinish := false
+	var lastErr string
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+
+		var chunk map[string]interface{}
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			continue
+		}
+
+		// Provider-level error inside an SSE event.
+		if errField, ok := chunk["error"]; ok && errField != nil {
+			lastErr = extractErrorDetail(chunk, []byte(payload))
+			continue
+		}
+
+		choices, _ := chunk["choices"].([]interface{})
+		for _, c := range choices {
+			cm, _ := c.(map[string]interface{})
+			if cm == nil {
+				continue
+			}
+			if fr, ok := cm["finish_reason"].(string); ok && fr != "" {
+				sawFinish = true
+			}
+			delta, _ := cm["delta"].(map[string]interface{})
+			if delta == nil {
+				continue
+			}
+			if content, _ := delta["content"].(string); content != "" {
+				sawContent = true
+			}
+			// Models that emit thinking-only output before metering events
+			// (Opus 4.7, DeepSeek, GLM-5) need this branch — without it the
+			// SSE probe falsely reports "no completion content".
+			if rc, _ := delta["reasoning_content"].(string); rc != "" {
+				sawContent = true
+			}
+			if tc, _ := delta["tool_calls"].([]interface{}); len(tc) > 0 {
+				sawContent = true
+			}
+		}
+	}
+
+	if sawContent || sawFinish {
+		return true, ""
+	}
+	if lastErr == "" {
+		lastErr = "Provider returned no completion content"
+	}
+	return false, lastErr
 }
 
 // HandleRefreshModels fetches live model list from upstream

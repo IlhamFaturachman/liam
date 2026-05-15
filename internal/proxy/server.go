@@ -64,11 +64,14 @@ func Start(cfg *config.Config, database *db.Database) error {
 		integrations: integrations.NewService(),
 		combo:        NewComboHandler(database),
 	}
-	s.modelsHandler = NewModelsHandler(s, database, registry, aliases, s.pool, s.ag)
 
-	// Initialize Supabase sync
+	// Initialize Supabase sync first so the models handler can wire it
+	// for auto-sync of custom-model CRUD.
 	syncClient := liamsync.NewClient(cfg.SupabaseURL, cfg.SupabaseKey)
 	s.syncer = liamsync.NewSyncer(syncClient, database)
+
+	s.modelsHandler = NewModelsHandler(s, database, registry, aliases, s.pool, s.ag, s.syncer)
+
 	if s.syncer.IsEnabled() {
 		if err := liamsync.EnsureTables(syncClient); err != nil {
 			log.Printf("[SYNC] Warning: %v", err)
@@ -124,82 +127,83 @@ func Start(cfg *config.Config, database *db.Database) error {
 		r.Group(func(r chi.Router) {
 			r.Use(apiAuthMiddleware(database))
 
-		// Accounts
-		r.Get("/accounts", s.handleListAccounts)
-		r.Post("/accounts", s.handleAddAccount)
-		r.Delete("/accounts/{id}", s.handleDeleteAccount)
+			// Accounts
+			r.Get("/accounts", s.handleListAccounts)
+			r.Post("/accounts", s.handleAddAccount)
+			r.Delete("/accounts/{id}", s.handleDeleteAccount)
 
-		// Keys
-		r.Get("/keys", s.handleListKeys)
-		r.Post("/keys", s.handleCreateKey)
-		r.Delete("/keys/{id}", s.handleDeleteKey)
+			// Keys
+			r.Get("/keys", s.handleListKeys)
+			r.Post("/keys", s.handleCreateKey)
+			r.Delete("/keys/{id}", s.handleDeleteKey)
 
-		// Settings
-		r.Get("/settings/base-url", s.handleGetBaseURL)
-		r.Post("/settings/base-url", s.handleSetBaseURL)
+			// Settings
+			r.Get("/settings/base-url", s.handleGetBaseURL)
+			r.Post("/settings/base-url", s.handleSetBaseURL)
 
-		// Stats & Usage
-		r.Get("/stats", s.handleStats)
-		r.Get("/usage/recent", s.HandleUsageRecent)
-		r.Get("/usage/stats", s.HandleUsageStats)
-		r.Get("/usage/chart", s.HandleUsageChart)
-		r.Get("/usage/{id}", s.HandleUsageDetail)
-		r.Get("/providers/stats", s.HandleProviderStats)
+			// Stats & Usage
+			r.Get("/stats", s.handleStats)
+			r.Get("/usage/recent", s.HandleUsageRecent)
+			r.Get("/usage/stats", s.HandleUsageStats)
+			r.Get("/usage/chart", s.HandleUsageChart)
+			r.Get("/usage/{id}", s.HandleUsageDetail)
+			r.Get("/providers/stats", s.HandleProviderStats)
 
-		// Models
-		r.Get("/models", s.modelsHandler.HandleListModels)
-		r.Post("/models/custom", s.modelsHandler.HandleAddCustomModel)
-		r.Delete("/models/custom/*", s.modelsHandler.HandleRemoveModel)
-		r.Post("/models/toggle/*", s.modelsHandler.HandleToggleModel)
-		r.Post("/models/test", s.modelsHandler.HandleTestModel)
-		r.Post("/providers/{alias}/refresh-models", s.modelsHandler.HandleRefreshModels)
-		r.Post("/providers/{alias}/disable-all", s.modelsHandler.HandleDisableAllForProvider)
+			// Models
+			r.Get("/models", s.modelsHandler.HandleListModels)
+			r.Post("/models/custom", s.modelsHandler.HandleAddCustomModel)
+			r.Delete("/models/custom/*", s.modelsHandler.HandleRemoveModel)
+			r.Post("/models/toggle/*", s.modelsHandler.HandleToggleModel)
+			r.Post("/models/test", s.modelsHandler.HandleTestModel)
+			r.Post("/providers/{alias}/refresh-models", s.modelsHandler.HandleRefreshModels)
+			r.Post("/providers/{alias}/disable-all", s.modelsHandler.HandleDisableAllForProvider)
 
-		// Aliases
-		r.Get("/aliases", s.modelsHandler.HandleListAliases)
-		r.Post("/aliases", s.modelsHandler.HandleSetAlias)
-		r.Delete("/aliases/{alias}", s.modelsHandler.HandleDeleteAlias)
+			// Aliases
+			r.Get("/aliases", s.modelsHandler.HandleListAliases)
+			r.Post("/aliases", s.modelsHandler.HandleSetAlias)
+			r.Delete("/aliases/{alias}", s.modelsHandler.HandleDeleteAlias)
 
-		// Integrations
-		r.Get("/integrations", s.integrations.HandleList)
-		r.Get("/integrations/{tool}", s.integrations.HandleGet)
-		r.Post("/integrations/{tool}/snippet", s.integrations.HandleSnippet)
-		r.Post("/integrations/{tool}/apply", s.integrations.HandleApply)
-		r.Post("/integrations/{tool}/reset", s.integrations.HandleReset)
+			// Integrations
+			r.Get("/integrations", s.integrations.HandleList)
+			r.Get("/integrations/{tool}", s.integrations.HandleGet)
+			r.Post("/integrations/{tool}/snippet", s.integrations.HandleSnippet)
+			r.Post("/integrations/{tool}/apply", s.integrations.HandleApply)
+			r.Post("/integrations/{tool}/reset", s.integrations.HandleReset)
 
-		// Sync
-		r.Get("/sync/status", s.handleSyncStatus)
-		r.Post("/sync/now", s.handleSyncNow)
+			// Sync
+			r.Get("/sync/status", s.handleSyncStatus)
+			r.Post("/sync/now", s.handleSyncNow)
 
-		// Combos
-		r.Get("/combos", s.combo.HandleList)
-		r.Post("/combos", s.combo.HandleCreate)
-		r.Put("/combos/{id}", s.combo.HandleUpdate)
-		r.Delete("/combos/{id}", s.combo.HandleDelete)
+			// Combos
+			r.Get("/combos", s.combo.HandleList)
+			r.Post("/combos", s.combo.HandleCreate)
+			r.Put("/combos/{id}", s.combo.HandleUpdate)
+			r.Delete("/combos/{id}", s.combo.HandleDelete)
 
-		// Routing settings
-		r.Get("/settings/routing", s.handleGetRouting)
-		r.Post("/settings/routing", s.handleSetRouting)
+			// Routing settings
+			r.Get("/settings/routing", s.handleGetRouting)
+			r.Post("/settings/routing", s.handleSetRouting)
 
-		// Account reorder (drag-and-drop)
-		r.Post("/accounts/reorder", s.handleReorderAccounts)
+			// Account reorder (drag-and-drop)
+			r.Post("/accounts/reorder", s.handleReorderAccounts)
 
-		// Account import (manual add)
-		r.Post("/accounts/import/ag", s.handleImportAG)
-		r.Post("/accounts/import/kiro", s.handleImportKiro)
-		r.Get("/oauth/ag/authorize", s.handleAGAuthorize)
-		r.Post("/oauth/ag/exchange", s.handleAGExchange)
+			// Account import (manual add)
+			r.Post("/accounts/import/ag", s.handleImportAG)
+			r.Post("/accounts/import/kiro", s.handleImportKiro)
+			r.Get("/oauth/ag/authorize", s.handleAGAuthorize)
+			r.Post("/oauth/ag/exchange", s.handleAGExchange)
 
-		// Account actions
-		r.Post("/accounts/{id}/refresh-quota", s.handleRefreshQuota)
-		r.Get("/accounts/{id}/locks", s.handleGetAccountLocks)
-		r.Post("/accounts/{id}/excluded-models", s.handleSetExcludedModels)
-		r.Patch("/accounts/{id}", s.handleEditAccount)
+			// Account actions
+			r.Post("/accounts/{id}/refresh-quota", s.handleRefreshQuota)
+			r.Get("/accounts/{id}/locks", s.handleGetAccountLocks)
+			r.Post("/accounts/{id}/excluded-models", s.handleSetExcludedModels)
+			r.Post("/accounts/{id}/test", s.handleTestAccount)
+			r.Patch("/accounts/{id}", s.handleEditAccount)
 
-		// Harvest
-		r.Post("/harvest/start", s.harvest.HandleStart)
-		r.Get("/harvest/status", s.harvest.HandleStatus)
-		r.Post("/harvest/stop", s.harvest.HandleStop)
+			// Harvest
+			r.Post("/harvest/start", s.harvest.HandleStart)
+			r.Get("/harvest/status", s.harvest.HandleStatus)
+			r.Post("/harvest/stop", s.harvest.HandleStop)
 		}) // end r.Group (auth-protected)
 	}) // end r.Route("/api")
 
@@ -438,7 +442,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 				// Brief cooldown on this account, try different account
 				log.Printf("[RETRY %d] Account %s short cooldown (%s), switching account for %v", attempt+1, account.Email, decision.Reason, decision.Cooldown)
 				cooldownSecs := int(decision.Cooldown.Seconds())
-				if cooldownSecs < 5 { cooldownSecs = 5 }
+				if cooldownSecs < 5 {
+					cooldownSecs = 5
+				}
 				s.db.MarkAccountError(account.ID, "rate_limited: "+decision.Reason, cooldownSecs)
 				if model != "" {
 					s.db.SetModelLock(account.ID, model, time.Now().UTC().Add(decision.Cooldown))
@@ -450,7 +456,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 				// Long cooldown, account exhausted
 				log.Printf("[RETRY %d] Account %s quota exhausted (%s), cooldown %v", attempt+1, account.Email, decision.Reason, decision.Cooldown)
 				cooldownSecs := int(decision.Cooldown.Seconds())
-				if cooldownSecs < 300 { cooldownSecs = 300 }
+				if cooldownSecs < 300 {
+					cooldownSecs = 300
+				}
 				s.db.MarkAccountError(account.ID, "quota_exhausted: "+decision.Reason, cooldownSecs)
 				if model != "" {
 					s.db.SetModelLock(account.ID, model, time.Now().UTC().Add(decision.Cooldown))
@@ -482,15 +490,6 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			RequestBody:  reqBodyLog,
 		}
 
-		// Broadcast to SSE dashboard
-		BroadcastRequest(map[string]interface{}{
-			"time":       time.Now().UTC().Format("15:04:05"),
-			"model":      model,
-			"account":    account.Email,
-			"latency_ms": latency,
-			"status":     resp.StatusCode,
-		})
-
 		// Stream or return response
 		if stream {
 			s.streamResponse(w, resp)
@@ -504,8 +503,22 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Save usage log after response is sent
+		// Save usage log after response is sent. Persist first so the SSE
+		// payload carries the canonical id/created_at — the dashboard can
+		// then upsert by id without waiting for /api/usage/recent.
 		s.db.LogUsage(usageLog)
+		BroadcastRequest(map[string]interface{}{
+			"id":            usageLog.ID,
+			"created_at":    usageLog.CreatedAt.Format(time.RFC3339Nano),
+			"account_id":    usageLog.AccountID,
+			"account_email": usageLog.AccountEmail,
+			"provider":      usageLog.Provider,
+			"model":         usageLog.Model,
+			"status_code":   usageLog.StatusCode,
+			"latency_ms":    usageLog.LatencyMs,
+			"tokens_in":     usageLog.TokensIn,
+			"tokens_out":    usageLog.TokensOut,
+		})
 		return
 	}
 
@@ -702,6 +715,14 @@ func (s *Server) handleComboRequest(w http.ResponseWriter, r *http.Request, req 
 			"status":     resp.StatusCode,
 		})
 
+		BroadcastRequest(map[string]interface{}{
+			"time":       time.Now().UTC().Format("15:04:05"),
+			"model":      comboModel,
+			"account":    account.Email,
+			"latency_ms": latency,
+			"status":     resp.StatusCode,
+		})
+
 		if stream {
 			s.streamResponse(w, resp)
 			usageLog.ResponseBody = "(streaming response)"
@@ -714,6 +735,20 @@ func (s *Server) handleComboRequest(w http.ResponseWriter, r *http.Request, req 
 			}
 		}
 		s.db.LogUsage(usageLog)
+		// Re-broadcast with the canonical id/created_at so the dashboard
+		// row carries the same identifier returned by /api/usage/recent.
+		BroadcastRequest(map[string]interface{}{
+			"id":            usageLog.ID,
+			"created_at":    usageLog.CreatedAt.Format(time.RFC3339Nano),
+			"account_id":    usageLog.AccountID,
+			"account_email": usageLog.AccountEmail,
+			"provider":      usageLog.Provider,
+			"model":         usageLog.Model,
+			"status_code":   usageLog.StatusCode,
+			"latency_ms":    usageLog.LatencyMs,
+			"tokens_in":     usageLog.TokensIn,
+			"tokens_out":    usageLog.TokensOut,
+		})
 		return
 	}
 
@@ -819,6 +854,11 @@ func (s *Server) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// Never leak raw access/refresh tokens to the dashboard. The derived
+	// fields (HasCredentials, TokenExpiresAt) are enough to drive the UI.
+	for i := range accounts {
+		accounts[i].Credentials = nil
+	}
 	writeJSON(w, http.StatusOK, accounts)
 }
 
@@ -845,6 +885,10 @@ func (s *Server) handleAddAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if s.syncer != nil {
+		s.syncer.PushAccountAsync(account)
+	}
+
 	writeJSON(w, http.StatusCreated, account)
 }
 
@@ -857,6 +901,11 @@ func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 	if err := s.db.DeleteAccount(id); err != nil {
 		writeError(w, 500, err.Error())
 		return
+	}
+	// Mirror the delete to Supabase + record a tombstone so the next pull
+	// doesn't resurrect this row. Safe to call when sync is disabled.
+	if s.syncer != nil {
+		s.syncer.DeleteAccountAsync(id)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
@@ -910,8 +959,8 @@ func (s *Server) handleGetBaseURL(w http.ResponseWriter, r *http.Request) {
 		baseURL = fmt.Sprintf("http://localhost:%d/v1", s.cfg.Port)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{
-		"base_url":     baseURL,
-		"default_url":  fmt.Sprintf("http://localhost:%d/v1", s.cfg.Port),
+		"base_url":    baseURL,
+		"default_url": fmt.Sprintf("http://localhost:%d/v1", s.cfg.Port),
 	})
 }
 
@@ -944,10 +993,10 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"accounts_total":      len(accounts),
-		"accounts_active":     active,
+		"accounts_total":       len(accounts),
+		"accounts_active":      active,
 		"accounts_by_provider": byProvider,
-		"api_keys_total":      len(keys),
+		"api_keys_total":       len(keys),
 	})
 }
 

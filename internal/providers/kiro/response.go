@@ -45,9 +45,9 @@ func translateStreamingResponse(body io.ReadCloser, model string) io.ReadCloser 
 		defer body.Close()
 
 		state := &streamState{
-			model:    model,
-			id:       "chatcmpl-" + uuid.New().String()[:8],
-			created:  time.Now().Unix(),
+			model:     model,
+			id:        "chatcmpl-" + uuid.New().String()[:8],
+			created:   time.Now().Unix(),
 			toolCalls: map[string]*toolCallAccum{},
 		}
 
@@ -92,29 +92,91 @@ type toolCallAccum struct {
 func handleFrame(w io.Writer, state *streamState, frame *eventFrame) {
 	switch frame.EventType {
 	case "assistantResponseEvent":
+		// Payload may be flat ({content: "..."}) or nested
+		// ({assistantResponseEvent: {content: "..."}}) depending on the
+		// upstream model. Try both shapes.
 		var ev struct {
-			Content string `json:"content"`
+			Content                string `json:"content"`
+			AssistantResponseEvent *struct {
+				Content string `json:"content"`
+			} `json:"assistantResponseEvent"`
 		}
-		if err := json.Unmarshal(frame.Payload, &ev); err == nil && ev.Content != "" {
-			emitChunk(w, state, &OpenAIMsg{Content: &ev.Content}, nil)
+		if err := json.Unmarshal(frame.Payload, &ev); err != nil {
+			return
+		}
+		content := ev.Content
+		if content == "" && ev.AssistantResponseEvent != nil {
+			content = ev.AssistantResponseEvent.Content
+		}
+		if content != "" {
+			emitChunk(w, state, &OpenAIMsg{Content: &content}, nil)
+		}
+
+	case "reasoningContentEvent":
+		// Thinking/reasoning content emitted by Opus 4.7, DeepSeek,
+		// GLM-5, etc. before the main answer. Forward as
+		// reasoning_content (matches OpenAI thinking conventions) and
+		// also surface it as visible content so the test probe sees
+		// at least one delta — without this Opus 4.7 looked "failed"
+		// because nothing was streamed before metering events.
+		var ev struct {
+			Content               string `json:"content"`
+			ReasoningContentEvent *struct {
+				Content string `json:"content"`
+			} `json:"reasoningContentEvent"`
+		}
+		if err := json.Unmarshal(frame.Payload, &ev); err != nil {
+			return
+		}
+		content := ev.Content
+		if content == "" && ev.ReasoningContentEvent != nil {
+			content = ev.ReasoningContentEvent.Content
+		}
+		if content != "" {
+			emitChunk(w, state, &OpenAIMsg{ReasoningContent: &content}, nil)
 		}
 
 	case "codeEvent":
 		var ev struct {
-			Content string `json:"content"`
+			Content   string `json:"content"`
+			CodeEvent *struct {
+				Content string `json:"content"`
+			} `json:"codeEvent"`
 		}
-		if err := json.Unmarshal(frame.Payload, &ev); err == nil && ev.Content != "" {
-			emitChunk(w, state, &OpenAIMsg{Content: &ev.Content}, nil)
+		if err := json.Unmarshal(frame.Payload, &ev); err != nil {
+			return
+		}
+		content := ev.Content
+		if content == "" && ev.CodeEvent != nil {
+			content = ev.CodeEvent.Content
+		}
+		if content != "" {
+			emitChunk(w, state, &OpenAIMsg{Content: &content}, nil)
 		}
 
 	case "toolUseEvent":
 		var ev struct {
-			ToolUseID string `json:"toolUseId"`
-			Name      string `json:"name"`
-			Input     string `json:"input"`
-			Stop      bool   `json:"stop"`
+			ToolUseID    string `json:"toolUseId"`
+			Name         string `json:"name"`
+			Input        string `json:"input"`
+			Stop         bool   `json:"stop"`
+			ToolUseEvent *struct {
+				ToolUseID string `json:"toolUseId"`
+				Name      string `json:"name"`
+				Input     string `json:"input"`
+				Stop      bool   `json:"stop"`
+			} `json:"toolUseEvent"`
 		}
 		if err := json.Unmarshal(frame.Payload, &ev); err != nil {
+			return
+		}
+		// Unwrap nested payload shape, used by some Kiro upstream models.
+		if ev.ToolUseEvent != nil && ev.ToolUseID == "" {
+			ev.ToolUseID = ev.ToolUseEvent.ToolUseID
+			ev.Name = ev.ToolUseEvent.Name
+			ev.Input = ev.ToolUseEvent.Input
+		}
+		if ev.ToolUseID == "" {
 			return
 		}
 		acc, ok := state.toolCalls[ev.ToolUseID]
@@ -124,8 +186,8 @@ func handleFrame(w io.Writer, state *streamState, frame *eventFrame) {
 			// Emit tool_call start
 			emitChunk(w, state, &OpenAIMsg{
 				ToolCalls: []OpenAIToolCall{{
-					ID:   ev.ToolUseID,
-					Type: "function",
+					ID:       ev.ToolUseID,
+					Type:     "function",
 					Function: OpenAIFunctionCall{Name: ev.Name},
 				}},
 			}, nil)
@@ -134,8 +196,8 @@ func handleFrame(w io.Writer, state *streamState, frame *eventFrame) {
 			acc.args += ev.Input
 			emitChunk(w, state, &OpenAIMsg{
 				ToolCalls: []OpenAIToolCall{{
-					ID:   ev.ToolUseID,
-					Type: "function",
+					ID:       ev.ToolUseID,
+					Type:     "function",
 					Function: OpenAIFunctionCall{Arguments: ev.Input},
 				}},
 			}, nil)
@@ -149,6 +211,32 @@ func handleFrame(w io.Writer, state *streamState, frame *eventFrame) {
 		}
 		emitChunk(w, state, nil, &stopReason)
 
+	case "metricsEvent":
+		// Token usage from upstream. Payload may be flat or nested.
+		var ev struct {
+			InputTokens  int `json:"inputTokens"`
+			OutputTokens int `json:"outputTokens"`
+			MetricsEvent *struct {
+				InputTokens  int `json:"inputTokens"`
+				OutputTokens int `json:"outputTokens"`
+			} `json:"metricsEvent"`
+		}
+		if err := json.Unmarshal(frame.Payload, &ev); err == nil {
+			in := ev.InputTokens
+			out := ev.OutputTokens
+			if in == 0 && out == 0 && ev.MetricsEvent != nil {
+				in = ev.MetricsEvent.InputTokens
+				out = ev.MetricsEvent.OutputTokens
+			}
+			if in > 0 || out > 0 {
+				state.usage = &OpenAIUsage{
+					PromptTokens:     in,
+					CompletionTokens: out,
+					TotalTokens:      in + out,
+				}
+			}
+		}
+
 	case "contextUsageEvent":
 		var ev struct {
 			ContextUsagePercentage float64 `json:"contextUsagePercentage"`
@@ -156,11 +244,21 @@ func handleFrame(w io.Writer, state *streamState, frame *eventFrame) {
 		if err := json.Unmarshal(frame.Payload, &ev); err == nil {
 			// Estimate tokens from context usage % (200k window assumption)
 			used := int(ev.ContextUsagePercentage / 100 * 200000)
-			state.usage = &OpenAIUsage{
-				PromptTokens: used,
-				TotalTokens:  used,
+			if state.usage == nil {
+				state.usage = &OpenAIUsage{
+					PromptTokens: used,
+					TotalTokens:  used,
+				}
 			}
 		}
+
+	case "messageMetadataEvent", "supplementaryWebLinksEvent", "meteringEvent":
+		// Known events we don't surface; ignore silently.
+
+	default:
+		// Unknown event types are intentionally ignored to keep the
+		// stream resilient to upstream additions. Errors surface via
+		// the HTTP status code path before this function ever runs.
 	}
 }
 
@@ -225,11 +323,12 @@ func readEventStreamFrame(r io.Reader) (*eventFrame, error) {
 
 // parseEventType extracts :event-type from headers (simplified parser)
 // AWS EventStream header format:
-//   [1 byte: name length]
-//   [N bytes: name]
-//   [1 byte: type] (7 = string)
-//   [2 bytes: value length]
-//   [N bytes: value]
+//
+//	[1 byte: name length]
+//	[N bytes: name]
+//	[1 byte: type] (7 = string)
+//	[2 bytes: value length]
+//	[N bytes: value]
 func parseEventType(headers []byte) string {
 	i := 0
 	for i < len(headers) {

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -32,6 +33,9 @@ type Account struct {
 	QuotaTotal        int             `json:"quota_total"`
 	QuotaRemaining    int             `json:"quota_remaining"`
 	QuotaResetAt      *time.Time      `json:"quota_reset_at,omitempty"`
+	Plan              string          `json:"plan,omitempty"`            // e.g. "Kiro Pro", "Kiro Free"
+	AuthMethod        string          `json:"auth_method,omitempty"`     // "imported" | "builder-id" | "idc" | "google" | "github"
+	QuotaBreakdown    json.RawMessage `json:"quota_breakdown,omitempty"` // map[resourceType]{used,total,reset_at} JSON
 	ConsecutiveErrors int             `json:"consecutive_errors"`
 	LastError         string          `json:"last_error,omitempty"`
 	CooldownUntil     *time.Time      `json:"cooldown_until,omitempty"`
@@ -40,6 +44,10 @@ type Account struct {
 	Metadata          json.RawMessage `json:"metadata,omitempty"`
 	CreatedAt         time.Time       `json:"created_at"`
 	UpdatedAt         time.Time       `json:"updated_at"`
+
+	// Derived fields populated when listing accounts. Not persisted.
+	TokenExpiresAt string `json:"token_expires_at,omitempty"` // RFC3339 timestamp from credentials.expires_at
+	HasCredentials bool   `json:"has_credentials"`            // true when credentials contain a usable token
 }
 
 // AGCredentials for Antigravity accounts
@@ -65,27 +73,27 @@ type KiroCredentials struct {
 
 // Combo represents a named model group with fallback/round-robin
 type Combo struct {
-	ID         string   `json:"id"`
-	Name       string   `json:"name"`
-	Models     []string `json:"models"`
-	Strategy   string   `json:"strategy"`    // "fallback" | "round-robin"
-	StickyLimit int     `json:"sticky_limit"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	ID          string    `json:"id"`
+	Name        string    `json:"name"`
+	Models      []string  `json:"models"`
+	Strategy    string    `json:"strategy"` // "fallback" | "round-robin"
+	StickyLimit int       `json:"sticky_limit"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 // APIKey represents a consumer API key
 type APIKey struct {
-	ID        string    `json:"id"`
-	KeyHash   string    `json:"key_hash"`
-	KeyPrefix string    `json:"key_prefix"`
-	Name      string    `json:"name"`
-	IsActive  bool      `json:"is_active"`
-	RateLimitRPM int    `json:"rate_limit_rpm"`
-	RateLimitRPD int    `json:"rate_limit_rpd"`
-	TotalRequests int64 `json:"total_requests"`
-	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
-	CreatedAt  time.Time  `json:"created_at"`
+	ID            string     `json:"id"`
+	KeyHash       string     `json:"key_hash"`
+	KeyPrefix     string     `json:"key_prefix"`
+	Name          string     `json:"name"`
+	IsActive      bool       `json:"is_active"`
+	RateLimitRPM  int        `json:"rate_limit_rpm"`
+	RateLimitRPD  int        `json:"rate_limit_rpd"`
+	TotalRequests int64      `json:"total_requests"`
+	LastUsedAt    *time.Time `json:"last_used_at,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
 }
 
 // UsageLog represents a single request log
@@ -247,9 +255,24 @@ func (d *Database) migrate() error {
 		"ALTER TABLE accounts ADD COLUMN priority INTEGER DEFAULT 0",
 		"ALTER TABLE accounts ADD COLUMN consecutive_use_count INTEGER DEFAULT 0",
 		"ALTER TABLE accounts ADD COLUMN model_locks TEXT DEFAULT '{}'",
+		"ALTER TABLE accounts ADD COLUMN plan TEXT DEFAULT ''",
+		"ALTER TABLE accounts ADD COLUMN auth_method TEXT DEFAULT ''",
+		"ALTER TABLE accounts ADD COLUMN quota_breakdown TEXT DEFAULT '{}'",
 	}
 	for _, stmt := range alterStatements {
 		d.db.Exec(stmt) // Ignore errors (column already exists)
+	}
+
+	// Heal accounts written by older builds: empty/NULL credentials and
+	// metadata break json_extract() and Supabase NOT NULL pushes. Replace
+	// them with valid empty objects.
+	repairStatements := []string{
+		"UPDATE accounts SET credentials = '{}' WHERE credentials IS NULL OR credentials = '' OR json_valid(credentials) = 0",
+		"UPDATE accounts SET metadata = '{}' WHERE metadata IS NULL OR metadata = '' OR json_valid(metadata) = 0",
+		"UPDATE accounts SET quota_breakdown = '{}' WHERE quota_breakdown IS NULL OR quota_breakdown = '' OR json_valid(quota_breakdown) = 0",
+	}
+	for _, stmt := range repairStatements {
+		d.db.Exec(stmt) // best-effort, log nothing
 	}
 
 	return nil
@@ -264,21 +287,41 @@ func (d *Database) UpsertAccount(a *Account) error {
 		a.ID = uuid.New().String()
 	}
 
+	// Normalize JSON columns: SQLite + JSONB downstream both expect a real
+	// JSON object string, never empty string. An empty Credentials/Metadata
+	// would make json_extract() and Supabase NOT NULL fail later.
+	credsStr := strings.TrimSpace(string(a.Credentials))
+	if credsStr == "" {
+		credsStr = "{}"
+	}
+	metaStr := strings.TrimSpace(string(a.Metadata))
+	if metaStr == "" {
+		metaStr = "{}"
+	}
+	breakdown := strings.TrimSpace(string(a.QuotaBreakdown))
+	if breakdown == "" {
+		breakdown = "{}"
+	}
+
 	_, err := d.db.Exec(`
 		INSERT INTO accounts (id, provider, email, status, credentials, quota_total, quota_remaining, 
-			quota_reset_at, consecutive_errors, last_error, cooldown_until, last_used_at, last_login_at, metadata, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			quota_reset_at, plan, auth_method, quota_breakdown,
+			consecutive_errors, last_error, cooldown_until, last_used_at, last_login_at, metadata, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(provider, email) DO UPDATE SET
 			status=excluded.status, credentials=excluded.credentials, 
 			quota_total=excluded.quota_total, quota_remaining=excluded.quota_remaining,
-			quota_reset_at=excluded.quota_reset_at, consecutive_errors=excluded.consecutive_errors,
+			quota_reset_at=excluded.quota_reset_at,
+			plan=excluded.plan, auth_method=excluded.auth_method, quota_breakdown=excluded.quota_breakdown,
+			consecutive_errors=excluded.consecutive_errors,
 			last_error=excluded.last_error, cooldown_until=excluded.cooldown_until,
 			last_used_at=excluded.last_used_at, last_login_at=excluded.last_login_at,
 			metadata=excluded.metadata, updated_at=excluded.updated_at`,
-		a.ID, a.Provider, a.Email, a.Status, string(a.Credentials),
+		a.ID, a.Provider, a.Email, a.Status, credsStr,
 		a.QuotaTotal, a.QuotaRemaining, timePtr(a.QuotaResetAt),
+		a.Plan, a.AuthMethod, breakdown,
 		a.ConsecutiveErrors, a.LastError, timePtr(a.CooldownUntil),
-		timePtr(a.LastUsedAt), timePtr(a.LastLoginAt), string(a.Metadata),
+		timePtr(a.LastUsedAt), timePtr(a.LastLoginAt), metaStr,
 		now, now,
 	)
 	return err
@@ -289,10 +332,14 @@ func (d *Database) ListAccounts(provider string) ([]Account, error) {
 	var rows *sql.Rows
 	var err error
 
+	const baseSelect = `SELECT id, provider, email, status, credentials, quota_total, quota_remaining,
+		quota_reset_at, plan, auth_method, quota_breakdown,
+		consecutive_errors, last_error, created_at, updated_at FROM accounts`
+
 	if provider == "" {
-		rows, err = d.db.Query("SELECT id, provider, email, status, credentials, quota_total, quota_remaining, consecutive_errors, last_error, created_at, updated_at FROM accounts ORDER BY provider, email")
+		rows, err = d.db.Query(baseSelect + " ORDER BY provider, email")
 	} else {
-		rows, err = d.db.Query("SELECT id, provider, email, status, credentials, quota_total, quota_remaining, consecutive_errors, last_error, created_at, updated_at FROM accounts WHERE provider = ? ORDER BY email", provider)
+		rows, err = d.db.Query(baseSelect+" WHERE provider = ? ORDER BY email", provider)
 	}
 	if err != nil {
 		return nil, err
@@ -302,19 +349,56 @@ func (d *Database) ListAccounts(provider string) ([]Account, error) {
 	var accounts []Account
 	for rows.Next() {
 		var a Account
-		var creds, createdAt, updatedAt string
-		var lastErr sql.NullString
+		var creds, lastErr, plan, authMethod, breakdown, quotaResetAt sql.NullString
+		var createdAt, updatedAt sql.NullString
 		err := rows.Scan(&a.ID, &a.Provider, &a.Email, &a.Status, &creds,
-			&a.QuotaTotal, &a.QuotaRemaining, &a.ConsecutiveErrors, &lastErr, &createdAt, &updatedAt)
+			&a.QuotaTotal, &a.QuotaRemaining,
+			&quotaResetAt, &plan, &authMethod, &breakdown,
+			&a.ConsecutiveErrors, &lastErr, &createdAt, &updatedAt)
 		if err != nil {
 			return nil, err
 		}
-		a.Credentials = json.RawMessage(creds)
+		if creds.Valid && creds.String != "" {
+			a.Credentials = json.RawMessage(creds.String)
+		} else {
+			a.Credentials = json.RawMessage("{}")
+		}
+		// Derive token metadata from credentials JSON so the dashboard can
+		// surface expiry + a "no credentials, please re-import" hint
+		// without leaking the raw token.
+		var credsMap map[string]interface{}
+		if jErr := json.Unmarshal(a.Credentials, &credsMap); jErr == nil {
+			if exp, ok := credsMap["expires_at"].(string); ok && exp != "" {
+				a.TokenExpiresAt = exp
+			}
+			access, _ := credsMap["access_token"].(string)
+			refresh, _ := credsMap["refresh_token"].(string)
+			a.HasCredentials = strings.TrimSpace(access) != "" || strings.TrimSpace(refresh) != ""
+		}
 		if lastErr.Valid {
 			a.LastError = lastErr.String
 		}
-		a.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
-		a.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+		if plan.Valid {
+			a.Plan = plan.String
+		}
+		if authMethod.Valid {
+			a.AuthMethod = authMethod.String
+		}
+		if breakdown.Valid && breakdown.String != "" {
+			a.QuotaBreakdown = json.RawMessage(breakdown.String)
+		}
+		if quotaResetAt.Valid && quotaResetAt.String != "" {
+			t, errParse := time.Parse(time.RFC3339Nano, quotaResetAt.String)
+			if errParse == nil {
+				a.QuotaResetAt = &t
+			}
+		}
+		if createdAt.Valid {
+			a.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt.String)
+		}
+		if updatedAt.Valid {
+			a.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt.String)
+		}
 		accounts = append(accounts, a)
 	}
 	return accounts, nil
@@ -338,7 +422,7 @@ func (d *Database) GetActiveAccounts(provider string) ([]Account, error) {
 	var accounts []Account
 	for rows.Next() {
 		var a Account
-		var creds string
+		var creds sql.NullString
 		var lastUsed, cooldown, createdAt, updatedAt sql.NullString
 		err := rows.Scan(&a.ID, &a.Provider, &a.Email, &a.Status, &creds,
 			&a.QuotaTotal, &a.QuotaRemaining, &a.ConsecutiveErrors,
@@ -346,7 +430,11 @@ func (d *Database) GetActiveAccounts(provider string) ([]Account, error) {
 		if err != nil {
 			return nil, err
 		}
-		a.Credentials = json.RawMessage(creds)
+		if creds.Valid && creds.String != "" {
+			a.Credentials = json.RawMessage(creds.String)
+		} else {
+			a.Credentials = json.RawMessage("{}")
+		}
 		if lastUsed.Valid {
 			t, _ := time.Parse(time.RFC3339Nano, lastUsed.String)
 			a.LastUsedAt = &t
@@ -406,13 +494,18 @@ func (d *Database) UpdateAccountCredentials(id string, creds json.RawMessage) er
 
 // GetAccountsNeedingRefresh returns accounts with tokens expiring soon
 func (d *Database) GetAccountsNeedingRefresh(provider string, withinMinutes int) ([]Account, error) {
-	// We check credentials JSON for expires_at field
+	// We check credentials JSON for expires_at field. Guard with json_valid()
+	// so a single malformed row doesn't poison the whole query.
 	threshold := time.Now().UTC().Add(time.Duration(withinMinutes) * time.Minute).Format(time.RFC3339Nano)
 
 	rows, err := d.db.Query(`
 		SELECT id, provider, email, status, credentials, created_at, updated_at
 		FROM accounts 
 		WHERE provider = ? AND status = 'active'
+			AND credentials IS NOT NULL
+			AND credentials != ''
+			AND json_valid(credentials) = 1
+			AND json_extract(credentials, '$.expires_at') IS NOT NULL
 			AND json_extract(credentials, '$.expires_at') < ?
 		ORDER BY json_extract(credentials, '$.expires_at') ASC`,
 		provider, threshold)
@@ -424,13 +517,18 @@ func (d *Database) GetAccountsNeedingRefresh(provider string, withinMinutes int)
 	var accounts []Account
 	for rows.Next() {
 		var a Account
-		var creds, createdAt, updatedAt string
+		var creds sql.NullString
+		var createdAt, updatedAt sql.NullString
 		err := rows.Scan(&a.ID, &a.Provider, &a.Email, &a.Status, &creds, &createdAt, &updatedAt)
 		if err != nil {
 			return nil, err
 		}
-		a.Credentials = json.RawMessage(creds)
-		a.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+		if creds.Valid {
+			a.Credentials = json.RawMessage(creds.String)
+		}
+		if createdAt.Valid {
+			a.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt.String)
+		}
 		accounts = append(accounts, a)
 	}
 	return accounts, nil
@@ -452,14 +550,14 @@ func (d *Database) CreateAPIKey(name string) (*APIKey, string, error) {
 	keyHash := hex.EncodeToString(hash[:])
 
 	key := &APIKey{
-		ID:        uuid.New().String(),
-		KeyHash:   keyHash,
-		KeyPrefix: rawKey[:16],
-		Name:      name,
-		IsActive:  true,
+		ID:           uuid.New().String(),
+		KeyHash:      keyHash,
+		KeyPrefix:    rawKey[:16],
+		Name:         name,
+		IsActive:     true,
 		RateLimitRPM: 60,
 		RateLimitRPD: 1000,
-		CreatedAt: time.Now().UTC(),
+		CreatedAt:    time.Now().UTC(),
 	}
 
 	_, err := d.db.Exec(`

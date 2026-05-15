@@ -3,8 +3,10 @@ package proxy
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -86,6 +88,9 @@ func (s *Server) handleImportAG(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, fmt.Sprintf("Failed to save: %v", err))
 		return
 	}
+	if s.syncer != nil {
+		s.syncer.PushAccountAsync(account)
+	}
 
 	writeJSON(w, 201, map[string]interface{}{
 		"success":    true,
@@ -94,10 +99,14 @@ func (s *Server) handleImportAG(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleImportKiro imports a Kiro account from a refresh token
+// handleImportKiro imports a Kiro account from a refresh token. When
+// account_id is provided the existing account row is updated in place — this
+// is what the dashboard "Re-import" button uses so corrupted accounts (e.g.
+// pulled from sync without credentials) are healed instead of duplicated.
 func (s *Server) handleImportKiro(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		RefreshToken string `json:"refresh_token"`
+		AccountID    string `json:"account_id,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, 400, "invalid JSON")
@@ -132,7 +141,29 @@ func (s *Server) handleImportKiro(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Extract email from JWT (access token)
-	email := extractEmailFromJWT(newCreds.AccessToken)
+	jwtEmail := extractEmailFromJWT(newCreds.AccessToken)
+
+	// Resolve target account: explicit account_id wins over email-based
+	// upsert so the user can deliberately heal a specific row.
+	var targetAccount *db.Account
+	if req.AccountID != "" {
+		existing, lookupErr := s.findAccountByID(req.AccountID)
+		if lookupErr == nil && existing != nil && existing.Provider == "kiro" {
+			targetAccount = existing
+		}
+	}
+
+	email := jwtEmail
+	if targetAccount != nil {
+		// Preserve the original email so dashboards/aliases keep working.
+		// If the row had a placeholder ("kiro-…@imported") and the JWT
+		// gave us a real address, prefer the real one.
+		if strings.HasSuffix(targetAccount.Email, "@imported") && jwtEmail != "" {
+			email = jwtEmail
+		} else {
+			email = targetAccount.Email
+		}
+	}
 	if email == "" {
 		email = "kiro-" + uuid.New().String()[:8] + "@imported"
 	}
@@ -147,26 +178,57 @@ func (s *Server) handleImportKiro(w http.ResponseWriter, r *http.Request) {
 	}
 	finalCredsJSON, _ := json.Marshal(finalCreds)
 
-	// Fetch quota from Kiro API
-	used, total, _ := kiro.FetchQuota(newCreds.AccessToken, newCreds.ProfileARN)
+	// Fetch quota from Kiro API. The default profile ARN is used internally
+	// when newCreds.ProfileARN is empty (matches 9router behaviour).
+	var quotaTotal, quotaRemaining int
+	var quotaResetAt, plan string
+	var breakdownJSON json.RawMessage
+	if qr, qErr := kiro.FetchQuota(newCreds.AccessToken, newCreds.ProfileARN); qErr == nil && qr != nil {
+		quotaTotal = qr.Total
+		quotaRemaining = qr.Total - qr.Used
+		quotaResetAt = qr.ResetAt
+		plan = qr.Plan
+		if len(qr.Breakdown) > 0 {
+			if b, mErr := json.Marshal(qr.Breakdown); mErr == nil {
+				breakdownJSON = b
+			}
+		}
+	}
 
 	account := &db.Account{
 		Provider:       "kiro",
 		Email:          email,
 		Status:         "active",
 		Credentials:    finalCredsJSON,
-		QuotaTotal:     total,
-		QuotaRemaining: total - used,
+		QuotaTotal:     quotaTotal,
+		QuotaRemaining: quotaRemaining,
+		Plan:           plan,
+		AuthMethod:     "imported",
+		QuotaBreakdown: breakdownJSON,
+	}
+	if quotaResetAt != "" {
+		t, _ := time.Parse(time.RFC3339, quotaResetAt)
+		account.QuotaResetAt = &t
+	}
+	if targetAccount != nil {
+		// Reuse the existing primary key so SSE feeds, usage logs, and
+		// model locks linked to this row stay valid.
+		account.ID = targetAccount.ID
 	}
 
 	if err := s.db.UpsertAccount(account); err != nil {
 		writeError(w, 500, fmt.Sprintf("Failed to save: %v", err))
 		return
 	}
+	if s.syncer != nil {
+		s.syncer.PushAccountAsync(account)
+	}
 
 	writeJSON(w, 201, map[string]interface{}{
-		"success": true,
-		"email":   email,
+		"success":  true,
+		"email":    email,
+		"id":       account.ID,
+		"replaced": targetAccount != nil,
 	})
 }
 
@@ -213,29 +275,87 @@ func (s *Server) handleRefreshQuota(w http.ResponseWriter, r *http.Request) {
 		})
 	} else if account.Provider == "kiro" {
 		var creds db.KiroCredentials
-		json.Unmarshal(account.Credentials, &creds)
-
-		if creds.AccessToken == "" {
-			writeError(w, 400, "no access token")
+		if err := json.Unmarshal(account.Credentials, &creds); err != nil {
+			writeError(w, 500, fmt.Sprintf("parse credentials: %v", err))
 			return
 		}
 
-		used, total, err := kiro.FetchQuota(creds.AccessToken, creds.ProfileARN)
-		if err != nil {
-			writeError(w, 502, fmt.Sprintf("Failed to fetch quota: %v", err))
+		if creds.AccessToken == "" && creds.RefreshToken == "" {
+			writeError(w, 400, "no access or refresh token")
 			return
 		}
 
-		// Update quota in DB
-		account.QuotaTotal = total
-		account.QuotaRemaining = total - used
-		s.db.UpsertAccount(account)
+		// Try once with the current access token. If the upstream rejects
+		// it as expired/forbidden, refresh first and retry once.
+		qr, qErr := kiro.FetchQuota(creds.AccessToken, creds.ProfileARN)
+
+		var quotaErr *kiro.QuotaError
+		if qErr != nil && errors.As(qErr, &quotaErr) && quotaErr.Reason == kiro.QuotaErrorAuthExpired && creds.RefreshToken != "" {
+			// Force a refresh, persist the new creds, retry once.
+			refreshed, rErr := kiro.RefreshToken(account)
+			if rErr != nil {
+				writeError(w, 502, fmt.Sprintf("token refresh failed: %v", rErr))
+				return
+			}
+			newCredsJSON, _ := json.Marshal(refreshed)
+			if err := s.db.UpdateAccountCredentials(account.ID, newCredsJSON); err != nil {
+				log.Printf("[REFRESH-QUOTA] persist refreshed creds: %v", err)
+			}
+			account.Credentials = newCredsJSON
+			// kiro.KiroCredentials and db.KiroCredentials share the
+			// same JSON shape — copy field-by-field to avoid the
+			// type mismatch and keep ProfileARN/Region/etc intact.
+			creds = db.KiroCredentials{
+				AccessToken:  refreshed.AccessToken,
+				RefreshToken: refreshed.RefreshToken,
+				ExpiresAt:    refreshed.ExpiresAt,
+				ClientID:     refreshed.ClientID,
+				ClientSecret: refreshed.ClientSecret,
+				Region:       refreshed.Region,
+				ProfileARN:   refreshed.ProfileARN,
+			}
+			qr, qErr = kiro.FetchQuota(creds.AccessToken, creds.ProfileARN)
+		}
+
+		if qErr != nil {
+			writeError(w, 502, fmt.Sprintf("Failed to fetch quota: %v", qErr))
+			return
+		}
+		if qr == nil {
+			writeError(w, 502, "quota response was empty")
+			return
+		}
+
+		// Persist quota + plan + breakdown to DB so the dashboard
+		// reflects the latest state without another roundtrip.
+		account.QuotaTotal = qr.Total
+		account.QuotaRemaining = qr.Total - qr.Used
+		account.Plan = qr.Plan
+		if qr.ResetAt != "" {
+			if t, parseErr := time.Parse(time.RFC3339, qr.ResetAt); parseErr == nil {
+				account.QuotaResetAt = &t
+			}
+		}
+		if len(qr.Breakdown) > 0 {
+			if b, mErr := json.Marshal(qr.Breakdown); mErr == nil {
+				account.QuotaBreakdown = b
+			}
+		}
+		if err := s.db.UpsertAccount(account); err != nil {
+			log.Printf("[REFRESH-QUOTA] persist account: %v", err)
+		}
+		if s.syncer != nil {
+			s.syncer.PushAccountAsync(account)
+		}
 
 		writeJSON(w, 200, map[string]interface{}{
 			"status":    "refreshed",
-			"used":      used,
-			"total":     total,
-			"remaining": total - used,
+			"used":      qr.Used,
+			"total":     qr.Total,
+			"remaining": qr.Total - qr.Used,
+			"reset_at":  qr.ResetAt,
+			"plan":      qr.Plan,
+			"breakdown": qr.Breakdown,
 		})
 	} else {
 		writeError(w, 400, "quota refresh not supported for this provider")
@@ -312,11 +432,33 @@ func (s *Server) handleSetExcludedModels(w http.ResponseWriter, r *http.Request)
 		writeError(w, 500, err.Error())
 		return
 	}
+	if s.syncer != nil {
+		s.syncer.PushAccountAsync(account)
+	}
 
 	writeJSON(w, 200, map[string]string{"status": "saved"})
 }
 
 // --- Helpers ---
+
+// findAccountByID returns the account matching the given ID, or nil if not
+// found. ListAccounts is used to keep credential decoding consistent (it
+// fills TokenExpiresAt / HasCredentials).
+func (s *Server) findAccountByID(id string) (*db.Account, error) {
+	if id == "" {
+		return nil, fmt.Errorf("missing id")
+	}
+	accounts, err := s.db.ListAccounts("")
+	if err != nil {
+		return nil, err
+	}
+	for i := range accounts {
+		if accounts[i].ID == id {
+			return &accounts[i], nil
+		}
+	}
+	return nil, fmt.Errorf("account not found")
+}
 
 // extractEmailFromJWT extracts email from a JWT access token (best effort)
 func extractEmailFromJWT(token string) string {
@@ -458,7 +600,9 @@ func (s *Server) handleAGExchange(w http.ResponseWriter, r *http.Request) {
 	email := ""
 	userResp, err := http.Get("https://www.googleapis.com/oauth2/v1/userinfo?alt=json&access_token=" + tokens.AccessToken)
 	if err == nil && userResp.StatusCode == 200 {
-		var userInfo struct{ Email string `json:"email"` }
+		var userInfo struct {
+			Email string `json:"email"`
+		}
 		json.NewDecoder(userResp.Body).Decode(&userInfo)
 		userResp.Body.Close()
 		email = userInfo.Email
@@ -495,6 +639,9 @@ func (s *Server) handleAGExchange(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, fmt.Sprintf("Failed to save: %v", err))
 		return
 	}
+	if s.syncer != nil {
+		s.syncer.PushAccountAsync(account)
+	}
 
 	writeJSON(w, 201, map[string]interface{}{
 		"success":    true,
@@ -529,6 +676,139 @@ func (s *Server) handleEditAccount(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, err.Error())
 		return
 	}
+	// Mirror the rename to Supabase. We re-read the account so the row
+	// pushed upstream reflects the new email + updated_at.
+	if s.syncer != nil {
+		if updated, err := s.findAccountByID(id); err == nil && updated != nil {
+			s.syncer.PushAccountAsync(updated)
+		}
+	}
 
 	writeJSON(w, 200, map[string]string{"status": "updated", "email": req.Email})
+}
+
+// handleTestAccount validates an account's credentials by checking token
+// expiry and refreshing if needed. Adopted from 9router pattern
+// (`testOAuthConnection` with `checkExpiry: true, refreshable: true`):
+//
+//  1. If access_token is empty -> invalid
+//  2. If token expired and refresh_token available -> refresh, persist, return valid+refreshed
+//  3. If token still valid -> return valid (provider-specific liveness probes
+//     are intentionally skipped to avoid burning quota on noisy auth APIs)
+//
+// Provider-agnostic: works for both Antigravity and Kiro since both expose
+// the same shape (access_token + refresh_token + expires_at).
+func (s *Server) handleTestAccount(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		writeError(w, 400, "missing id")
+		return
+	}
+
+	account, err := s.findAccountByID(id)
+	if err != nil || account == nil {
+		writeError(w, 404, "account not found")
+		return
+	}
+
+	start := time.Now()
+	result := map[string]interface{}{
+		"valid":      false,
+		"refreshed":  false,
+		"latency_ms": 0,
+		"error":      nil,
+	}
+
+	switch account.Provider {
+	case "antigravity":
+		var creds db.AGCredentials
+		_ = json.Unmarshal(account.Credentials, &creds)
+		if creds.AccessToken == "" && creds.RefreshToken == "" {
+			result["error"] = "No access or refresh token. Please re-import the account."
+			result["latency_ms"] = int(time.Since(start).Milliseconds())
+			writeJSON(w, 200, result)
+			return
+		}
+
+		expired := antigravity.IsTokenExpired(&creds, 5)
+		if expired && creds.RefreshToken != "" {
+			refreshed, rErr := antigravity.RefreshToken(s.cfg, account)
+			if rErr != nil {
+				result["error"] = "Token expired and refresh failed: " + rErr.Error()
+				result["latency_ms"] = int(time.Since(start).Milliseconds())
+				writeJSON(w, 200, result)
+				return
+			}
+			credsJSON, _ := json.Marshal(refreshed)
+			_ = s.db.UpdateAccountCredentials(account.ID, credsJSON)
+			account.Credentials = credsJSON
+			if s.syncer != nil {
+				s.syncer.PushAccountAsync(account)
+			}
+			result["refreshed"] = true
+			result["valid"] = true
+		} else if expired {
+			result["error"] = "Token expired (no refresh token)"
+		} else {
+			result["valid"] = true
+		}
+
+	case "kiro":
+		var creds db.KiroCredentials
+		_ = json.Unmarshal(account.Credentials, &creds)
+		if creds.AccessToken == "" && creds.RefreshToken == "" {
+			result["error"] = "No access or refresh token. Please re-import the account."
+			result["latency_ms"] = int(time.Since(start).Milliseconds())
+			writeJSON(w, 200, result)
+			return
+		}
+
+		// kiro.IsTokenExpired expects *kiro.KiroCredentials, but the DB
+		// version has the same JSON shape — copy what we need.
+		kCreds := &kiro.KiroCredentials{
+			AccessToken:  creds.AccessToken,
+			RefreshToken: creds.RefreshToken,
+			ExpiresAt:    creds.ExpiresAt,
+			ProfileARN:   creds.ProfileARN,
+			Region:       creds.Region,
+		}
+		expired := kiro.IsTokenExpired(kCreds, 5)
+
+		if expired && creds.RefreshToken != "" {
+			refreshed, rErr := kiro.RefreshToken(account)
+			if rErr != nil {
+				result["error"] = "Token expired and refresh failed: " + rErr.Error()
+				result["latency_ms"] = int(time.Since(start).Milliseconds())
+				writeJSON(w, 200, result)
+				return
+			}
+			persisted := db.KiroCredentials{
+				AccessToken:  refreshed.AccessToken,
+				RefreshToken: refreshed.RefreshToken,
+				ExpiresAt:    refreshed.ExpiresAt,
+				ClientID:     refreshed.ClientID,
+				ClientSecret: refreshed.ClientSecret,
+				Region:       refreshed.Region,
+				ProfileARN:   refreshed.ProfileARN,
+			}
+			credsJSON, _ := json.Marshal(persisted)
+			_ = s.db.UpdateAccountCredentials(account.ID, credsJSON)
+			account.Credentials = credsJSON
+			if s.syncer != nil {
+				s.syncer.PushAccountAsync(account)
+			}
+			result["refreshed"] = true
+			result["valid"] = true
+		} else if expired {
+			result["error"] = "Token expired (no refresh token)"
+		} else {
+			result["valid"] = true
+		}
+
+	default:
+		result["error"] = "Provider test not supported: " + account.Provider
+	}
+
+	result["latency_ms"] = int(time.Since(start).Milliseconds())
+	writeJSON(w, 200, result)
 }

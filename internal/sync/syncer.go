@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
+	gosync "sync"
 	"time"
 
 	"github.com/liam-auto/liam/internal/db"
@@ -15,14 +17,25 @@ type Syncer struct {
 	database *db.Database
 	lastSync time.Time
 	enabled  bool
+
+	// tombstones records accounts the user just deleted locally so the
+	// next pull doesn't resurrect them while the remote DELETE is still
+	// propagating (or while the sync worker pulls before pushing). The
+	// map key is the account ID and the value is the wallclock time the
+	// tombstone was created. Entries older than tombstoneTTL are GC'd.
+	tombMu     gosync.Mutex
+	tombstones map[string]time.Time
 }
+
+const tombstoneTTL = 10 * time.Minute
 
 // NewSyncer creates a new syncer
 func NewSyncer(client *Client, database *db.Database) *Syncer {
 	return &Syncer{
-		client:   client,
-		database: database,
-		enabled:  client.IsConfigured(),
+		client:     client,
+		database:   database,
+		enabled:    client.IsConfigured(),
+		tombstones: make(map[string]time.Time),
 	}
 }
 
@@ -105,6 +118,13 @@ func (s *Syncer) PullAccounts() error {
 		remoteUpdated := parseTime(row["updated_at"])
 		id, _ := row["id"].(string)
 		if id == "" {
+			continue
+		}
+
+		// Skip rows that the user just deleted locally — without this
+		// the next pull would resurrect the account before the remote
+		// DELETE has had a chance to propagate.
+		if s.isTombstoned(id) {
 			continue
 		}
 
@@ -219,6 +239,19 @@ func (s *Syncer) PullCustomModels() error {
 
 // --- Push (Local → Remote) ---
 
+// safeUnmarshalJSON parses raw JSON bytes into a map. If the input is empty
+// or invalid, it returns an empty map so Supabase NOT NULL columns never get
+// a null value pushed.
+func safeUnmarshalJSON(raw json.RawMessage) map[string]interface{} {
+	out := map[string]interface{}{}
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return out
+	}
+	_ = json.Unmarshal([]byte(trimmed), &out)
+	return out
+}
+
 // PushAccounts pushes local accounts to Supabase
 func (s *Syncer) PushAccounts() error {
 	accounts, err := s.database.ListAccounts("")
@@ -232,10 +265,8 @@ func (s *Syncer) PushAccounts() error {
 
 	rows := make([]map[string]interface{}, 0, len(accounts))
 	for _, a := range accounts {
-		var creds interface{}
-		json.Unmarshal(a.Credentials, &creds)
-		var meta interface{}
-		json.Unmarshal(a.Metadata, &meta)
+		creds := safeUnmarshalJSON(a.Credentials)
+		meta := safeUnmarshalJSON(a.Metadata)
 
 		rows = append(rows, map[string]interface{}{
 			"id":                 a.ID,
@@ -298,10 +329,8 @@ func (s *Syncer) PushAccount(account *db.Account) {
 		return
 	}
 
-	var creds interface{}
-	json.Unmarshal(account.Credentials, &creds)
-	var meta interface{}
-	json.Unmarshal(account.Metadata, &meta)
+	creds := safeUnmarshalJSON(account.Credentials)
+	meta := safeUnmarshalJSON(account.Metadata)
 
 	row := map[string]interface{}{
 		"id":                 account.ID,
@@ -322,14 +351,145 @@ func (s *Syncer) PushAccount(account *db.Account) {
 	}
 }
 
+// PushCustomModel pushes a single custom model row upstream. Mirrors the
+// behaviour of PushAccount: best-effort, fire-and-forget so handlers stay
+// fast and a Supabase outage doesn't block dashboard interactions.
+func (s *Syncer) PushCustomModel(id, providerAlias, modelID, displayName, modelType string, isEnabled bool, metadata map[string]interface{}) {
+	if !s.enabled || strings.TrimSpace(id) == "" {
+		return
+	}
+	if modelType == "" {
+		modelType = "llm"
+	}
+	if metadata == nil {
+		metadata = map[string]interface{}{}
+	}
+	row := map[string]interface{}{
+		"id":             id,
+		"provider_alias": providerAlias,
+		"model_id":       modelID,
+		"display_name":   displayName,
+		"type":           modelType,
+		"is_custom":      true,
+		"is_enabled":     isEnabled,
+		"metadata":       metadata,
+		"created_at":     time.Now().UTC().Format(time.RFC3339),
+	}
+	if err := s.client.UpsertOne("model_registry", row); err != nil {
+		log.Printf("[SYNC] Push custom model %s error: %v", id, err)
+	}
+}
+
+// PushCustomModelAsync wraps PushCustomModel in a goroutine so HTTP handlers
+// can return immediately.
+func (s *Syncer) PushCustomModelAsync(id, providerAlias, modelID, displayName, modelType string, isEnabled bool, metadata map[string]interface{}) {
+	if !s.enabled {
+		return
+	}
+	go s.PushCustomModel(id, providerAlias, modelID, displayName, modelType, isEnabled, metadata)
+}
+
+// DeleteCustomModel removes a custom model row from Supabase by id.
+func (s *Syncer) DeleteCustomModel(id string) {
+	id = strings.TrimSpace(id)
+	if id == "" || !s.enabled {
+		return
+	}
+	if err := s.client.Delete("model_registry", "id=eq."+id); err != nil {
+		log.Printf("[SYNC] Delete custom model %s error: %v", id, err)
+	}
+}
+
+// DeleteCustomModelAsync mirrors DeleteCustomModel for goroutine fire-and-forget.
+func (s *Syncer) DeleteCustomModelAsync(id string) {
+	if strings.TrimSpace(id) == "" || !s.enabled {
+		return
+	}
+	go s.DeleteCustomModel(id)
+}
+
+// DeleteAccount removes an account from Supabase and records a tombstone so
+// the next pull doesn't resurrect it. Safe to call even when sync is
+// disabled — it then just records the tombstone for an eventual reconnect.
+func (s *Syncer) DeleteAccount(id string) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return
+	}
+	s.markTombstone(id)
+	if !s.enabled {
+		return
+	}
+	// PostgREST filter syntax: ?id=eq.<uuid>
+	if err := s.client.Delete("accounts", "id=eq."+id); err != nil {
+		log.Printf("[SYNC] Delete account %s error: %v", id, err)
+	}
+}
+
+// PushAccountAsync runs PushAccount in a goroutine so HTTP handlers can
+// return immediately without blocking the response on a Supabase round trip.
+func (s *Syncer) PushAccountAsync(account *db.Account) {
+	if !s.enabled || account == nil {
+		return
+	}
+	go s.PushAccount(account)
+}
+
+// DeleteAccountAsync mirrors PushAccountAsync for deletes.
+func (s *Syncer) DeleteAccountAsync(id string) {
+	if strings.TrimSpace(id) == "" {
+		return
+	}
+	go s.DeleteAccount(id)
+}
+
+// --- Tombstone helpers ---
+
+func (s *Syncer) markTombstone(id string) {
+	s.tombMu.Lock()
+	defer s.tombMu.Unlock()
+	if s.tombstones == nil {
+		s.tombstones = make(map[string]time.Time)
+	}
+	s.tombstones[id] = time.Now().Add(tombstoneTTL)
+	s.gcTombstonesLocked()
+}
+
+func (s *Syncer) isTombstoned(id string) bool {
+	s.tombMu.Lock()
+	defer s.tombMu.Unlock()
+	if s.tombstones == nil {
+		return false
+	}
+	exp, ok := s.tombstones[id]
+	if !ok {
+		return false
+	}
+	if time.Now().After(exp) {
+		delete(s.tombstones, id)
+		return false
+	}
+	return true
+}
+
+// gcTombstonesLocked drops expired entries. The caller must hold tombMu.
+func (s *Syncer) gcTombstonesLocked() {
+	now := time.Now()
+	for id, exp := range s.tombstones {
+		if now.After(exp) {
+			delete(s.tombstones, id)
+		}
+	}
+}
+
 // --- Status ---
 
 // Status returns current sync status for dashboard
 func (s *Syncer) Status() map[string]interface{} {
 	status := map[string]interface{}{
-		"enabled":     s.enabled,
-		"connected":   false,
-		"last_sync":   "",
+		"enabled":      s.enabled,
+		"connected":    false,
+		"last_sync":    "",
 		"supabase_url": "",
 	}
 

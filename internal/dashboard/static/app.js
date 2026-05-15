@@ -93,12 +93,27 @@ function app() {
     addAccountLoading: false,
     addAccountMsg: '',
     addAccountOk: null,
+    addAccountReplaceId: '', // when set, /import endpoint updates that row in place
 
     // Edit Account
     showEditAccountModal: false,
     editAccountId: '',
     editAccountEmail: '',
     editAccountMsg: '',
+
+    // Account auto-refresh — persisted in localStorage. Default ON: a fresh
+    // user opening the dashboard expects quotas to update automatically. The
+    // actual interval/countdown only starts after the first toggleAccountAutoRefresh()
+    // is invoked from init() (so the timer respects the saved value).
+    accountAutoRefresh: true,
+    accountRefreshInterval: null,
+    accountRefreshCountdown: 60,
+    accountCountdownInterval: null,
+
+    // Account test state (per-id)
+    testingAccountId: null,
+    accountTestResults: {}, // { [id]: { valid, error, latency_ms, refreshed, ts } }
+
     savedPresets: [],
 
     // Model Select Modal
@@ -116,6 +131,10 @@ function app() {
     // Usage detail
     expandedUsageId: null,
     expandedUsageData: null,
+    usageDetailOpen: false,
+    usageSections: { request: true, response: true },
+    usagePage: 0,
+    usagePageSize: 10,
 
     // Harvest
     harvest: { provider: 'ag', concurrency: '4', headless: 'false', accounts: '' },
@@ -167,11 +186,99 @@ function app() {
       this.endpoint = 'http://localhost:' + location.port + '/v1/chat/completions';
       this.token = localStorage.getItem('liam_token') || '';
       this.sidebarCollapsed = localStorage.getItem('liam_sidebar_collapsed') === '1';
+      // Restore auto-refresh preference. Default ON when nothing is stored
+      // so a fresh dashboard refreshes quotas automatically.
+      const storedAR = localStorage.getItem('liam_account_auto_refresh');
+      this.accountAutoRefresh = storedAR === null ? true : storedAR === '1';
       this.loadPresets();
+      // Bind URL hash routing so refreshing the browser keeps the user on
+      // the same page/sub-page. Format: #/<page> or #/<page>/<detail>.
+      // We restore the state from the hash now (in case the URL already
+      // points at e.g. #/providers/kiro) and listen for hashchange so the
+      // browser back/forward buttons keep state in sync.
+      this.applyHashRoute();
+      window.addEventListener('hashchange', () => this.applyHashRoute());
       if (this.token) {
         this.verifyToken();
       } else {
         this.authChecked = true;
+      }
+    },
+
+    // ---- URL hash routing helpers ----
+    // The Alpine state is the source of truth at runtime; the hash mirrors
+    // it so a hard refresh restores the same view. We avoid a real router
+    // because the dashboard is a single static HTML file served by Go.
+    parseHash() {
+      const raw = (window.location.hash || '').replace(/^#\/?/, '');
+      if (!raw) return { page: 'overview' };
+      const parts = raw.split('/').filter(Boolean);
+      const page = parts[0] || 'overview';
+      const detail = parts[1] ? decodeURIComponent(parts[1]) : '';
+      return { page, detail };
+    },
+    applyHashRoute() {
+      const { page, detail } = this.parseHash();
+      const validPages = (this.navItems || []).map(n => n.id);
+      if (!validPages.includes(page)) {
+        // Unknown page: silently fall back to overview without polluting history.
+        if (this.page !== 'overview') this.page = 'overview';
+        return;
+      }
+      const pageChanged = this.page !== page;
+      this.page = page;
+
+      // Sub-page detail. We only auto-open known providers/integrations
+      // because openProvider/openIntegrationDetail rely on data that is
+      // only populated after loadAll(); when the user lands directly on
+      // a deep link before loadAll, openSubpage() is called again from
+      // loadAll's continuation in startSSE-friendly path.
+      this._pendingSubpage = detail || '';
+
+      if (pageChanged) {
+        this.providerDetail = null;
+        this.integrationDetail = null;
+        this.expandedUsageId = null;
+        this.usageDetailOpen = false;
+      }
+
+      this.$nextTick(() => {
+        if (this.page === 'overview') this.renderChart();
+        if (this.page === 'usage') this.renderUsageChart();
+        if (this.page === 'integrations') this.fetchIntegrations();
+        this.openSubpageFromHash();
+      });
+    },
+    openSubpageFromHash() {
+      const target = this._pendingSubpage;
+      if (!target) return;
+      if (this.page === 'providers') {
+        // Wait until accounts list is populated (loadAll() finishes).
+        if (!this.accounts || !this.accounts.length) return;
+        if (this.providerDetail !== target) this.openProvider(target);
+        this._pendingSubpage = '';
+      } else if (this.page === 'integrations') {
+        if (!this.integrations || !this.integrations.length) return;
+        if (this.integrationDetail !== target) this.openIntegration(target);
+        this._pendingSubpage = '';
+      }
+    },
+    setHash(page, detail) {
+      const next = detail ? `#/${page}/${encodeURIComponent(detail)}` : `#/${page}`;
+      if (window.location.hash !== next) {
+        // Use replaceState when only the detail changed within the same page
+        // so browser history isn't cluttered with every provider switch.
+        history.replaceState(null, '', next);
+      }
+    },
+    navigateTo(page) {
+      const next = `#/${page}`;
+      if (window.location.hash !== next) {
+        history.pushState(null, '', next);
+        this.applyHashRoute();
+      } else {
+        // Same page click — still trigger onPageChange side effects.
+        this.onPageChange();
       }
     },
 
@@ -243,6 +350,14 @@ function app() {
       this.startSSE();
       this.startHarvestPoll();
       this.$nextTick(() => this.renderChart());
+      // Initial data is now in memory — re-run the deep link handler so
+      // refreshing on #/providers/kiro lands on that detail page.
+      if (this._pendingSubpage) {
+        if (this.page === 'integrations') {
+          await this.fetchIntegrations();
+        }
+        this.$nextTick(() => this.openSubpageFromHash());
+      }
     },
     onPageChange() {
       this.providerDetail = null;
@@ -389,13 +504,17 @@ function app() {
     },
 
     // Add Account
-    async openAddAccount() {
+    async openAddAccount(replaceAccountId) {
       this.showAddAccountModal = true;
       this.addAccountTab = 'oauth';
       this.addAccountForm = { refresh_token: '', email: '', callback_url: '' };
       this.addAccountOAuthURL = '';
       this.addAccountMsg = '';
       this.addAccountLoading = false;
+      // When triggered by the "Re-import" banner, pass the existing
+      // account ID so the backend updates that row in place instead
+      // of creating a duplicate keyed on a different email.
+      this.addAccountReplaceId = (typeof replaceAccountId === 'string' && replaceAccountId) ? replaceAccountId : '';
 
       // If AG provider, fetch OAuth URL
       if (this.providerDetail === 'antigravity') {
@@ -411,7 +530,11 @@ function app() {
         this.addAccountTab = 'token';
       }
     },
-    closeAddAccount() { this.showAddAccountModal = false; this.addAccountMsg = ''; },
+    closeAddAccount() {
+      this.showAddAccountModal = false;
+      this.addAccountMsg = '';
+      this.addAccountReplaceId = '';
+    },
 
     async submitAddAccountOAuth() {
       if (!this.addAccountForm.callback_url) { this.addAccountMsg = 'Paste the callback URL'; this.addAccountOk = false; return; }
@@ -450,6 +573,13 @@ function app() {
         ? { refresh_token: this.addAccountForm.refresh_token }
         : { refresh_token: this.addAccountForm.refresh_token, email: this.addAccountForm.email || '' };
 
+      // When this modal was opened via the "Re-import" banner, hand the
+      // existing account's ID to the backend so it updates that row in
+      // place instead of inserting a duplicate.
+      if (this.addAccountReplaceId) {
+        body.account_id = this.addAccountReplaceId;
+      }
+
       try {
         const r = await fetch(endpoint, {
           method: 'POST',
@@ -458,7 +588,7 @@ function app() {
         });
         const d = await r.json();
         if (r.ok && d.success) {
-          this.addAccountMsg = 'Account added: ' + d.email;
+          this.addAccountMsg = (d.replaced ? 'Account re-imported: ' : 'Account added: ') + d.email;
           this.addAccountOk = true;
           await this.fetchAccounts();
           await this.fetchProviders();
@@ -499,6 +629,108 @@ function app() {
       } catch (e) { this.editAccountMsg = 'Connection error'; }
     },
 
+    // Account actions
+    async refreshAccountQuota(id) {
+      try {
+        await fetch('/api/accounts/' + id + '/refresh-quota', { method: 'POST' });
+        await this.fetchAccounts();
+        if (this.providerDetail) await this.openProvider(this.providerDetail);
+      } catch (e) {}
+    },
+    async refreshAllQuotas() {
+      for (const a of this.providerAccounts) {
+        await this.refreshAccountQuota(a.id);
+      }
+    },
+
+    // Test a single account's credentials. Adopted from 9router pattern:
+    // backend handles expiry-check + refresh + persist; UI just shows status.
+    async testAccount(id) {
+      if (!id || this.testingAccountId === id) return;
+      this.testingAccountId = id;
+      try {
+        const r = await fetch('/api/accounts/' + id + '/test', { method: 'POST' });
+        const d = await r.json();
+        this.accountTestResults = {
+          ...this.accountTestResults,
+          [id]: {
+            valid: !!d.valid,
+            error: d.error || null,
+            latency_ms: d.latency_ms || 0,
+            refreshed: !!d.refreshed,
+            ts: Date.now(),
+          }
+        };
+        // Refresh accounts so token_expires_at / has_credentials reflect any
+        // refresh we just performed server-side.
+        if (d.refreshed) {
+          await this.fetchAccounts();
+          if (this.providerDetail) await this.openProvider(this.providerDetail);
+        }
+      } catch (e) {
+        this.accountTestResults = {
+          ...this.accountTestResults,
+          [id]: { valid: false, error: 'Connection error', latency_ms: 0, refreshed: false, ts: Date.now() }
+        };
+      } finally {
+        this.testingAccountId = null;
+      }
+    },
+
+    accountTestStatusLabel(id) {
+      const r = this.accountTestResults[id];
+      if (!r) return 'Test connection';
+      if (r.valid) {
+        const note = r.refreshed ? ' (refreshed)' : '';
+        return `OK ${r.latency_ms}ms${note}`;
+      }
+      return r.error || 'Test failed';
+    },
+    async deleteAccountById(id) {
+      if (!confirm('Delete this account? This cannot be undone.')) return;
+      try {
+        await fetch('/api/accounts/' + id, { method: 'DELETE' });
+        await this.fetchAccounts();
+        await this.fetchProviders();
+        if (this.providerDetail) await this.openProvider(this.providerDetail);
+      } catch (e) {}
+    },
+    async toggleAccountStatus(account) {
+      const newStatus = account.status === 'active' ? 'disabled' : 'active';
+      try {
+        await fetch('/api/accounts', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ ...account, status: newStatus, credentials: undefined })
+        });
+        await this.fetchAccounts();
+        if (this.providerDetail) await this.openProvider(this.providerDetail);
+      } catch (e) {}
+    },
+
+    // Auto-refresh toggle. Persists the preference in localStorage so the
+    // checkbox state survives reload/restart.
+    toggleAccountAutoRefresh() {
+      localStorage.setItem('liam_account_auto_refresh', this.accountAutoRefresh ? '1' : '0');
+      // Always clear any existing interval first so toggling off->on doesn't
+      // double-stack timers.
+      if (this.accountRefreshInterval) clearInterval(this.accountRefreshInterval);
+      if (this.accountCountdownInterval) clearInterval(this.accountCountdownInterval);
+      this.accountRefreshInterval = null;
+      this.accountCountdownInterval = null;
+
+      if (this.accountAutoRefresh) {
+        this.accountRefreshCountdown = 60;
+        this.accountRefreshInterval = setInterval(() => {
+          this.refreshAllQuotas();
+          this.accountRefreshCountdown = 60;
+        }, 60000);
+        this.accountCountdownInterval = setInterval(() => {
+          if (this.accountRefreshCountdown > 0) this.accountRefreshCountdown--;
+        }, 1000);
+      }
+    },
+
     buildOverviewStats() {
       this.overviewStats = [
         { label: 'Status', value: 'Online', color: 'text-emerald-400' },
@@ -518,13 +750,34 @@ function app() {
     async openProvider(name) {
       this.providerDetail = name;
       this.providerAccounts = this.accounts.filter(a => a.provider === name);
+      // Mirror the selection into the URL so refresh restores it.
+      this.setHash('providers', name);
       const alias = this.providerNameToAlias(name);
       try {
         const r = await fetch('/api/models?provider=' + alias);
         if (r.ok) this.providerModels = await r.json() || [];
       } catch (e) { this.providerModels = []; }
+      // Activate auto-refresh if it was previously enabled. We only spawn
+      // the interval the first time the provider page is opened (or after
+      // navigating away + back) — toggleAccountAutoRefresh handles the
+      // de-dup.
+      if (this.accountAutoRefresh && !this.accountRefreshInterval) {
+        this.toggleAccountAutoRefresh();
+      }
     },
-    closeProvider() { this.providerDetail = null; this.providerModels = []; },
+    closeProvider() {
+      this.providerDetail = null;
+      this.providerModels = [];
+      // Drop the detail segment from the URL so a refresh stays on the
+      // providers grid instead of reopening the closed detail page.
+      this.setHash('providers');
+      // Stop auto-refresh interval when leaving the provider detail page so
+      // we don't keep ticking for nothing in the background.
+      if (this.accountRefreshInterval) clearInterval(this.accountRefreshInterval);
+      if (this.accountCountdownInterval) clearInterval(this.accountCountdownInterval);
+      this.accountRefreshInterval = null;
+      this.accountCountdownInterval = null;
+    },
 
     // Model test
     async testModel(modelId) {
@@ -643,23 +896,104 @@ function app() {
       navigator.clipboard.writeText(prefix);
     },
 
-    // Usage detail
-    async toggleUsageDetail(id) {
-      if (this.expandedUsageId === id) {
-        this.expandedUsageId = null;
-        this.expandedUsageData = null;
-        return;
-      }
+    // Usage detail (drawer-based, mirrors the 9router request details UI)
+    async openUsageDetail(id) {
+      if (!id) return;
       this.expandedUsageId = id;
       this.expandedUsageData = null;
+      this.usageDetailOpen = true;
+      // Reset section open-state per row so the user always sees
+      // request + response collapsibles in their default state.
+      this.usageSections = { request: true, response: true };
       try {
         const r = await fetch('/api/usage/' + id);
         if (r.ok) this.expandedUsageData = await r.json();
       } catch (e) {}
     },
+    closeUsageDetail() {
+      this.usageDetailOpen = false;
+      this.expandedUsageId = null;
+      this.expandedUsageData = null;
+    },
+    toggleSection(name) {
+      if (!this.usageSections) this.usageSections = {};
+      this.usageSections[name] = !this.usageSections[name];
+    },
+
+    // Backward-compat shim — existing keyboard shortcuts still call
+    // toggleUsageDetail; route them to the drawer flow.
+    toggleUsageDetail(id) { this.openUsageDetail(id); },
+
     prettyJSON(str) {
       if (!str) return '';
       try { return JSON.stringify(JSON.parse(str), null, 2); } catch (e) { return str; }
+    },
+
+    // Extract assistant content from a usage log's response_body. The body
+    // is either a JSON object (non-streaming) or an SSE stream of
+    // chat.completion.chunk lines. We accumulate every delta.content +
+    // delta.text so the drawer shows the actual reply text instead of raw
+    // SSE noise.
+    extractedContent(d) {
+      if (!d || !d.response_body) return '';
+      const body = d.response_body;
+      // Try JSON first.
+      try {
+        const obj = JSON.parse(body);
+        if (Array.isArray(obj?.choices) && obj.choices.length) {
+          const c = obj.choices[0];
+          if (c.message?.content) return c.message.content;
+          if (typeof c.text === 'string') return c.text;
+        }
+      } catch (_) {}
+
+      if (!body.includes('data:')) return '';
+      let out = '';
+      for (const line of body.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data:')) continue;
+        const payload = trimmed.slice(5).trim();
+        if (!payload || payload === '[DONE]') continue;
+        try {
+          const obj = JSON.parse(payload);
+          for (const c of obj.choices || []) {
+            const delta = c.delta || {};
+            if (typeof delta.content === 'string') out += delta.content;
+            else if (typeof delta.text === 'string') out += delta.text;
+          }
+        } catch (_) { /* ignore non-JSON SSE noise */ }
+      }
+      return out;
+    },
+
+    // Same idea for thinking/reasoning content. Models that emit
+    // delta.reasoning_content stream their thoughts before the answer.
+    extractedThinking(d) {
+      if (!d || !d.response_body) return '';
+      const body = d.response_body;
+      if (!body.includes('data:')) {
+        // Non-streaming: thinking field on message
+        try {
+          const obj = JSON.parse(body);
+          const r = obj?.choices?.[0]?.message?.reasoning_content;
+          return typeof r === 'string' ? r : '';
+        } catch (_) { return ''; }
+      }
+      let out = '';
+      for (const line of body.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data:')) continue;
+        const payload = trimmed.slice(5).trim();
+        if (!payload || payload === '[DONE]') continue;
+        try {
+          const obj = JSON.parse(payload);
+          for (const c of obj.choices || []) {
+            const delta = c.delta || {};
+            if (typeof delta.reasoning_content === 'string') out += delta.reasoning_content;
+          }
+        } catch (_) {}
+      }
+      return out;
     },
 
     // SSE
@@ -669,8 +1003,37 @@ function app() {
       this.sse.onmessage = (e) => {
         try {
           const req = JSON.parse(e.data);
-          this.liveRequests.unshift(req);
-          if (this.liveRequests.length > 50) this.liveRequests.pop();
+
+          // Two payload shapes flow through /sse/requests today:
+          //   1) lightweight pre-log event (no id) — used by the live
+          //      ticker on the Overview page.
+          //   2) canonical post-log event (with id + created_at) — used
+          //      to push real-time rows into the Recent Requests table
+          //      without waiting for a refresh.
+          if (req && req.id) {
+            // Dedup by id; if it's already there (rare race), update
+            // in place so latency/status reflect the latest.
+            const idx = this.recentUsage.findIndex(u => u.id === req.id);
+            const merged = {
+              tokens_in: 0,
+              tokens_out: 0,
+              ...req,
+            };
+            if (idx === -1) {
+              this.recentUsage.unshift(merged);
+              if (this.recentUsage.length > 50) this.recentUsage.pop();
+              // Keep the user looking at page 0 (newest) when they
+              // haven't scrolled. If they're on a later page, leave
+              // the cursor where it is.
+              if (this.usagePage === 0) this.expandedUsageId = this.expandedUsageId;
+            } else {
+              this.recentUsage.splice(idx, 1, merged);
+            }
+          } else {
+            // Lightweight feed — keep liveRequests for chart ticker.
+            this.liveRequests.unshift(req);
+            if (this.liveRequests.length > 50) this.liveRequests.pop();
+          }
         } catch (err) {}
       };
     },
@@ -720,6 +1083,8 @@ function app() {
       this.integrationDetail = toolName;
       this.integrationDetailData = null;
       this.integrationApplyMsg = '';
+      // Mirror selection into URL hash so refresh keeps the same tool open.
+      this.setHash('integrations', toolName);
 
       // Initialize config
       const firstKey = this.keys.length > 0 ? this.keys[0] : null;
@@ -752,6 +1117,8 @@ function app() {
       this.integrationDetail = null;
       this.integrationDetailData = null;
       this.integrationSnippet = '';
+      // Drop detail segment so refresh shows the integrations grid.
+      this.setHash('integrations');
     },
     async refreshSnippet() {
       if (!this.integrationDetail) return;
@@ -978,13 +1345,170 @@ function app() {
     formatNum(n) { if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M'; if (n >= 1000) return (n / 1000).toFixed(1) + 'K'; return String(n); },
     quotaPercent(a) { return a.quota_total > 0 ? Math.round((a.quota_remaining / a.quota_total) * 100) : 0; },
     quotaColor(a) { const p = this.quotaPercent(a); return p > 50 ? 'bg-ok' : p > 20 ? 'bg-warn' : 'bg-err'; },
+
+    // True when the credentials JSON does not have a usable token yet
+    // (server strips creds before sending; we rely on has_credentials).
+    isTokenExpired(a) {
+      if (!a || !a.token_expires_at) return false;
+      const t = Date.parse(a.token_expires_at);
+      if (!isFinite(t)) return false;
+      return t <= Date.now();
+    },
+
+    tokenExpiryClass(a) {
+      if (!a || !a.token_expires_at) return 'text-txt-3';
+      const ms = Date.parse(a.token_expires_at) - Date.now();
+      if (!isFinite(ms)) return 'text-txt-3';
+      if (ms <= 0) return 'text-err';
+      if (ms < 5 * 60 * 1000) return 'text-warn';
+      return 'text-txt-3';
+    },
+
+    // "expired 3m ago" / "expires in 42m" / "expires 14:30"
+    formatTokenExpiry(a) {
+      if (!a || !a.token_expires_at) return '';
+      const t = Date.parse(a.token_expires_at);
+      if (!isFinite(t)) return 'invalid expiry';
+      const ms = t - Date.now();
+      const abs = Math.abs(ms);
+      const mins = Math.round(abs / 60000);
+      const past = ms <= 0;
+      if (mins < 1) return past ? 'expired just now' : 'expires in <1m';
+      if (mins < 60) return past ? `expired ${mins}m ago` : `expires in ${mins}m`;
+      const hrs = Math.round(mins / 60);
+      if (hrs < 48) return past ? `expired ${hrs}h ago` : `expires in ${hrs}h`;
+      const days = Math.round(hrs / 24);
+      return past ? `expired ${days}d ago` : `expires in ${days}d`;
+    },
+
+    // Format a number compactly: keep up to 1 decimal for fractional values,
+    // otherwise return the integer. Used for per-resource breakdown labels.
+    quotaFmt(v) {
+      if (v === null || v === undefined) return '0';
+      const n = Number(v);
+      if (!isFinite(n)) return '0';
+      if (Number.isInteger(n)) return String(n);
+      return n.toFixed(1);
+    },
+
+    // Pretty label for a quota_breakdown key. The Kiro upstream returns
+    // resource keys like "agentic_request" and "agentic_request_freetrial";
+    // turn them into human-friendly headings.
+    quotaResourceLabel(key) {
+      if (!key) return 'usage';
+      const lower = String(key).toLowerCase();
+      const map = {
+        agentic_request: 'agentic',
+        agentic_request_freetrial: 'agentic (free trial)',
+        chat: 'chat',
+        chat_freetrial: 'chat (free trial)',
+      };
+      if (map[lower]) return map[lower];
+      return lower.replace(/_/g, ' ');
+    },
+
+    hasQuotaBreakdown(a) {
+      const b = a && a.quota_breakdown;
+      if (!b) return false;
+      try {
+        const obj = typeof b === 'string' ? JSON.parse(b) : b;
+        return obj && typeof obj === 'object' && Object.keys(obj).length > 0;
+      } catch (e) {
+        return false;
+      }
+    },
+
+    quotaBreakdownRows(a) {
+      if (!a) return [];
+      let raw = a.quota_breakdown;
+      if (!raw) return [];
+      if (typeof raw === 'string') {
+        try { raw = JSON.parse(raw); } catch (e) { return []; }
+      }
+      if (!raw || typeof raw !== 'object') return [];
+
+      // Sort so the headline AGENTIC_REQUEST bucket comes first, then the
+      // free-trial mirror, then everything else alphabetically.
+      const order = (k) => {
+        if (k === 'agentic_request') return 0;
+        if (k === 'agentic_request_freetrial') return 1;
+        if (k.endsWith('_freetrial')) return 3;
+        return 2;
+      };
+
+      return Object.entries(raw)
+        .map(([key, entry]) => {
+          const used = Number(entry?.used) || 0;
+          const total = Number(entry?.total) || 0;
+          const remaining = Math.max(total - used, 0);
+          const percent = total > 0 ? Math.round((remaining / total) * 100) : 0;
+          return {
+            key,
+            label: this.quotaResourceLabel(key),
+            used,
+            total,
+            remaining,
+            percent,
+            usedFmt: this.quotaFmt(used),
+            totalFmt: total > 0 ? this.quotaFmt(total) : '?',
+            resetAt: entry?.reset_at || '',
+          };
+        })
+        .sort((x, y) => order(x.key) - order(y.key) || x.key.localeCompare(y.key));
+    },
+
+    // ---- Usage pagination helpers (client-side, 10 per page) ----
+    pagedUsage() {
+      const start = this.usagePage * this.usagePageSize;
+      return this.recentUsage.slice(start, start + this.usagePageSize);
+    },
+    usagePageRangeLabel() {
+      if (!this.recentUsage.length) return '';
+      const start = this.usagePage * this.usagePageSize + 1;
+      const end = Math.min((this.usagePage + 1) * this.usagePageSize, this.recentUsage.length);
+      return start + '-' + end + ' of ' + this.recentUsage.length;
+    },
+    usagePagePrev() {
+      if (this.usagePage > 0) this.usagePage--;
+      this.expandedUsageId = null;
+    },
+    usagePageNext() {
+      if ((this.usagePage + 1) * this.usagePageSize < this.recentUsage.length) this.usagePage++;
+      this.expandedUsageId = null;
+    },
+
     timeAgo(t) {
       if (!t) return '-';
-      const d = Date.now() - new Date(t).getTime();
-      if (d < 60000) return Math.round(d/1000) + 's ago';
-      if (d < 3600000) return Math.round(d/60000) + 'm ago';
-      if (d < 86400000) return Math.round(d/3600000) + 'h ago';
-      return Math.round(d/86400000) + 'd ago';
+      const ms = new Date(t).getTime();
+      if (!isFinite(ms)) return '-';
+      const diff = Date.now() - ms;
+      const future = diff < 0;
+      const abs = Math.abs(diff);
+      const fmt = (n, unit) => future ? `in ${n}${unit}` : `${n}${unit} ago`;
+      if (abs < 60000) return fmt(Math.round(abs/1000), 's');
+      if (abs < 3600000) return fmt(Math.round(abs/60000), 'm');
+      if (abs < 86400000) return fmt(Math.round(abs/3600000), 'h');
+      return fmt(Math.round(abs/86400000), 'd');
+    },
+
+    // "15/05/2026 17:30" — fixed length so it doesn't shift the layout.
+    // Used for the title attribute on relative-time labels.
+    formatDateTime(t) {
+      if (!t) return '';
+      const d = new Date(t);
+      if (!isFinite(d.getTime())) return '';
+      const pad = (n) => String(n).padStart(2, '0');
+      return `${pad(d.getDate())}/${pad(d.getMonth()+1)}/${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    },
+
+    // Compact "15/05 17:30" for inline display when a relative label
+    // is too noisy (we use it for the resets timestamp under each bar).
+    formatShortDateTime(t) {
+      if (!t) return '';
+      const d = new Date(t);
+      if (!isFinite(d.getTime())) return '';
+      const pad = (n) => String(n).padStart(2, '0');
+      return `${pad(d.getDate())}/${pad(d.getMonth()+1)} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
     },
   };
 }
