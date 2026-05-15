@@ -782,12 +782,22 @@ func (d *Database) SetSetting(key string, value string) error {
 	return err
 }
 
-// EnsureInternalTestKey ensures an internal test API key exists for self-testing
-// Returns the raw key (only set once on first boot, then retrieved from settings)
+// EnsureInternalTestKey ensures an internal test API key exists for
+// self-testing (used by /api/models/test). Returns the raw key.
+//
+// Defensive: the value cached in settings can become stale when the
+// underlying api_keys row is hard-deleted or rotated (e.g. an old
+// dashboard wiped all keys, or the key prefix scheme changed between
+// LIAM versions). We re-validate against the api_keys table on every
+// call and regenerate on miss so /api/models/test never starts hitting
+// 401s on its own proxy.
 func (d *Database) EnsureInternalTestKey() (string, error) {
-	existing := d.GetSetting("internal_test_key", "")
-	if existing != "" {
-		return existing, nil
+	if existing := d.GetSetting("internal_test_key", ""); existing != "" {
+		if _, err := d.ValidateAPIKey(existing); err == nil {
+			return existing, nil
+		}
+		// Cached key no longer matches a live row — fall through and
+		// recreate. The orphaned settings entry is overwritten below.
 	}
 
 	_, rawKey, err := d.CreateAPIKey("_internal_test")
