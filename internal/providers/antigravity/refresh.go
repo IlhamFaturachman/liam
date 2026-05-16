@@ -11,20 +11,118 @@ import (
 
 	"github.com/liam-auto/liam/internal/config"
 	"github.com/liam-auto/liam/internal/db"
+	"golang.org/x/sync/singleflight"
 )
 
-// RefreshToken refreshes an expired Google OAuth access token
+// RefreshErrorReason classifies why a token refresh failed so callers can
+// decide whether to retry, mark dead, or just back off. Mirrors 9router's
+// `isUnrecoverableRefreshError` taxonomy (tokenRefresh.js:14-24).
+type RefreshErrorReason string
+
+const (
+	// RefreshErrorTransient: network/5xx — safe to retry next tick.
+	RefreshErrorTransient RefreshErrorReason = "transient"
+	// RefreshErrorInvalidGrant: refresh_token revoked/expired/reused — DEAD.
+	// Account should be quarantined (status=disabled) so we don't keep
+	// hammering Google with a known-bad token (which makes our IP look
+	// even more like an abusive bot).
+	RefreshErrorInvalidGrant RefreshErrorReason = "invalid_grant"
+	// RefreshErrorInvalidClient: client_id/client_secret wrong, or OAuth app
+	// suspended. Affects ALL accounts equally — don't quarantine the account.
+	RefreshErrorInvalidClient RefreshErrorReason = "invalid_client"
+	// RefreshErrorParse: response decode failed (Google changed shape, or
+	// CDN served HTML error page). Treat as transient.
+	RefreshErrorParse RefreshErrorReason = "parse"
+)
+
+// RefreshError wraps a refresh failure with a structured reason so the
+// worker can decide whether to disable the account or keep retrying.
+type RefreshError struct {
+	Reason  RefreshErrorReason
+	Message string
+}
+
+func (e *RefreshError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Message == "" {
+		return string(e.Reason)
+	}
+	return string(e.Reason) + ": " + e.Message
+}
+
+// IsUnrecoverable returns true when the error means "this refresh_token
+// will never work again" — caller should disable the account, not retry.
+func (e *RefreshError) IsUnrecoverable() bool {
+	if e == nil {
+		return false
+	}
+	return e.Reason == RefreshErrorInvalidGrant
+}
+
+// AsRefreshError extracts a *RefreshError from any error, or returns nil.
+// Lets callers do `if rerr := AsRefreshError(err); rerr != nil { … }` without
+// importing errors.As at every call site.
+func AsRefreshError(err error) *RefreshError {
+	if err == nil {
+		return nil
+	}
+	if re, ok := err.(*RefreshError); ok {
+		return re
+	}
+	return nil
+}
+
+// refreshGroup deduplicates concurrent refresh calls keyed by refresh_token.
+//
+// Why: Google's OAuth backend treats two POSTs with the same refresh_token
+// arriving in the same second as `refresh_token_reused` → revokes the entire
+// token family (refresh + access). With 300 accounts this race is inevitable
+// when the worker tick collides with on-demand refresh from handleRefreshQuota
+// or the harvest re-import path. singleflight.Group collapses concurrent calls
+// for the same key to a single upstream request.
+//
+// Mirrors 9router's `refreshPromiseCache` (tokenRefresh.js:9, 521-533) but uses
+// Go-native singleflight which auto-cleans the key when the call resolves.
+var refreshGroup singleflight.Group
+
+// RefreshToken refreshes an expired Google OAuth access token.
+//
+// Behaviour:
+//   - Preserves the existing refresh_token if Google doesn't return a new one
+//     (Google rotates rarely, but when it does we MUST capture it — using the
+//     old token after a rotate triggers `invalid_grant` and kills the account).
+//   - Dedupes concurrent calls for the same refresh_token (see refreshGroup).
+//   - Returns *RefreshError so the worker can distinguish "retry next tick"
+//     from "this account is dead, quarantine it".
 func RefreshToken(cfg *config.Config, account *db.Account) (*db.AGCredentials, error) {
 	var creds db.AGCredentials
 	if err := json.Unmarshal(account.Credentials, &creds); err != nil {
-		return nil, fmt.Errorf("parse credentials: %w", err)
+		return nil, &RefreshError{Reason: RefreshErrorParse, Message: "parse stored credentials: " + err.Error()}
 	}
 
 	if creds.RefreshToken == "" {
-		return nil, fmt.Errorf("no refresh token for account %s", account.Email)
+		// No refresh_token at all — can't recover. Treat as invalid_grant
+		// so the worker quarantines the row instead of retrying forever.
+		return nil, &RefreshError{Reason: RefreshErrorInvalidGrant, Message: "no refresh_token stored for " + account.Email}
 	}
 
-	// Google OAuth2 token refresh
+	// singleflight key: refresh_token alone is enough — same token from
+	// multiple goroutines must always collapse to one upstream call.
+	v, err, _ := refreshGroup.Do(creds.RefreshToken, func() (interface{}, error) {
+		return doRefresh(cfg, &creds)
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := v.(db.AGCredentials)
+	return &out, nil
+}
+
+// doRefresh performs the actual HTTP exchange. Always called inside
+// singleflight so concurrent callers share the result.
+func doRefresh(cfg *config.Config, creds *db.AGCredentials) (db.AGCredentials, error) {
 	data := url.Values{
 		"grant_type":    {"refresh_token"},
 		"refresh_token": {creds.RefreshToken},
@@ -32,35 +130,89 @@ func RefreshToken(cfg *config.Config, account *db.Account) (*db.AGCredentials, e
 		"client_secret": {cfg.AGClientSecret},
 	}
 
-	resp, err := http.Post(
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Post(
 		"https://oauth2.googleapis.com/token",
 		"application/x-www-form-urlencoded",
 		strings.NewReader(data.Encode()),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("refresh request failed: %w", err)
+		return db.AGCredentials{}, &RefreshError{Reason: RefreshErrorTransient, Message: "network: " + err.Error()}
 	}
 	defer resp.Body.Close()
 
+	body, _ := io.ReadAll(resp.Body)
+
+	// Classify by Google's documented OAuth2 error codes
+	// (https://datatracker.ietf.org/doc/html/rfc6749#section-5.2).
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("refresh failed with status %d", resp.StatusCode)
+		var errResp struct {
+			Error            string `json:"error"`
+			ErrorDescription string `json:"error_description"`
+		}
+		_ = json.Unmarshal(body, &errResp)
+
+		reason := RefreshErrorTransient
+		switch errResp.Error {
+		case "invalid_grant":
+			// refresh_token revoked, expired, or reused. Permanent.
+			reason = RefreshErrorInvalidGrant
+		case "invalid_client", "unauthorized_client":
+			// OAuth app misconfigured. Affects all accounts; don't blame this one.
+			reason = RefreshErrorInvalidClient
+		case "invalid_request", "invalid_scope":
+			// Bug in our request. Transient from caller's POV — log loud.
+			reason = RefreshErrorTransient
+		}
+
+		msg := fmt.Sprintf("status %d", resp.StatusCode)
+		if errResp.Error != "" {
+			msg += " " + errResp.Error
+			if errResp.ErrorDescription != "" {
+				msg += " (" + errResp.ErrorDescription + ")"
+			}
+		} else if len(body) > 0 {
+			msg += ": " + truncateAG(string(body), 200)
+		}
+		return db.AGCredentials{}, &RefreshError{Reason: reason, Message: msg}
 	}
 
+	// Google's success response: access_token + expires_in are guaranteed.
+	// refresh_token is OPTIONAL — only sent when Google rotates the family.
+	// We must capture it when present; using an old token after rotation
+	// produces invalid_grant and kills the account.
 	var tokenResp struct {
-		AccessToken string `json:"access_token"`
-		ExpiresIn   int    `json:"expires_in"`
-		TokenType   string `json:"token_type"`
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token,omitempty"`
+		ExpiresIn    int    `json:"expires_in"`
+		TokenType    string `json:"token_type"`
+		Scope        string `json:"scope,omitempty"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
-		return nil, fmt.Errorf("parse refresh response: %w", err)
+	if err := json.Unmarshal(body, &tokenResp); err != nil {
+		return db.AGCredentials{}, &RefreshError{Reason: RefreshErrorParse, Message: "decode response: " + err.Error()}
 	}
 
-	// Update credentials
-	creds.AccessToken = tokenResp.AccessToken
-	expiresAt := time.Now().UTC().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
-	creds.ExpiresAt = expiresAt.Format(time.RFC3339)
+	if tokenResp.AccessToken == "" {
+		return db.AGCredentials{}, &RefreshError{Reason: RefreshErrorParse, Message: "empty access_token in 200 response"}
+	}
 
-	return &creds, nil
+	// Build updated credentials. Preserve fields the response doesn't carry.
+	out := *creds
+	out.AccessToken = tokenResp.AccessToken
+	if tokenResp.RefreshToken != "" {
+		// Google rotated the family — this is the new authoritative refresh_token.
+		out.RefreshToken = tokenResp.RefreshToken
+	}
+	if tokenResp.Scope != "" {
+		out.Scope = tokenResp.Scope
+	}
+	expiresIn := tokenResp.ExpiresIn
+	if expiresIn <= 0 {
+		expiresIn = 3600
+	}
+	out.ExpiresAt = time.Now().UTC().Add(time.Duration(expiresIn) * time.Second).Format(time.RFC3339)
+
+	return out, nil
 }
 
 // LoadCodeAssist fetches projectId from Google's loadCodeAssist API

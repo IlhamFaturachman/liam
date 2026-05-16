@@ -451,13 +451,18 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			resp.Body.Close()
 			if IsNonRetryable(resp.StatusCode, respBody) {
 				log.Printf("[NON-RETRYABLE] %s: %d — %s", account.Email, resp.StatusCode, string(respBody[:min(len(respBody), 100)]))
+				// Persist failed request so the dashboard surfaces what
+				// went wrong; previously these vanished silently and
+				// users couldn't see the offending payload.
+				s.logFailedRequest(r, account, provider, model, body, resp.StatusCode, string(respBody), startTime)
 				writeError(w, resp.StatusCode, ExtractErrorMessage(respBody))
 				return
 			}
 			// Generic 4xx (not in non-retryable list): treat as account error
 			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody[:min(len(respBody), 100)]))
 			cooldown, msg := s.applyAccountError(account, resp.StatusCode, respBody, resp.Header)
-			log.Printf("[RETRY %d] Account %s HTTP %d -> %s", attempt+1, account.Email, resp.StatusCode, msg)
+			log.Printf("[RETRY %d] Account %s HTTP %d -> %s | body: %s", attempt+1, account.Email, resp.StatusCode, msg, string(respBody[:min(len(respBody), 200)]))
+			s.logFailedRequest(r, account, provider, model, body, resp.StatusCode, string(respBody), startTime)
 			if s.pool.Count(provider) <= 1 {
 				time.Sleep(cooldown)
 			}
@@ -470,6 +475,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			resp.Body.Close()
 			cooldown, msg := s.applyAccountError(account, resp.StatusCode, respBody, resp.Header)
 			log.Printf("[RETRY %d] Account %s HTTP %d -> %s", attempt+1, account.Email, resp.StatusCode, msg)
+			s.logFailedRequest(r, account, provider, model, body, resp.StatusCode, string(respBody), startTime)
 			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
 			if s.pool.Count(provider) <= 1 {
 				time.Sleep(cooldown)
@@ -738,6 +744,55 @@ func (s *Server) syncWorker() {
 			log.Printf("[SYNC] Error: %v", err)
 		}
 	}
+}
+
+// logFailedRequest persists a failed upstream request to usage_logs so the
+// dashboard surfaces the offending payload + error response. Without this,
+// 4xx/5xx requests vanished silently and operators couldn't see what
+// triggered "improperly formed request" / 429 / etc. Best-effort: errors
+// here are logged but never propagate to the caller.
+//
+// We use a much larger truncation budget (100KB vs 5KB for successful
+// requests) because the whole point of this row is to debug malformed
+// payloads — a 5KB cap would clip OpenCode-class requests right at the
+// tool definitions section and hide the actual schema bug.
+func (s *Server) logFailedRequest(r *http.Request, account *db.Account, provider, model string, body []byte, statusCode int, respBody string, startTime time.Time) {
+	const failedLogCap = 100 * 1024
+	reqBodyLog := string(body)
+	if len(reqBodyLog) > failedLogCap {
+		reqBodyLog = reqBodyLog[:failedLogCap] + "\n...(truncated)"
+	}
+	respLog := respBody
+	if len(respLog) > failedLogCap {
+		respLog = respLog[:failedLogCap] + "\n...(truncated)"
+	}
+	usageLog := &db.UsageLog{
+		APIKeyID:     r.Header.Get("X-API-Key-ID"),
+		AccountID:    account.ID,
+		AccountEmail: account.Email,
+		Provider:     provider,
+		Model:        model,
+		StatusCode:   statusCode,
+		LatencyMs:    int(time.Since(startTime).Milliseconds()),
+		Error:        respLog,
+		RequestBody:  reqBodyLog,
+		ResponseBody: respLog,
+	}
+	if err := s.db.LogUsage(usageLog); err != nil {
+		log.Printf("[LOG-FAILED] persist failed request: %v", err)
+		return
+	}
+	BroadcastRequest(map[string]interface{}{
+		"id":            usageLog.ID,
+		"created_at":    usageLog.CreatedAt.Format(time.RFC3339Nano),
+		"account_id":    usageLog.AccountID,
+		"account_email": usageLog.AccountEmail,
+		"provider":      usageLog.Provider,
+		"model":         usageLog.Model,
+		"status_code":   usageLog.StatusCode,
+		"latency_ms":    usageLog.LatencyMs,
+		"error":         respLog,
+	})
 }
 
 // applyAccountError classifies an upstream failure and applies the
@@ -1013,11 +1068,65 @@ func (s *Server) handleAddAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate credentials BEFORE writing to DB. The harvest pipeline hits
+	// this endpoint for every imported account, and silently accepting
+	// rows with missing refresh_token / unparseable expires_at is what
+	// makes the dashboard fill up with accounts that "look fine" but die
+	// the moment their access_token expires (refresh.go can't recover
+	// without a refresh_token).
+	//
+	// We intentionally only enforce this for OAuth providers (AG/Kiro);
+	// other providers may carry session cookies or API keys with no
+	// expiry concept.
+	switch input.Provider {
+	case "antigravity":
+		var c db.AGCredentials
+		if err := json.Unmarshal(input.Credentials, &c); err != nil {
+			writeError(w, http.StatusBadRequest, "credentials JSON invalid: "+err.Error())
+			return
+		}
+		if strings.TrimSpace(c.RefreshToken) == "" {
+			writeError(w, http.StatusBadRequest, "refresh_token is required for antigravity accounts (without it the worker can't keep the access_token alive past 1 hour)")
+			return
+		}
+		// expires_at is best-effort: if absent, we set "now" so the
+		// background worker picks the row up on its first tick. Don't
+		// reject — some upstream callers may not compute it.
+		if strings.TrimSpace(c.ExpiresAt) == "" {
+			c.ExpiresAt = time.Now().UTC().Format(time.RFC3339)
+			if patched, err := json.Marshal(c); err == nil {
+				input.Credentials = patched
+			}
+		} else if _, err := time.Parse(time.RFC3339, c.ExpiresAt); err != nil {
+			if _, err2 := time.Parse(time.RFC3339Nano, c.ExpiresAt); err2 != nil {
+				writeError(w, http.StatusBadRequest, "expires_at must be RFC3339 timestamp, got: "+c.ExpiresAt)
+				return
+			}
+		}
+	case "kiro":
+		var c db.KiroCredentials
+		if err := json.Unmarshal(input.Credentials, &c); err != nil {
+			writeError(w, http.StatusBadRequest, "credentials JSON invalid: "+err.Error())
+			return
+		}
+		if strings.TrimSpace(c.RefreshToken) == "" {
+			writeError(w, http.StatusBadRequest, "refresh_token is required for kiro accounts")
+			return
+		}
+		if strings.TrimSpace(c.ExpiresAt) == "" {
+			c.ExpiresAt = time.Now().UTC().Format(time.RFC3339)
+			if patched, err := json.Marshal(c); err == nil {
+				input.Credentials = patched
+			}
+		}
+	}
+
 	account := &db.Account{
 		Provider:    input.Provider,
 		Email:       input.Email,
 		Status:      "active",
 		Credentials: input.Credentials,
+		AuthMethod:  "imported",
 	}
 
 	if err := s.db.UpsertAccount(account); err != nil {

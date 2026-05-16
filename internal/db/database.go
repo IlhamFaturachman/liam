@@ -500,6 +500,24 @@ func (d *Database) MarkAccountError(id string, errMsg string, cooldownSecs int) 
 	return err
 }
 
+// SetAccountStatus updates an account's status (e.g. "active", "disabled",
+// "cooldown") and optionally records the reason in last_error. Used by the
+// refresh worker to quarantine accounts whose refresh_token has been revoked
+// upstream — leaving them as 'active' would have the worker keep hammering
+// Google with a known-bad token every 5 minutes, which is exactly the
+// behaviour that gets the outbound IP rate-limited.
+func (d *Database) SetAccountStatus(id, status, reason string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if reason == "" {
+		_, err := d.db.Exec(`UPDATE accounts SET status = ?, updated_at = ? WHERE id = ?`,
+			status, now, id)
+		return err
+	}
+	_, err := d.db.Exec(`UPDATE accounts SET status = ?, last_error = ?, updated_at = ? WHERE id = ?`,
+		status, reason, now, id)
+	return err
+}
+
 // BumpBackoff bumps the per-account 429 backoff level by one (capped at
 // `maxLevel`) and writes the resulting cooldown window to the account
 // row. Returns the new level so callers can log it. Mirrors 9router's

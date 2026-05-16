@@ -9,41 +9,121 @@ import (
 	"time"
 
 	"github.com/liam-auto/liam/internal/db"
+	"golang.org/x/sync/singleflight"
 )
 
 // Kiro desktop auth endpoint (doesn't require clientId/clientSecret)
 const kiroDesktopRefreshURL = "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken"
 
-// RefreshToken refreshes a Kiro access token using the desktop auth endpoint
+// RefreshErrorReason classifies why a refresh failed. Mirrors the AG-side
+// taxonomy so the worker can use one quarantine path for both providers.
+type RefreshErrorReason string
+
+const (
+	RefreshErrorTransient    RefreshErrorReason = "transient"
+	RefreshErrorInvalidGrant RefreshErrorReason = "invalid_grant"
+	RefreshErrorParse        RefreshErrorReason = "parse"
+)
+
+// RefreshError wraps a Kiro refresh failure with a structured reason.
+type RefreshError struct {
+	Reason  RefreshErrorReason
+	Message string
+}
+
+func (e *RefreshError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Message == "" {
+		return string(e.Reason)
+	}
+	return string(e.Reason) + ": " + e.Message
+}
+
+// IsUnrecoverable returns true when the refresh_token is permanently dead.
+func (e *RefreshError) IsUnrecoverable() bool {
+	if e == nil {
+		return false
+	}
+	return e.Reason == RefreshErrorInvalidGrant
+}
+
+// AsRefreshError extracts a *RefreshError from any error, or returns nil.
+func AsRefreshError(err error) *RefreshError {
+	if err == nil {
+		return nil
+	}
+	if re, ok := err.(*RefreshError); ok {
+		return re
+	}
+	return nil
+}
+
+// refreshGroup deduplicates concurrent refresh calls per refresh_token. Kiro's
+// auth endpoint is more tolerant than Google's (rotates refresh_token on every
+// successful refresh, no `refresh_token_reused` family revoke), but two
+// parallel refreshes still race on which rotated refresh_token wins — the
+// loser's stored refresh_token is invalidated. singleflight keeps it serial.
+var refreshGroup singleflight.Group
+
+// RefreshToken refreshes a Kiro access token using the desktop auth endpoint.
+//
+// Kiro's response includes a fresh refresh_token on every successful call.
+// We MUST capture it (already does); singleflight prevents the parallel-race
+// where two callers both store their own rotated token and one becomes stale.
 func RefreshToken(account *db.Account) (*KiroCredentials, error) {
 	var creds KiroCredentials
 	if err := json.Unmarshal(account.Credentials, &creds); err != nil {
-		return nil, fmt.Errorf("parse credentials: %w", err)
+		return nil, &RefreshError{Reason: RefreshErrorParse, Message: "parse credentials: " + err.Error()}
 	}
 
 	if creds.RefreshToken == "" {
-		return nil, fmt.Errorf("no refresh token")
+		return nil, &RefreshError{Reason: RefreshErrorInvalidGrant, Message: "no refresh_token stored"}
 	}
 
+	v, err, _ := refreshGroup.Do(creds.RefreshToken, func() (interface{}, error) {
+		return doRefresh(&creds)
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := v.(KiroCredentials)
+	return &out, nil
+}
+
+func doRefresh(creds *KiroCredentials) (KiroCredentials, error) {
 	body, _ := json.Marshal(map[string]string{
 		"refreshToken": creds.RefreshToken,
 	})
 
 	req, err := http.NewRequest("POST", kiroDesktopRefreshURL, strings.NewReader(string(body)))
 	if err != nil {
-		return nil, err
+		return KiroCredentials{}, &RefreshError{Reason: RefreshErrorTransient, Message: err.Error()}
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("refresh request: %w", err)
+		return KiroCredentials{}, &RefreshError{Reason: RefreshErrorTransient, Message: "network: " + err.Error()}
 	}
 	defer resp.Body.Close()
 
+	respBody, _ := io.ReadAll(resp.Body)
+
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("refresh failed with status %d", resp.StatusCode)
+		// Kiro returns 400/401 with a body like {"message":"..."} when the
+		// refresh_token is dead. 5xx is transient. Be conservative: only
+		// classify 4xx as InvalidGrant.
+		reason := RefreshErrorTransient
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			reason = RefreshErrorInvalidGrant
+		}
+		return KiroCredentials{}, &RefreshError{
+			Reason:  reason,
+			Message: fmt.Sprintf("status %d: %s", resp.StatusCode, truncate(string(respBody), 200)),
+		}
 	}
 
 	var tokenResp struct {
@@ -52,24 +132,29 @@ func RefreshToken(account *db.Account) (*KiroCredentials, error) {
 		ProfileArn   string `json:"profileArn"`
 		ExpiresIn    int    `json:"expiresIn"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
-		return nil, fmt.Errorf("parse response: %w", err)
+	if err := json.Unmarshal(respBody, &tokenResp); err != nil {
+		return KiroCredentials{}, &RefreshError{Reason: RefreshErrorParse, Message: "decode response: " + err.Error()}
 	}
 
-	creds.AccessToken = tokenResp.AccessToken
+	if tokenResp.AccessToken == "" {
+		return KiroCredentials{}, &RefreshError{Reason: RefreshErrorParse, Message: "empty accessToken in 200 response"}
+	}
+
+	out := *creds
+	out.AccessToken = tokenResp.AccessToken
 	if tokenResp.RefreshToken != "" {
-		creds.RefreshToken = tokenResp.RefreshToken
+		out.RefreshToken = tokenResp.RefreshToken
 	}
 	if tokenResp.ProfileArn != "" {
-		creds.ProfileARN = tokenResp.ProfileArn
+		out.ProfileARN = tokenResp.ProfileArn
 	}
 	expiresIn := tokenResp.ExpiresIn
 	if expiresIn <= 0 {
 		expiresIn = 3600
 	}
-	creds.ExpiresAt = time.Now().UTC().Add(time.Duration(expiresIn) * time.Second).Format(time.RFC3339)
+	out.ExpiresAt = time.Now().UTC().Add(time.Duration(expiresIn) * time.Second).Format(time.RFC3339)
 
-	return &creds, nil
+	return out, nil
 }
 
 // IsTokenExpired checks if the access token is expired or expiring soon

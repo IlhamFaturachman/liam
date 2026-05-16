@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -81,6 +84,15 @@ func (e *Executor) ExecuteWithSession(account *db.Account, model string, body []
 		return nil, fmt.Errorf("execute: %w", err)
 	}
 
+	// On 4xx/5xx, dump the upstream payload to disk so we can inspect
+	// what we sent vs what Kiro rejected. The dashboard's request_body
+	// shows the OpenAI-format input *before* translation; this dump is
+	// the actual JSON the upstream saw, which is what really matters
+	// for debugging "Improperly formed request" and friends.
+	if resp.StatusCode >= 400 {
+		dumpFailedKiroPayload(account.ID, model, kiroBody, resp.StatusCode)
+	}
+
 	// If error status, return as-is for handler to process
 	if resp.StatusCode != 200 {
 		return resp, nil
@@ -106,4 +118,36 @@ func (e *Executor) ReadErrorBody(resp *http.Response) string {
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	return string(body)
+}
+
+// dumpFailedKiroPayload writes the JSON we sent to Kiro to a debug file
+// so the operator can compare it against what 9router/Kiro IDE produces.
+// We keep at most the 10 most recent dumps under ~/.liam/debug/kiro-fail/
+// so the directory doesn't grow unbounded.
+func dumpFailedKiroPayload(accountID, model string, body []byte, statusCode int) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	dir := filepath.Join(home, ".liam", "debug", "kiro-fail")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return
+	}
+
+	// Trim oldest files when we exceed the cap. Best-effort: any error
+	// here is silently ignored to keep the request hot path fast.
+	if entries, err := os.ReadDir(dir); err == nil && len(entries) >= 10 {
+		// os.ReadDir returns alphabetical order; our filenames are
+		// timestamp-prefixed so sort by name == sort by time.
+		excess := len(entries) - 9
+		for i := 0; i < excess; i++ {
+			os.Remove(filepath.Join(dir, entries[i].Name()))
+		}
+	}
+
+	ts := time.Now().UTC().Format("20060102T150405.000")
+	safeModel := strings.ReplaceAll(model, "/", "_")
+	name := fmt.Sprintf("%s-%d-%s-%s.json", ts, statusCode, safeModel, accountID[:8])
+	path := filepath.Join(dir, name)
+	_ = os.WriteFile(path, body, 0644)
 }

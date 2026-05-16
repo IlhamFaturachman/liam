@@ -3,12 +3,42 @@ package workers
 import (
 	"encoding/json"
 	"log"
+	"math/rand"
+	"sync"
 	"time"
 
 	"github.com/liam-auto/liam/internal/config"
 	"github.com/liam-auto/liam/internal/db"
 	"github.com/liam-auto/liam/internal/providers/antigravity"
 	"github.com/liam-auto/liam/internal/providers/kiro"
+)
+
+// Tunables for the refresh worker. Centralised so the values are obvious
+// when troubleshooting "why is account X dead".
+const (
+	// refreshTickInterval is how often the worker scans for soon-to-expire
+	// tokens. With 5 min ticks and a 10 min lead time every account gets at
+	// least one refresh chance before its access_token actually expires.
+	refreshTickInterval = 5 * time.Minute
+
+	// refreshLeadMinutes: select accounts whose access_token expires within
+	// this many minutes. Must be >= refreshTickInterval (in minutes) plus a
+	// margin so we never hit a tick where the token already expired.
+	refreshLeadMinutes = 10
+
+	// refreshBatchConcurrency caps how many AG accounts we refresh in
+	// parallel. With 300 accounts under one outbound IP, hammering Google
+	// with 300 simultaneous POSTs to oauth2.googleapis.com is the single
+	// fastest way to get the IP rate-limited or the token family revoked
+	// for "unusual activity". 8 mirrors what 9router does for the same
+	// upstream and stays well under Google's per-IP soft cap.
+	refreshBatchConcurrency = 8
+
+	// refreshJitterMaxMs: spread requests in a batch over this window so
+	// they don't arrive at Google as one synchronous burst at HH:00:00.
+	// 30s is enough to look organic without delaying refresh meaningfully
+	// (we still finish way before the 10 min lead time elapses).
+	refreshJitterMaxMs = 30_000
 )
 
 // StartAll launches all background workers as goroutines
@@ -21,12 +51,13 @@ func StartAll(cfg *config.Config, database *db.Database) {
 	log.Println("[WORKERS] All background workers started")
 }
 
-// tokenRefresher refreshes expiring tokens every 5 minutes
+// tokenRefresher refreshes expiring tokens at a regular cadence.
 func tokenRefresher(cfg *config.Config, database *db.Database) {
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(refreshTickInterval)
 	defer ticker.Stop()
 
-	// Run once immediately
+	// Run once immediately so newly imported accounts don't have to wait
+	// 5 minutes for their first refresh.
 	refreshTokens(cfg, database)
 
 	for range ticker.C {
@@ -35,43 +66,127 @@ func tokenRefresher(cfg *config.Config, database *db.Database) {
 }
 
 func refreshTokens(cfg *config.Config, database *db.Database) {
-	// Refresh AG accounts with tokens expiring within 10 minutes
-	agAccounts, err := database.GetAccountsNeedingRefresh("antigravity", 10)
-	if err != nil {
+	// AG and Kiro use distinct refresh paths (Google OAuth vs AWS Cognito-ish)
+	// but the per-batch concurrency + jitter shape is identical, so we
+	// drive them through the same scaffolding.
+
+	if agAccounts, err := database.GetAccountsNeedingRefresh("antigravity", refreshLeadMinutes); err != nil {
 		log.Printf("[REFRESH] Error getting AG accounts: %v", err)
 	} else if len(agAccounts) > 0 {
-		log.Printf("[REFRESH] Refreshing %d AG tokens", len(agAccounts))
-		for _, account := range agAccounts {
+		log.Printf("[REFRESH] AG: %d account(s) need refresh", len(agAccounts))
+		runRefreshBatch(agAccounts, func(account db.Account) error {
 			newCreds, err := antigravity.RefreshToken(cfg, &account)
 			if err != nil {
-				log.Printf("[REFRESH] AG failed for %s: %v", account.Email, err)
-				database.MarkAccountError(account.ID, "refresh_failed: "+err.Error(), 0)
-				continue
+				return err
 			}
 			credsJSON, _ := json.Marshal(newCreds)
-			database.UpdateAccountCredentials(account.ID, credsJSON)
-			log.Printf("[REFRESH] AG refreshed: %s", account.Email)
-		}
+			return database.UpdateAccountCredentials(account.ID, credsJSON)
+		}, func(account db.Account, err error) {
+			handleRefreshFailure(database, account, err, "AG", isAGUnrecoverable)
+		}, "AG")
 	}
 
-	// Refresh Kiro accounts with tokens expiring within 10 minutes
-	kiroAccounts, err := database.GetAccountsNeedingRefresh("kiro", 10)
-	if err != nil {
+	if kiroAccounts, err := database.GetAccountsNeedingRefresh("kiro", refreshLeadMinutes); err != nil {
 		log.Printf("[REFRESH] Error getting Kiro accounts: %v", err)
 	} else if len(kiroAccounts) > 0 {
-		log.Printf("[REFRESH] Refreshing %d Kiro tokens", len(kiroAccounts))
-		for _, account := range kiroAccounts {
+		log.Printf("[REFRESH] Kiro: %d account(s) need refresh", len(kiroAccounts))
+		runRefreshBatch(kiroAccounts, func(account db.Account) error {
 			newCreds, err := kiro.RefreshToken(&account)
 			if err != nil {
-				log.Printf("[REFRESH] Kiro failed for %s: %v", account.Email, err)
-				database.MarkAccountError(account.ID, "refresh_failed: "+err.Error(), 0)
-				continue
+				return err
 			}
 			credsJSON, _ := json.Marshal(newCreds)
-			database.UpdateAccountCredentials(account.ID, credsJSON)
-			log.Printf("[REFRESH] Kiro refreshed: %s", account.Email)
-		}
+			return database.UpdateAccountCredentials(account.ID, credsJSON)
+		}, func(account db.Account, err error) {
+			handleRefreshFailure(database, account, err, "Kiro", isKiroUnrecoverable)
+		}, "Kiro")
 	}
+}
+
+// runRefreshBatch executes `do` for each account with bounded concurrency
+// and per-account jitter so a 300-account batch doesn't fan out into 300
+// simultaneous OAuth requests from the same IP.
+func runRefreshBatch(
+	accounts []db.Account,
+	do func(db.Account) error,
+	onErr func(db.Account, error),
+	label string,
+) {
+	sem := make(chan struct{}, refreshBatchConcurrency)
+	var wg sync.WaitGroup
+	successCount := 0
+	var mu sync.Mutex
+
+	for _, account := range accounts {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(account db.Account) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			// Per-account jitter. rand.Intn is fine here; this is anti-burst
+			// shaping, not security. The sleep happens INSIDE the worker
+			// pool so it doesn't block submission of the next account —
+			// other workers are free to start immediately.
+			if refreshJitterMaxMs > 0 {
+				time.Sleep(time.Duration(rand.Intn(refreshJitterMaxMs)) * time.Millisecond)
+			}
+
+			if err := do(account); err != nil {
+				onErr(account, err)
+				return
+			}
+			mu.Lock()
+			successCount++
+			mu.Unlock()
+			log.Printf("[REFRESH] %s OK: %s", label, account.Email)
+		}(account)
+	}
+
+	wg.Wait()
+	log.Printf("[REFRESH] %s batch done: %d/%d succeeded", label, successCount, len(accounts))
+}
+
+// handleRefreshFailure decides whether to keep the account active or
+// quarantine it permanently based on the structured error from the
+// provider's RefreshToken().
+//
+// Why quarantine: once Google says `invalid_grant` the refresh_token is dead
+// — every retry from the same outbound IP is one more strike against our
+// reputation. Disabling the row stops the worker from picking it up next
+// tick (GetAccountsNeedingRefresh filters on status='active').
+func handleRefreshFailure(
+	database *db.Database,
+	account db.Account,
+	err error,
+	label string,
+	isUnrecoverable func(error) bool,
+) {
+	if isUnrecoverable(err) {
+		log.Printf("[REFRESH] %s DEAD %s: %v — quarantining", label, account.Email, err)
+		// Mark the account disabled so subsequent worker ticks skip it,
+		// and record the failure reason in last_error for the dashboard.
+		_ = database.SetAccountStatus(account.ID, "disabled", "refresh_unrecoverable: "+err.Error())
+		return
+	}
+	// Transient — leave status active, just record the latest error.
+	// Worker picks the row up again on the next tick.
+	log.Printf("[REFRESH] %s transient fail %s: %v", label, account.Email, err)
+	_ = database.MarkAccountError(account.ID, "refresh_failed: "+err.Error(), 0)
+}
+
+func isAGUnrecoverable(err error) bool {
+	if re := antigravity.AsRefreshError(err); re != nil {
+		return re.IsUnrecoverable()
+	}
+	return false
+}
+
+func isKiroUnrecoverable(err error) bool {
+	if re := kiro.AsRefreshError(err); re != nil {
+		return re.IsUnrecoverable()
+	}
+	return false
 }
 
 // healthChecker validates accounts every 15 minutes

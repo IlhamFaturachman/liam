@@ -61,7 +61,14 @@ var errorRules = []errorRule{
 	// --- Text-based rules (checked first, order = priority) ---
 	{text: "no credentials", cooldownMs: LongCooldownMs},
 	{text: "request not allowed", cooldownMs: ShortCooldownMs},
-	{text: "improperly formed request", cooldownMs: LongCooldownMs},
+	// "Improperly formed request" is a payload-shape problem (translator
+	// bug, malformed multimodal input, oversized history). Cooling the
+	// account down for 2 minutes was way too aggressive — single-account
+	// users got locked out and the retry loop just hit the same account
+	// after sleeping. Drop to a short 5s window so the account recovers
+	// fast and the loop has a real chance to surface the underlying
+	// error to the caller.
+	{text: "improperly formed request", cooldownMs: ShortCooldownMs},
 	{text: "rate limit", backoff: true},
 	{text: "too many requests", backoff: true},
 	{text: "quota exceeded", backoff: true},
