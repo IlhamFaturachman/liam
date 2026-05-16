@@ -65,6 +65,13 @@ func (e *Executor) ExecuteWithSession(account *db.Account, model string, body []
 	req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
 	req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
 	req.Header.Set("Amz-Sdk-Request", "attempt=1; max=1")
+	// Impersonate Kiro IDE so the upstream applies the same tier/limits
+	// the desktop client gets. The previous "liam-kiro/1.0" identifier
+	// likely landed us in the generic CodeWhisperer 200k bucket; matching
+	// 9router's official IDE headers is our best shot at the >200k tier
+	// the IDE itself enjoys for Opus 4.7's 1M context.
+	req.Header.Set("User-Agent", "AWS-SDK-JS/3.0.0 kiro-ide/1.0.0")
+	req.Header.Set("X-Amz-User-Agent", "aws-sdk-js/3.0.0 kiro-ide/1.0.0")
 	if sessionID != "" {
 		req.Header.Set("X-Amz-Session-Id", sessionID)
 	}

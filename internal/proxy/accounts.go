@@ -82,6 +82,27 @@ func (s *Server) handleImportAG(w http.ResponseWriter, r *http.Request) {
 		Email:       req.Email,
 		Status:      "active",
 		Credentials: credsJSON,
+		AuthMethod:  "imported",
+	}
+
+	// Best-effort quota fetch so the dashboard renders the new
+	// account with usage data immediately. Failures are non-fatal —
+	// the user can hit "Refresh Quota" later if Cloud Code Assist
+	// is throttling or the project is brand-new.
+	if qr, qErr := antigravity.FetchQuota(req.AccessToken); qErr == nil && qr != nil {
+		account.QuotaTotal = qr.Total
+		account.QuotaRemaining = qr.Total - qr.Used
+		account.Plan = qr.Plan
+		if qr.ResetAt != "" {
+			if t, parseErr := time.Parse(time.RFC3339, qr.ResetAt); parseErr == nil {
+				account.QuotaResetAt = &t
+			}
+		}
+		if len(qr.Breakdown) > 0 {
+			if b, mErr := json.Marshal(qr.Breakdown); mErr == nil {
+				account.QuotaBreakdown = b
+			}
+		}
 	}
 
 	if err := s.db.UpsertAccount(account); err != nil {
@@ -258,20 +279,71 @@ func (s *Server) handleRefreshQuota(w http.ResponseWriter, r *http.Request) {
 		var creds db.AGCredentials
 		json.Unmarshal(account.Credentials, &creds)
 
-		if creds.AccessToken == "" {
-			writeError(w, 400, "no access token")
+		if creds.AccessToken == "" && creds.RefreshToken == "" {
+			writeError(w, 400, "no access or refresh token")
 			return
 		}
 
-		_, _, err := antigravity.LoadCodeAssist(creds.AccessToken)
-		if err != nil {
-			writeError(w, 502, fmt.Sprintf("Failed to fetch quota: %v", err))
+		// Try once with the cached access token. If Cloud Code Assist
+		// rejects it as expired/forbidden, refresh and retry once —
+		// mirrors the Kiro flow below.
+		qr, qErr := antigravity.FetchQuota(creds.AccessToken)
+
+		var quotaErr *antigravity.QuotaError
+		if qErr != nil && errors.As(qErr, &quotaErr) && quotaErr.Reason == antigravity.QuotaErrorAuthExpired && creds.RefreshToken != "" {
+			refreshed, rErr := antigravity.RefreshToken(s.cfg, account)
+			if rErr != nil {
+				writeError(w, 502, fmt.Sprintf("token refresh failed: %v", rErr))
+				return
+			}
+			newCredsJSON, _ := json.Marshal(refreshed)
+			if err := s.db.UpdateAccountCredentials(account.ID, newCredsJSON); err != nil {
+				log.Printf("[REFRESH-QUOTA] persist refreshed AG creds: %v", err)
+			}
+			account.Credentials = newCredsJSON
+			creds = *refreshed
+			qr, qErr = antigravity.FetchQuota(creds.AccessToken)
+		}
+
+		if qErr != nil {
+			writeError(w, 502, fmt.Sprintf("Failed to fetch quota: %v", qErr))
 			return
+		}
+		if qr == nil {
+			writeError(w, 502, "quota response was empty")
+			return
+		}
+
+		// Persist quota + plan + breakdown so the dashboard reflects
+		// the latest state without another roundtrip.
+		account.QuotaTotal = qr.Total
+		account.QuotaRemaining = qr.Total - qr.Used
+		account.Plan = qr.Plan
+		if qr.ResetAt != "" {
+			if t, parseErr := time.Parse(time.RFC3339, qr.ResetAt); parseErr == nil {
+				account.QuotaResetAt = &t
+			}
+		}
+		if len(qr.Breakdown) > 0 {
+			if b, mErr := json.Marshal(qr.Breakdown); mErr == nil {
+				account.QuotaBreakdown = b
+			}
+		}
+		if err := s.db.UpsertAccount(account); err != nil {
+			log.Printf("[REFRESH-QUOTA] persist AG account: %v", err)
+		}
+		if s.syncer != nil {
+			s.syncer.PushAccountAsync(account)
 		}
 
 		writeJSON(w, 200, map[string]interface{}{
-			"status":  "refreshed",
-			"message": "Token validated successfully",
+			"status":    "refreshed",
+			"used":      qr.Used,
+			"total":     qr.Total,
+			"remaining": qr.Total - qr.Used,
+			"reset_at":  qr.ResetAt,
+			"plan":      qr.Plan,
+			"breakdown": qr.Breakdown,
 		})
 	} else if account.Provider == "kiro" {
 		var creds db.KiroCredentials
@@ -609,6 +681,26 @@ func (s *Server) handleAGExchange(w http.ResponseWriter, r *http.Request) {
 		Email:       email,
 		Status:      "active",
 		Credentials: credsJSON,
+		AuthMethod:  "oauth",
+	}
+
+	// Best-effort initial quota fetch — same pattern as handleImportAG
+	// + handleImportKiro. Failures are logged silently; the dashboard
+	// will surface a "Refresh Quota" affordance for retries.
+	if qr, qErr := antigravity.FetchQuota(tokens.AccessToken); qErr == nil && qr != nil {
+		account.QuotaTotal = qr.Total
+		account.QuotaRemaining = qr.Total - qr.Used
+		account.Plan = qr.Plan
+		if qr.ResetAt != "" {
+			if t, parseErr := time.Parse(time.RFC3339, qr.ResetAt); parseErr == nil {
+				account.QuotaResetAt = &t
+			}
+		}
+		if len(qr.Breakdown) > 0 {
+			if b, mErr := json.Marshal(qr.Breakdown); mErr == nil {
+				account.QuotaBreakdown = b
+			}
+		}
 	}
 
 	if err := s.db.UpsertAccount(account); err != nil {
