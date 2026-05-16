@@ -46,9 +46,13 @@ func (s *Service) HandleList(w http.ResponseWriter, r *http.Request) {
 	result := []ToolInfo{}
 	for _, name := range s.order {
 		tool, ok := s.tools[name]
-		if !ok { continue }
+		if !ok {
+			continue
+		}
 		status, err := tool.Status()
-		if err != nil { continue }
+		if err != nil {
+			continue
+		}
 		result = append(result, ToolInfo{ToolStatus: status})
 	}
 	writeJSON(w, 200, result)
@@ -73,8 +77,12 @@ func (s *Service) HandleGet(w http.ResponseWriter, r *http.Request) {
 	model := r.URL.Query().Get("model")
 	apiKey := r.URL.Query().Get("api_key")
 	baseURL := r.URL.Query().Get("base_url")
-	if apiKey == "" { apiKey = "<YOUR_KEY>" }
-	if baseURL == "" { baseURL = "http://localhost:666/v1" }
+	if apiKey == "" {
+		apiKey = "<YOUR_KEY>"
+	}
+	if baseURL == "" {
+		baseURL = "http://localhost:666/v1"
+	}
 
 	models := map[string]string{}
 	for _, slot := range tool.ModelSlots() {
@@ -170,9 +178,15 @@ func (s *Service) HandleSnippet(w http.ResponseWriter, r *http.Request) {
 	}
 	json.NewDecoder(r.Body).Decode(&req)
 
-	if req.APIKey == "" { req.APIKey = "<YOUR_KEY>" }
-	if req.BaseURL == "" { req.BaseURL = "http://localhost:666/v1" }
-	if req.Models == nil { req.Models = map[string]string{} }
+	if req.APIKey == "" {
+		req.APIKey = "<YOUR_KEY>"
+	}
+	if req.BaseURL == "" {
+		req.BaseURL = "http://localhost:666/v1"
+	}
+	if req.Models == nil {
+		req.Models = map[string]string{}
+	}
 
 	for _, slot := range tool.ModelSlots() {
 		if req.Models[slot.Key] == "" {
@@ -188,7 +202,7 @@ func (s *Service) HandleSnippet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, 200, map[string]string{
-		"snippet": tool.Snippet(cfg),
+		"snippet":     tool.Snippet(cfg),
 		"config_path": tool.ConfigPath(),
 	})
 }

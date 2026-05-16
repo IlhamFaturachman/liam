@@ -174,6 +174,8 @@ func Start(cfg *config.Config, database *db.Database) error {
 			// Settings
 			r.Get("/settings/base-url", s.handleGetBaseURL)
 			r.Post("/settings/base-url", s.handleSetBaseURL)
+			r.Get("/settings/token-saver", s.handleGetTokenSaver)
+			r.Post("/settings/token-saver", s.handleSetTokenSaver)
 
 			// Stats & Usage
 			r.Get("/stats", s.handleStats)
@@ -407,6 +409,17 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// chat handler stays provider-agnostic.
 	provider := s.resolveProviderFromModel(model)
 	providerInfo := s.providers.ByID(provider)
+
+	// Token savers (RTK + Caveman) — run AFTER thinking DSL has been
+	// stripped from the model name and BEFORE combo dispatch / any
+	// provider's translateRequest. This keeps both savers
+	// provider-agnostic by operating on the OpenAI canonical shape
+	// that all clients speak. Combo paths inherit the savings via
+	// `body` and `req` (we always re-marshal in lockstep).
+	// See internal/proxy/tokensaver.go for design notes on safety
+	// w.r.t. Kiro overlay, tool calls, and thinking config.
+	policy := loadTokenSaverPolicy(s.db, r.Header)
+	body = applyTokenSavers(req, body, policy)
 
 	// Extract session ID for session affinity
 	sessionID := extractSessionID(r, req)
