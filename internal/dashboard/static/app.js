@@ -163,9 +163,13 @@ function app() {
     ],
 
     // Harvest
-    harvest: { provider: 'ag', concurrency: '4', headless: 'false', accounts: '' },
-    harvestStatus: { running: false, success: 0, failed: 0, total: 0, logs: [], accounts: [] },
+    harvest: { provider: 'ag', concurrency: '4', headless: 'true', accounts: '', filter: 'all' },
+    harvestStatus: { running: false, success: 0, failed: 0, total: 0, active: 0, started_at: 0, ended_at: 0, logs: [], accounts: [] },
     harvestPoll: null,
+    // Re-rendered every second to keep the elapsed/ETA labels updating even
+    // when the status payload is unchanged (e.g. between 2-second polls).
+    harvestNow: Math.floor(Date.now() / 1000),
+    harvestNowTimer: null,
 
     // Settings
     settings: { currentPw: '', newPw: '', msg: '', ok: false },
@@ -189,6 +193,53 @@ function app() {
     get harvestAccountCount() {
       if (!this.harvest.accounts) return 0;
       return this.harvest.accounts.split('\n').filter(l => l.trim() && l.includes(':')).length;
+    },
+
+    // Seconds since the run kicked off (or total wall-clock if it has ended).
+    get harvestElapsed() {
+      const s = this.harvestStatus;
+      if (!s.started_at) return 0;
+      const end = s.running ? this.harvestNow : (s.ended_at || this.harvestNow);
+      return Math.max(0, end - s.started_at);
+    },
+
+    // Naive ETA: extrapolate from current throughput. We avoid showing
+    // anything until at least one account has finished (the early signal
+    // is noisy enough to mislead) and clamp to a sane upper bound.
+    get harvestETA() {
+      const s = this.harvestStatus;
+      if (!s.running) return 0;
+      const done = (s.success || 0) + (s.failed || 0);
+      const remaining = (s.total || 0) - done;
+      if (done < 1 || remaining <= 0) return 0;
+      const elapsed = this.harvestElapsed;
+      if (elapsed < 5) return 0;
+      // Per-account average × remaining, capped at 6 hours so a single
+      // hung worker can't make the dashboard claim "ETA: 47 hours".
+      return Math.min(Math.round((elapsed / done) * remaining), 6 * 3600);
+    },
+
+    formatDuration(secs) {
+      if (!secs || secs < 0) return '-';
+      if (secs < 60) return `${secs}s`;
+      const m = Math.floor(secs / 60);
+      const s = secs % 60;
+      if (m < 60) return `${m}m ${s}s`;
+      const h = Math.floor(m / 60);
+      return `${h}h ${m % 60}m`;
+    },
+
+    // Filter the per-account table by status. Empty filter = show all.
+    get filteredHarvestAccounts() {
+      const f = this.harvest.filter;
+      if (!f || f === 'all') return this.harvestStatus.accounts || [];
+      return (this.harvestStatus.accounts || []).filter(a => a.status === f);
+    },
+
+    get harvestProgressPercent() {
+      const s = this.harvestStatus;
+      if (!s.total) return 0;
+      return Math.round(((s.success + s.failed) / s.total) * 100);
     },
 
     get groupedRegistryModels() {
@@ -1582,6 +1633,15 @@ function app() {
         if (!this.harvestStatus.running && this.page !== 'harvest') return;
         this.fetchHarvestStatus();
       }, 2000);
+      // Independent 1-second wall-clock tick so the elapsed/ETA labels keep
+      // animating between status polls. Unlike fetchHarvestStatus this does
+      // not hit the server — it only updates `harvestNow`.
+      if (this.harvestNowTimer) clearInterval(this.harvestNowTimer);
+      this.harvestNowTimer = setInterval(() => {
+        if (this.harvestStatus.running) {
+          this.harvestNow = Math.floor(Date.now() / 1000);
+        }
+      }, 1000);
     },
     async fetchHarvestStatus() {
       try {
@@ -1590,11 +1650,27 @@ function app() {
           this.harvestStatus = await r.json();
           if (!this.harvestStatus.logs) this.harvestStatus.logs = [];
           if (!this.harvestStatus.accounts) this.harvestStatus.accounts = [];
+          this.harvestNow = Math.floor(Date.now() / 1000);
           if (!this.harvestStatus.running && this.harvestStatus.success > 0) {
             this.fetchAccounts(); this.fetchStats(); this.fetchProviders(); this.buildOverviewStats();
           }
         }
       } catch (e) {}
+    },
+
+    // Builds a one-line digest of the latest run. Useful for posting status
+    // updates into a chat or just reading at a glance after a long batch.
+    async copyHarvestSummary() {
+      const s = this.harvestStatus;
+      const elapsed = this.formatDuration(this.harvestElapsed);
+      const successRate = s.total > 0 ? Math.round((s.success / s.total) * 100) : 0;
+      const summary = `Harvest ${s.provider || 'ag'}: ${s.success}/${s.total} success (${successRate}%), ${s.failed} failed, ${elapsed}`;
+      try {
+        await navigator.clipboard.writeText(summary);
+        this.toast('Summary copied', { kind: 'success' });
+      } catch (e) {
+        this.toast('Copy failed: ' + e.message, { kind: 'error' });
+      }
     },
 
     // Settings

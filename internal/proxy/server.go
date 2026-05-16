@@ -118,7 +118,16 @@ func Start(cfg *config.Config, database *db.Database) error {
 	// Middleware
 	r.Use(quietLogger)
 	r.Use(middleware.Recoverer)
-	r.Use(middleware.Timeout(120 * time.Second))
+	// NOTE: we deliberately do NOT install a global `middleware.Timeout`
+	// here. Chi's timeout middleware cancels the request context after a
+	// fixed duration, which is fine for short management calls but
+	// catastrophic for streaming endpoints — `/v1/chat/completions` keeps
+	// the connection open while the upstream tokens trickle in, and a
+	// 120s cap there manifests as "stuck" responses + the
+	// `superfluous response.WriteHeader call from … Timeout` warning we
+	// were seeing in the log. The chat handler already enforces its own
+	// per-attempt budgets via the upstream HTTP client + retry loop, so
+	// the global timeout is redundant safety on top of fragility.
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   []string{"*"},
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},

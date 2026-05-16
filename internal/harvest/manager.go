@@ -140,34 +140,45 @@ func Setup(harvestDir string) error {
 	}
 
 	// Step 3: Install dependencies
-	fmt.Print("3. Installing dependencies... ")
+	fmt.Println("3. Installing dependencies (this can take 3-8 minutes)...")
 	pip := GetVenvPython(harvestDir)
 
-	installCmd := exec.Command(pip, "-m", "pip", "install", "-r", "requirements.txt", "-q")
+	// Stream pip output live to stdout/stderr so the operator can watch
+	// the install progress instead of staring at a frozen terminal. The
+	// previous CombinedOutput() + -q flag combo only emitted text on
+	// failure, which made every successful run look like a hang. We
+	// also drop -q so pip prints package downloads as they happen.
+	installCmd := exec.Command(pip, "-m", "pip", "install", "-r", "requirements.txt", "--progress-bar", "on")
 	installCmd.Dir = harvestDir
-	if out, err := installCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("failed: %s\n%s", err, string(out))
+	installCmd.Stdout = os.Stdout
+	installCmd.Stderr = os.Stderr
+	if err := installCmd.Run(); err != nil {
+		return fmt.Errorf("pip install failed: %w", err)
 	}
-	fmt.Println("OK")
+	fmt.Println("   OK")
 
 	// Step 4: Install Playwright Firefox
-	fmt.Print("4. Installing Playwright Firefox... ")
+	fmt.Println("4. Installing Playwright Firefox (downloads ~80MB browser)...")
 	pwCmd := exec.Command(pip, "-m", "playwright", "install", "firefox")
 	pwCmd.Dir = harvestDir
-	if out, err := pwCmd.CombinedOutput(); err != nil {
-		fmt.Printf("Warning: %s\n", string(out))
+	pwCmd.Stdout = os.Stdout
+	pwCmd.Stderr = os.Stderr
+	if err := pwCmd.Run(); err != nil {
+		fmt.Printf("   Warning: playwright install failed: %v\n", err)
 	} else {
-		fmt.Println("OK")
+		fmt.Println("   OK")
 	}
 
 	// Step 5: Download Camoufox
-	fmt.Print("5. Downloading Camoufox browser... ")
+	fmt.Println("5. Downloading Camoufox browser (downloads ~120MB anti-detect Firefox)...")
 	cfCmd := exec.Command(pip, "-m", "camoufox", "fetch")
 	cfCmd.Dir = harvestDir
-	if out, err := cfCmd.CombinedOutput(); err != nil {
-		fmt.Printf("Warning: %s\n", string(out))
+	cfCmd.Stdout = os.Stdout
+	cfCmd.Stderr = os.Stderr
+	if err := cfCmd.Run(); err != nil {
+		fmt.Printf("   Warning: camoufox fetch failed: %v\n", err)
 	} else {
-		fmt.Println("OK")
+		fmt.Println("   OK")
 	}
 
 	fmt.Println()

@@ -1028,7 +1028,7 @@ tailwind.config={theme:{extend:{colors:{
         <div class="grid grid-cols-3 gap-4 mb-4">
           <div><div class="text-[10px] text-txt-3 uppercase mb-1.5">Provider</div><select x-model="harvest.provider" class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm text-txt-1 focus:outline-none focus:border-brand"><option value="ag">Antigravity</option></select></div>
           <div><div class="text-[10px] text-txt-3 uppercase mb-1.5">Concurrency</div><select x-model="harvest.concurrency" class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm text-txt-1 focus:outline-none focus:border-brand"><option>1</option><option>2</option><option>3</option><option selected>4</option><option>6</option><option>8</option></select></div>
-          <div><div class="text-[10px] text-txt-3 uppercase mb-1.5">Mode</div><select x-model="harvest.headless" class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm text-txt-1 focus:outline-none focus:border-brand"><option value="false">Headed</option><option value="true">Headless</option></select></div>
+          <div><div class="text-[10px] text-txt-3 uppercase mb-1.5">Mode</div><select x-model="harvest.headless" class="w-full px-3 py-2 bg-surface-1 border border-bdr rounded-lg text-sm text-txt-1 focus:outline-none focus:border-brand"><option value="true">Headless</option><option value="false">Headed</option></select></div>
         </div>
         <textarea x-model="harvest.accounts" rows="5" class="w-full px-4 py-3 bg-surface-1 border border-bdr rounded-lg text-xs font-mono text-txt-1 placeholder-txt-3 focus:outline-none focus:border-brand resize-y" placeholder="email1@gmail.com:password123&#10;email2@gmail.com:password456"></textarea>
         <div class="flex items-center justify-between mt-3">
@@ -1041,24 +1041,45 @@ tailwind.config={theme:{extend:{colors:{
       </div>
       <div x-show="harvestStatus.total>0||harvestStatus.running" class="bg-surface-2 border border-bdr rounded-xl p-6 mb-4">
         <div class="flex items-center justify-between mb-4">
-          <span class="text-xs text-txt-3 uppercase tracking-wider">Progress</span>
-          <span x-show="harvestStatus.running" class="text-[11px] text-ok flex items-center gap-1.5"><span class="w-1.5 h-1.5 rounded-full bg-ok animate-pulse"></span>Running</span>
-          <span x-show="!harvestStatus.running&&harvestStatus.total>0" class="text-[11px] text-txt-3">Done</span>
+          <div class="flex items-center gap-3">
+            <span class="text-xs text-txt-3 uppercase tracking-wider">Progress</span>
+            <span x-show="harvestStatus.running" class="text-[11px] text-ok flex items-center gap-1.5"><span class="w-1.5 h-1.5 rounded-full bg-ok animate-pulse"></span>Running</span>
+            <span x-show="!harvestStatus.running&&harvestStatus.total>0" class="text-[11px] text-txt-3">Done</span>
+            <span class="text-[11px] text-txt-3 font-mono" x-text="harvestProgressPercent+'%'"></span>
+          </div>
+          <button @click="copyHarvestSummary()" x-show="harvestStatus.total>0" class="px-2.5 py-1 bg-surface-1 border border-bdr text-txt-2 text-[11px] rounded-md hover:text-brand-light hover:border-brand transition-all flex items-center gap-1">
+            <span class="material-symbols-outlined text-[14px]">content_copy</span> Summary
+          </button>
         </div>
-        <div class="grid grid-cols-3 gap-3 mb-4">
+        <!-- Slim progress bar so the % label above isn't the only feedback. -->
+        <div class="h-1.5 bg-surface-1 rounded-full overflow-hidden mb-4">
+          <div class="h-full bg-brand transition-all duration-300" :style="`width: ${harvestProgressPercent}%`"></div>
+        </div>
+        <div class="grid grid-cols-3 sm:grid-cols-6 gap-3">
           <div class="bg-surface-1 border border-bdr rounded-lg p-3 text-center"><div class="text-[10px] text-txt-3 uppercase">Success</div><div class="text-lg font-bold font-mono text-ok" x-text="harvestStatus.success"></div></div>
           <div class="bg-surface-1 border border-bdr rounded-lg p-3 text-center"><div class="text-[10px] text-txt-3 uppercase">Failed</div><div class="text-lg font-bold font-mono text-err" x-text="harvestStatus.failed"></div></div>
           <div class="bg-surface-1 border border-bdr rounded-lg p-3 text-center"><div class="text-[10px] text-txt-3 uppercase">Total</div><div class="text-lg font-bold font-mono" x-text="harvestStatus.total"></div></div>
+          <div class="bg-surface-1 border border-bdr rounded-lg p-3 text-center"><div class="text-[10px] text-txt-3 uppercase">Active</div><div class="text-lg font-bold font-mono text-warn" x-text="harvestStatus.active||0"></div></div>
+          <div class="bg-surface-1 border border-bdr rounded-lg p-3 text-center"><div class="text-[10px] text-txt-3 uppercase">Elapsed</div><div class="text-lg font-bold font-mono text-txt-2" x-text="formatDuration(harvestElapsed)"></div></div>
+          <div class="bg-surface-1 border border-bdr rounded-lg p-3 text-center"><div class="text-[10px] text-txt-3 uppercase">ETA</div><div class="text-lg font-bold font-mono text-txt-2" x-text="harvestETA?formatDuration(harvestETA):'-'"></div></div>
         </div>
       </div>
       <div x-show="harvestStatus.accounts && harvestStatus.accounts.length>0" class="bg-surface-2 border border-bdr rounded-xl overflow-hidden mb-4">
-        <div class="px-4 py-3 border-b border-bdr text-xs text-txt-3 uppercase tracking-wider">Per-Account Status</div>
+        <div class="px-4 py-3 border-b border-bdr flex items-center justify-between">
+          <div class="text-xs text-txt-3 uppercase tracking-wider">Per-Account Status</div>
+          <!-- Status filter pills. Click to scope the table to one bucket. -->
+          <div class="flex items-center gap-1">
+            <template x-for="opt in [{v:'all',l:'All'},{v:'pending',l:'Pending'},{v:'running',l:'Running'},{v:'success',l:'Success'},{v:'failed',l:'Failed'}]" :key="opt.v">
+              <button @click="harvest.filter=opt.v" class="px-2 py-1 text-[10px] rounded-md uppercase tracking-wider transition-all" :class="harvest.filter===opt.v?'bg-brand text-white':'bg-surface-1 border border-bdr text-txt-3 hover:text-txt-1'" x-text="opt.l"></button>
+            </template>
+          </div>
+        </div>
         <table class="w-full text-sm">
           <thead><tr class="border-b border-bdr text-[11px] text-txt-3 uppercase tracking-wider">
             <th class="text-left py-2 px-4 w-12">#</th><th class="text-left py-2 px-4">Email</th><th class="text-left py-2 px-4">Status</th><th class="text-left py-2 px-4">Time</th><th class="text-left py-2 px-4">Detail</th>
           </tr></thead>
           <tbody>
-            <template x-for="(a, i) in harvestStatus.accounts" :key="i">
+            <template x-for="(a, i) in filteredHarvestAccounts" :key="a.email">
               <tr class="border-b border-bdr-light">
                 <td class="py-2 px-4 text-txt-3 font-mono text-xs" x-text="i+1"></td>
                 <td class="py-2 px-4 font-mono text-xs" x-text="a.email"></td>
@@ -1072,6 +1093,9 @@ tailwind.config={theme:{extend:{colors:{
                 <td class="py-2 px-4 text-xs text-txt-2" x-text="a.detail||'-'"></td>
               </tr>
             </template>
+            <tr x-show="filteredHarvestAccounts.length===0">
+              <td colspan="5" class="py-6 text-center text-xs text-txt-3" x-text="'No accounts match filter: '+harvest.filter"></td>
+            </tr>
           </tbody>
         </table>
       </div>

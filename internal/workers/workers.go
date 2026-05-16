@@ -210,12 +210,42 @@ func checkHealth(cfg *config.Config, database *db.Database) {
 			if err := json.Unmarshal(account.Credentials, &creds); err != nil {
 				continue
 			}
-			_, _, err := antigravity.LoadCodeAssist(creds.AccessToken)
-			if err != nil {
-				log.Printf("[HEALTH] AG %s unhealthy: %v", account.Email, err)
-				database.MarkAccountError(account.ID, "health_check_failed: "+err.Error(), 0)
+			// Try once with the cached access token. Most accounts pass here
+			// because the refresh worker already topped them up.
+			//
+			// If we hit a 401/403 we DON'T fail the account immediately —
+			// the access token may simply have expired between refresher
+			// ticks (the refresh window is "expires_at - 10 min"; a token
+			// that died at minute 11 would still be presented here).
+			// We attempt one refresh + retry; only if THAT fails do we
+			// record an error. Mirrors the on-demand `handleRefreshQuota`
+			// flow so manual and automated paths agree.
+			_, _, hcErr := antigravity.LoadCodeAssist(creds.AccessToken)
+			if hcErr != nil && creds.RefreshToken != "" {
+				if refreshed, rErr := antigravity.RefreshToken(cfg, &account); rErr == nil {
+					credsJSON, _ := json.Marshal(refreshed)
+					if uErr := database.UpdateAccountCredentials(account.ID, credsJSON); uErr != nil {
+						log.Printf("[HEALTH] AG persist refreshed creds %s: %v", account.Email, uErr)
+					}
+					account.Credentials = credsJSON
+					_, _, hcErr = antigravity.LoadCodeAssist(refreshed.AccessToken)
+				} else if isAGUnrecoverable(rErr) {
+					// Refresh-token revoked. Quarantine instead of leaving
+					// the account active and re-failing every 15 minutes.
+					log.Printf("[HEALTH] AG DEAD %s: %v — quarantining", account.Email, rErr)
+					_ = database.SetAccountStatus(account.ID, "disabled", "health_refresh_unrecoverable: "+rErr.Error())
+					continue
+				} else {
+					// Transient refresh failure (network, 5xx). Treat the
+					// whole healthcheck as transient too.
+					hcErr = rErr
+				}
+			}
+			if hcErr != nil {
+				log.Printf("[HEALTH] AG %s unhealthy: %v", account.Email, hcErr)
+				_ = database.MarkAccountError(account.ID, "health_check_failed: "+hcErr.Error(), 0)
 			} else {
-				database.MarkAccountSuccess(account.ID)
+				_ = database.MarkAccountSuccess(account.ID)
 			}
 		}
 	}

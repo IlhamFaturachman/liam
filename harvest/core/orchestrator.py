@@ -23,6 +23,27 @@ WORKER_START_DELAY = (2000, 5000)
 MAX_RETRY_ATTEMPTS = 1
 
 
+async def _maybe_await(callback, *args):
+    """Invoke a user-supplied callback transparently for sync OR async funcs.
+
+    The standalone FastAPI UI registers an async broadcast handler (websocket
+    fanout). The embedded Go-driven runner registers a plain `print(...)` for
+    line-delimited JSON streaming. Both must work without the orchestrator
+    knowing which it is — otherwise sync callbacks raise `TypeError: object
+    NoneType is not awaitable`, which silently kills every per-account hook.
+    """
+    if callback is None:
+        return
+    try:
+        result = callback(*args)
+        if asyncio.iscoroutine(result):
+            await result
+    except Exception:
+        # A bad callback shouldn't take the whole batch down. The websocket
+        # handler is the only sane place to handle errors anyway.
+        pass
+
+
 class BatchState(str, Enum):
     IDLE = "idle"
     RUNNING = "running"
@@ -59,10 +80,24 @@ class Orchestrator:
         self._total_processed: int = 0
         self._start_time: float = 0
         self._on_update: Optional[Callable] = None
+        # Per-account hooks. Fire as soon as a worker finishes one account so
+        # downstream consumers (e.g. the embedded Go harvest service driving
+        # the dashboard tab) can persist + display results immediately
+        # instead of waiting for the entire batch to drain.
+        self._on_result: Optional[Callable] = None
+        self._on_failed: Optional[Callable] = None
         self._proxy_index: int = 0
 
     def set_update_callback(self, callback: Callable):
         self._on_update = callback
+
+    def set_result_callback(self, callback: Callable):
+        """Called with the result dict each time an account succeeds."""
+        self._on_result = callback
+
+    def set_failed_callback(self, callback: Callable):
+        """Called with the failure dict each time an account fails terminally."""
+        self._on_failed = callback
 
     def set_proxies(self, proxies: list[str]):
         self.proxies = [p.strip() for p in proxies if p.strip()]
@@ -155,41 +190,49 @@ class Orchestrator:
                 )
 
                 elapsed = round(time.time() - start_time, 1)
-                self.results.append({**result.to_dict(), "time": elapsed})
+                result_dict = {**result.to_dict(), "time": elapsed}
+                self.results.append(result_dict)
                 self.account_statuses[email] = {
                     "status": AccountStatus.SUCCESS,
                     "detail": f"Done in {elapsed}s",
                     "time": elapsed,
                 }
+                # Fire per-account hook BEFORE the global notify so consumers
+                # see the result first, then a fresh aggregate snapshot.
+                await self._fire_result(result_dict)
 
             except BatchLoginError as e:
                 elapsed = round(time.time() - start_time, 1)
-                self.failed.append({
+                fail = {
                     "email": email, "password": account["password"],
                     "error": e.message, "error_code": e.code.value,
                     "retryable": e.retryable,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
-                })
+                }
+                self.failed.append(fail)
                 self.account_statuses[email] = {
                     "status": AccountStatus.FAILED,
                     "detail": f"{e.code.value}: {e.message[:40]}",
                     "time": elapsed,
                 }
+                await self._fire_failed(fail)
 
             except Exception as e:
                 elapsed = round(time.time() - start_time, 1)
                 classified = classify_exception(e)
-                self.failed.append({
+                fail = {
                     "email": email, "password": account["password"],
                     "error": str(e), "error_code": classified.code.value,
                     "retryable": classified.retryable,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
-                })
+                }
+                self.failed.append(fail)
                 self.account_statuses[email] = {
                     "status": AccountStatus.FAILED,
                     "detail": str(e)[:50],
                     "time": elapsed,
                 }
+                await self._fire_failed(fail)
 
             finally:
                 self._active_workers -= 1
@@ -239,8 +282,13 @@ class Orchestrator:
             asyncio.ensure_future(self._notify_update())
 
     async def _notify_update(self):
-        if self._on_update:
-            await self._on_update(self.get_status())
+        await _maybe_await(self._on_update, self.get_status())
+
+    async def _fire_result(self, result: dict):
+        await _maybe_await(self._on_result, result)
+
+    async def _fire_failed(self, failure: dict):
+        await _maybe_await(self._on_failed, failure)
 
     def get_status(self) -> dict:
         total = len(self.accounts)

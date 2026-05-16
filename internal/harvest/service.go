@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"time"
 
 	"github.com/liam-auto/liam/internal/config"
 	"github.com/liam-auto/liam/internal/db"
@@ -24,18 +25,21 @@ type HarvestService struct {
 }
 
 type HarvestStatus struct {
-	Running  bool                    `json:"running"`
-	Provider string                  `json:"provider,omitempty"`
-	Total    int                     `json:"total"`
-	Success  int                     `json:"success"`
-	Failed   int                     `json:"failed"`
-	Logs     []string                `json:"logs"`
-	Accounts []HarvestAccountStatus  `json:"accounts"`
+	Running   bool                   `json:"running"`
+	Provider  string                 `json:"provider,omitempty"`
+	Total     int                    `json:"total"`
+	Success   int                    `json:"success"`
+	Failed    int                    `json:"failed"`
+	Active    int                    `json:"active"`     // workers currently running an account
+	StartedAt int64                  `json:"started_at"` // unix epoch seconds, 0 when idle
+	EndedAt   int64                  `json:"ended_at"`   // unix epoch seconds, 0 while running
+	Logs      []string               `json:"logs"`
+	Accounts  []HarvestAccountStatus `json:"accounts"`
 }
 
 type HarvestAccountStatus struct {
 	Email   string `json:"email"`
-	Status  string `json:"status"`  // pending, running, success, failed
+	Status  string `json:"status"` // pending, running, success, failed
 	Detail  string `json:"detail"`
 	TimeSec int    `json:"time_sec"`
 }
@@ -56,7 +60,13 @@ func (h *HarvestService) StartBatch(provider string, accounts string, concurrenc
 		return fmt.Errorf("harvest already running")
 	}
 	h.running = true
-	h.status = HarvestStatus{Running: true, Provider: provider, Logs: []string{}, Accounts: []HarvestAccountStatus{}}
+	h.status = HarvestStatus{
+		Running:   true,
+		Provider:  provider,
+		StartedAt: time.Now().Unix(),
+		Logs:      []string{},
+		Accounts:  []HarvestAccountStatus{},
+	}
 	h.mu.Unlock()
 
 	go h.runBatch(provider, accounts, concurrency, headless)
@@ -68,6 +78,8 @@ func (h *HarvestService) runBatch(provider string, accounts string, concurrency 
 		h.mu.Lock()
 		h.running = false
 		h.status.Running = false
+		h.status.Active = 0
+		h.status.EndedAt = time.Now().Unix()
 		h.mu.Unlock()
 	}()
 
@@ -92,7 +104,21 @@ func (h *HarvestService) runBatch(provider string, accounts string, concurrency 
 	}
 	defer os.Remove(tmpFile)
 
-	// Python script that runs batch and outputs JSON results line by line
+	// Python script that runs batch and outputs JSON results line by line.
+	//
+	// Important details:
+	//   - We register `on_result` and `on_failed` so the Go side gets each
+	//     account as soon as the worker finishes it. Without these the Go
+	//     `result`/`failed` lines only emit AFTER `orch.start()` returns,
+	//     which can be 10+ minutes for a 50-account batch — so the dashboard
+	//     looks frozen the whole time and accounts don't land in the DB.
+	//   - The progress callback uses `account_status` events: one line per
+	//     status change keyed by email so the Go side can update the
+	//     per-account table without re-shipping the entire status map every
+	//     event (which would amplify N² for big batches).
+	//   - All callbacks are PLAIN sync functions — orchestrator's
+	//     `_maybe_await` handles both shapes, so we get cheap stdout writes
+	//     without dragging an event loop through every progress tick.
 	script := fmt.Sprintf(`
 import sys, asyncio, json
 sys.path.insert(0, '.')
@@ -106,23 +132,53 @@ if not accounts:
     print(json.dumps({"type":"error","message":"No valid accounts found"}), flush=True)
     sys.exit(1)
 
-print(json.dumps({"type":"status","total":len(accounts),"message":f"Loaded {len(accounts)} accounts"}), flush=True)
+print(json.dumps({
+    "type":"status",
+    "total":len(accounts),
+    "message":f"Loaded {len(accounts)} accounts",
+    "accounts":[a["email"] for a in accounts],
+}), flush=True)
 
 provider = get_provider('%s')
 orch = Orchestrator()
 orch.load_accounts(accounts)
 
+# Track which accounts we've already pushed a row for so we can rate-limit
+# noisy "running" status updates without dropping the first/last for each.
+_last_status = {}
+
 def on_update(status):
-    import asyncio
-    print(json.dumps({"type":"progress","data":status}), flush=True)
+    # Aggregate snapshot — the Go side uses this to drive per-account rows.
+    # We translate it into one "account_status" line per email so processLine
+    # only has to update the affected row instead of replacing the table.
+    for email, info in (status.get("accounts") or {}).items():
+        new_status = info.get("status", "")
+        new_detail = info.get("detail", "")
+        new_time = info.get("time", 0)
+        prev = _last_status.get(email)
+        if prev == (new_status, new_detail):
+            continue
+        _last_status[email] = (new_status, new_detail)
+        print(json.dumps({
+            "type":"account_status",
+            "email":email,
+            "status":new_status,
+            "detail":new_detail,
+            "time_sec":new_time,
+        }), flush=True)
+
+def on_result(r):
+    print(json.dumps({"type":"result","data":r}), flush=True)
+
+def on_failed(f):
+    print(json.dumps({"type":"failed","data":f}), flush=True)
+
+orch.set_update_callback(on_update)
+orch.set_result_callback(on_result)
+orch.set_failed_callback(on_failed)
 
 async def run():
     await orch.start(provider=provider, concurrency=%d, headless=%s)
-    # Output results
-    for r in orch.results:
-        print(json.dumps({"type":"result","data":r}), flush=True)
-    for f in orch.failed:
-        print(json.dumps({"type":"failed","data":f}), flush=True)
     print(json.dumps({"type":"done","success":len(orch.results),"failed":len(orch.failed)}), flush=True)
 
 asyncio.run(run())
@@ -171,8 +227,11 @@ func (h *HarvestService) processLine(line string) {
 		total, _ := msg["total"].(float64)
 		h.mu.Lock()
 		h.status.Total = int(total)
-		// Initialize account list from accounts field if present
+		// Initialize account list from accounts field if present so the
+		// dashboard can show every queued email immediately, with status
+		// "pending" until the first worker picks it up.
 		if accs, ok := msg["accounts"].([]interface{}); ok {
+			h.status.Accounts = h.status.Accounts[:0]
 			for _, a := range accs {
 				if email, ok := a.(string); ok {
 					h.status.Accounts = append(h.status.Accounts, HarvestAccountStatus{
@@ -190,9 +249,15 @@ func (h *HarvestService) processLine(line string) {
 		detail, _ := msg["detail"].(string)
 		timeSec, _ := msg["time_sec"].(float64)
 		h.mu.Lock()
+		// Track per-status transitions to keep an accurate `active` count
+		// without needing a separate event from Python. The orchestrator
+		// transitions are pending → running → success|failed (or retrying),
+		// so we only flip the counter when the status changes.
+		var prevStatus string
 		found := false
 		for i := range h.status.Accounts {
 			if h.status.Accounts[i].Email == email {
+				prevStatus = h.status.Accounts[i].Status
 				h.status.Accounts[i].Status = status
 				h.status.Accounts[i].Detail = detail
 				h.status.Accounts[i].TimeSec = int(timeSec)
@@ -205,31 +270,43 @@ func (h *HarvestService) processLine(line string) {
 				Email: email, Status: status, Detail: detail, TimeSec: int(timeSec),
 			})
 		}
+		// Active workers transitions:
+		//   anything → "running": active++
+		//   "running" → success/failed/done: active--
+		if prevStatus != "running" && status == "running" {
+			h.status.Active++
+		} else if prevStatus == "running" && (status == "success" || status == "failed") {
+			if h.status.Active > 0 {
+				h.status.Active--
+			}
+		}
 		h.mu.Unlock()
 
 	case "progress":
-		// Silent update
+		// Reserved: per-tick aggregate snapshots. Currently unused — we
+		// derive everything from `account_status` to keep the wire small
+		// and avoid the N² status fanout of full-table updates.
 
 	case "result":
 		data, _ := msg["data"].(map[string]interface{})
 		if data != nil {
-			h.mu.Lock()
-			h.status.Success++
-			h.mu.Unlock()
 			h.importResult(data)
 			email, _ := data["email"].(string)
 			h.addLog(fmt.Sprintf("SUCCESS: %s", email))
+			h.mu.Lock()
+			h.status.Success++
+			h.mu.Unlock()
 		}
 
 	case "failed":
 		data, _ := msg["data"].(map[string]interface{})
-		h.mu.Lock()
-		h.status.Failed++
-		h.mu.Unlock()
 		if data != nil {
 			email, _ := data["email"].(string)
 			errMsg, _ := data["error"].(string)
 			h.addLog(fmt.Sprintf("FAILED: %s - %s", email, errMsg))
+			h.mu.Lock()
+			h.status.Failed++
+			h.mu.Unlock()
 		}
 
 	case "done":
@@ -349,5 +426,3 @@ func boolToPython(b bool) string {
 	}
 	return "False"
 }
-
-// Ensure io import is used
