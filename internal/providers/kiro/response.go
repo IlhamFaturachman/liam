@@ -58,11 +58,29 @@ func translateStreamingResponse(body io.ReadCloser, model string) io.ReadCloser 
 		for {
 			frame, err := readEventStreamFrame(body)
 			if err != nil {
-				if err != io.EOF {
-					// Best effort — flush what we have
-				}
-				// Send finish + DONE
+				// Determine the right finish reason. If we end the
+				// stream while a tool call is still mid-flight (we
+				// never saw its terminating Stop=true frame, or its
+				// accumulated arguments don't parse as valid JSON),
+				// surface "length" so consumers know the payload is
+				// truncated rather than complete. This prevents
+				// callers like OpenCode from feeding a half-formed
+				// `{"filePath": "..."` into JSON.parse and exploding
+				// with the dreaded "Expected '}'" error.
 				stopReason := "stop"
+				if state.activeToolID != "" {
+					stopReason = "length"
+				} else {
+					for _, acc := range state.toolCalls {
+						if !isCompleteJSON(acc.args) {
+							stopReason = "length"
+							break
+						}
+					}
+				}
+				if len(state.toolCalls) > 0 && stopReason == "stop" {
+					stopReason = "tool_calls"
+				}
 				emitChunk(pw, state, nil, &stopReason)
 				fmt.Fprintf(pw, "data: [DONE]\n\n")
 				return
@@ -434,4 +452,21 @@ func translateNonStreamingResponse(body io.ReadCloser, model string) ([]byte, er
 		"model":   model,
 		"choices": []interface{}{},
 	})
+}
+
+// isCompleteJSON reports whether the given string is a valid, fully-closed
+// JSON document. We use this to detect tool-call argument streams that got
+// truncated mid-flight (e.g. upstream connection reset), so we can flag the
+// completion with finish_reason="length" instead of "stop"/"tool_calls" and
+// give downstream callers a chance to retry instead of feeding broken JSON
+// straight into their parser.
+//
+// An empty string counts as "complete" because some tool calls legitimately
+// take zero arguments, and we don't want to false-flag those.
+func isCompleteJSON(s string) bool {
+	if s == "" {
+		return true
+	}
+	var v any
+	return json.Unmarshal([]byte(s), &v) == nil
 }

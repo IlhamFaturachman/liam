@@ -20,10 +20,34 @@ type Executor struct {
 	client *http.Client
 }
 
-// NewExecutor creates a new Kiro executor
+// NewExecutor creates a new Kiro executor.
+//
+// We deliberately do NOT set http.Client.Timeout: that field caps the
+// entire request lifecycle including streaming body reads, which would
+// truncate long Kiro EventStream responses (commonly 5–20 minutes for
+// agentic coding tasks). Mid-stream truncation surfaces downstream as
+// half-formed tool calls like
+//
+//	{"filePath": "/path/to/file.md"
+//
+// which then explodes in the consumer's JSON.parse with the dreaded
+// "Expected '}'" error. Instead we install a custom Transport whose
+// ResponseHeaderTimeout caps the *time-to-first-byte* (so a hung
+// upstream still surfaces quickly) without bounding the streaming body.
+// See CLIProxyAPI's AGENTS.md: "after an upstream connection is
+// established, do not set timeouts for any subsequent network behavior."
 func NewExecutor() *Executor {
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          50,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
 	return &Executor{
-		client: &http.Client{Timeout: 120 * time.Second},
+		client: &http.Client{Transport: transport},
 	}
 }
 

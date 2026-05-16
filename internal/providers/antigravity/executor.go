@@ -51,13 +51,31 @@ type Executor struct {
 	client *http.Client
 }
 
-// NewExecutor creates a new Antigravity executor
+// NewExecutor creates a new Antigravity executor.
+//
+// We deliberately do NOT set http.Client.Timeout: that field caps the
+// entire request lifecycle including streaming body reads, which would
+// truncate long Gemini Code Assist SSE responses (commonly multi-minute
+// for agentic tasks). Mid-stream truncation surfaces downstream as
+// half-formed tool calls (incomplete JSON arguments) that then fail
+// the consumer's parser with "Expected '}'". Instead we install a
+// custom Transport whose ResponseHeaderTimeout caps time-to-first-byte
+// without bounding the streaming body. See CLIProxyAPI's AGENTS.md:
+// "after an upstream connection is established, do not set timeouts
+// for any subsequent network behavior."
 func NewExecutor(cfg *config.Config) *Executor {
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          50,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
 	return &Executor{
-		cfg: cfg,
-		client: &http.Client{
-			Timeout: 120 * time.Second,
-		},
+		cfg:    cfg,
+		client: &http.Client{Transport: transport},
 	}
 }
 
