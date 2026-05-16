@@ -20,14 +20,6 @@ var nonRetryableKeywords = []string{
 	"invalid_api_key",
 	"billing_not_active",
 	"unsupported_model",
-	// "Improperly formed request" is Kiro upstream rejecting our payload
-	// shape (translator bug or malformed multimodal input). All accounts
-	// hit the same rejection, so retrying / cooling down is pointless —
-	// return the error straight to the caller so the integrator can fix
-	// the request.
-	"improperly formed request",
-	"Improperly formed request",
-	"ImproperlyFormedRequest",
 }
 
 // Non-retryable status codes (when combined with error keywords)

@@ -38,14 +38,22 @@ type OpenAIMessage struct {
 }
 
 type OpenAIToolCall struct {
-	ID       string             `json:"id"`
-	Type     string             `json:"type"`
+	// Index is REQUIRED on streaming chunks per the OpenAI spec — clients
+	// (OpenCode, Vercel AI SDK, the OpenAI SDK itself) use it to assemble
+	// tool-call argument deltas across multiple chunks. Without it the
+	// arguments stream is dropped and the client raises errors like
+	// "Missing key at [\"url\"]" when it tries to read the assembled tool
+	// call. We always emit Index 0 (Kiro never streams more than one
+	// tool call concurrently) and send it on every chunk.
+	Index    int                `json:"index"`
+	ID       string             `json:"id,omitempty"`
+	Type     string             `json:"type,omitempty"`
 	Function OpenAIFunctionCall `json:"function"`
 }
 
 type OpenAIFunctionCall struct {
-	Name      string `json:"name"`
-	Arguments string `json:"arguments"`
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
 }
 
 type OpenAITool struct {
