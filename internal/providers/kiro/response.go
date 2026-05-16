@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -110,6 +111,20 @@ type streamState struct {
 	// which then fails its own JSON.parse with "Expected '}'".
 	activeToolID string
 
+	// Inline thinking-block stripper. When `<thinking_mode>enabled</thinking_mode>`
+	// is injected into the user content, Opus 4.6 / Sonnet 4.5 / Sonnet
+	// 4.6 produce their reasoning trace as `<thinking>…</thinking>`
+	// blocks INSIDE the regular `assistantResponseEvent` content stream
+	// — they don't emit a separate `reasoningContentEvent` like Opus 4.7
+	// or DeepSeek do. Without this we'd leak the raw `<thinking>` tags
+	// to the end user. The state machine below routes everything inside
+	// a `<thinking>` block to `reasoning_content` and the rest to
+	// regular `content`, with carry-over for partial tag matches at
+	// chunk boundaries.
+	insideThinking bool
+	thinkingCarry  string // partial "<thinking" or "</thinking" match
+	contentCarry   string // partial "<thinking" outside a block
+
 	// outputCharCount tracks the total characters of assistant content
 	// we forwarded downstream, so we can synthesize a completion-tokens
 	// estimate when Kiro's metricsEvent reports outputTokens=0 (a known
@@ -145,8 +160,7 @@ func handleFrame(w io.Writer, state *streamState, frame *eventFrame) {
 			content = ev.AssistantResponseEvent.Content
 		}
 		if content != "" {
-			state.outputCharCount += len(content)
-			emitChunk(w, state, &OpenAIMsg{Content: &content}, nil)
+			emitAssistantText(w, state, content)
 		}
 
 	case "reasoningContentEvent":
@@ -315,6 +329,116 @@ func handleFrame(w io.Writer, state *streamState, frame *eventFrame) {
 		// stream resilient to upstream additions. Errors surface via
 		// the HTTP status code path before this function ever runs.
 	}
+}
+
+// emitAssistantText splits an incoming assistant text fragment into the
+// portion inside `<thinking>…</thinking>` blocks (routed to
+// reasoning_content) and the portion outside (routed to content). It
+// keeps state on the streamState so partial tag matches at chunk
+// boundaries — `<thi` arriving in one chunk and `nking>` in the next —
+// don't leak through.
+//
+// Sonnet 4.5 / Sonnet 4.6 / Opus 4.6 emit their thinking trace inline
+// like `<thinking>…</thinking>actual answer here`. Opus 4.7 and
+// DeepSeek emit a separate `reasoningContentEvent` instead so they
+// never hit this path. Either way the OpenAI client sees a clean
+// reasoning_content stream + a clean content stream.
+func emitAssistantText(w io.Writer, state *streamState, fragment string) {
+	if fragment == "" {
+		return
+	}
+	const openTag = "<thinking>"
+	const closeTag = "</thinking>"
+
+	for fragment != "" {
+		if state.insideThinking {
+			// Look for closing tag, taking thinkingCarry into account
+			combined := state.thinkingCarry + fragment
+			if idx := strings.Index(combined, closeTag); idx >= 0 {
+				// Emit everything up to the close tag as reasoning,
+				// then return to outside mode.
+				if idx > 0 {
+					reasoning := combined[:idx]
+					emitChunk(w, state, &OpenAIMsg{ReasoningContent: &reasoning}, nil)
+				}
+				consumed := idx + len(closeTag)
+				if consumed >= len(state.thinkingCarry) {
+					fragment = combined[consumed:]
+				} else {
+					fragment = combined[consumed:]
+				}
+				state.thinkingCarry = ""
+				state.insideThinking = false
+				continue
+			}
+			// No close tag yet. Hold the tail that could still match
+			// "</thinking" so we don't split it across chunks.
+			holdback := tagHoldback(combined, closeTag)
+			if holdback > 0 {
+				flush := combined[:len(combined)-holdback]
+				if flush != "" {
+					emitChunk(w, state, &OpenAIMsg{ReasoningContent: &flush}, nil)
+				}
+				state.thinkingCarry = combined[len(combined)-holdback:]
+			} else {
+				if combined != "" {
+					emitChunk(w, state, &OpenAIMsg{ReasoningContent: &combined}, nil)
+				}
+				state.thinkingCarry = ""
+			}
+			return
+		}
+
+		// Outside a thinking block. Look for opening tag.
+		combined := state.contentCarry + fragment
+		if idx := strings.Index(combined, openTag); idx >= 0 {
+			before := combined[:idx]
+			if before != "" {
+				state.outputCharCount += len(before)
+				emitChunk(w, state, &OpenAIMsg{Content: &before}, nil)
+			}
+			fragment = combined[idx+len(openTag):]
+			state.contentCarry = ""
+			state.insideThinking = true
+			continue
+		}
+		// No open tag yet. Hold the tail that could still match
+		// "<thinking" so we don't accidentally emit a "<thi" prefix
+		// as content right before the rest of the tag arrives.
+		holdback := tagHoldback(combined, openTag)
+		if holdback > 0 {
+			flush := combined[:len(combined)-holdback]
+			if flush != "" {
+				state.outputCharCount += len(flush)
+				emitChunk(w, state, &OpenAIMsg{Content: &flush}, nil)
+			}
+			state.contentCarry = combined[len(combined)-holdback:]
+		} else {
+			if combined != "" {
+				state.outputCharCount += len(combined)
+				emitChunk(w, state, &OpenAIMsg{Content: &combined}, nil)
+			}
+			state.contentCarry = ""
+		}
+		return
+	}
+}
+
+// tagHoldback returns how many trailing chars of `s` could still be the
+// start of `tag`. Used to defer flushing chunks that might contain a
+// partial tag at the boundary, so a `<thi` arriving alone doesn't get
+// flushed as user-visible content.
+func tagHoldback(s, tag string) int {
+	max := len(tag) - 1
+	if max > len(s) {
+		max = len(s)
+	}
+	for n := max; n > 0; n-- {
+		if strings.HasPrefix(tag, s[len(s)-n:]) {
+			return n
+		}
+	}
+	return 0
 }
 
 func emitChunk(w io.Writer, state *streamState, delta *OpenAIMsg, finishReason *string) {

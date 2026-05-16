@@ -19,7 +19,7 @@ func (o *OpenCode) SupportsAutoApply() bool { return true }
 
 func (o *OpenCode) ModelSlots() []ModelSlot {
 	return []ModelSlot{
-		{Key: "primary", Label: "Primary Model", Description: "Default model for chat", Default: "ag/claude-opus-4-6-thinking"},
+		{Key: "primary", Label: "Primary Model", Description: "Default model for chat", Default: "kr/claude-opus-4.7"},
 		{Key: "subagent", Label: "Subagent Model", Description: "Used by sub-agents (faster/cheaper)", Default: "ag/claude-sonnet-4-6"},
 	}
 }
@@ -73,7 +73,7 @@ func (o *OpenCode) Apply(cfg ToolConfig) error {
 	primary := cfg.Models["primary"]
 	subagent := cfg.Models["subagent"]
 	if primary == "" {
-		primary = "ag/claude-opus-4-6-thinking"
+		primary = "kr/claude-opus-4.7"
 	}
 	if subagent == "" {
 		subagent = "ag/claude-sonnet-4-6"
@@ -225,7 +225,7 @@ func (o *OpenCode) Snippet(cfg ToolConfig) string {
 	primary := cfg.Models["primary"]
 	subagent := cfg.Models["subagent"]
 	if primary == "" {
-		primary = "ag/claude-opus-4-6-thinking"
+		primary = "kr/claude-opus-4.7"
 	}
 	if subagent == "" {
 		subagent = "ag/claude-sonnet-4-6"

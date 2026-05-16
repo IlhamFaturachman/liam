@@ -11,6 +11,7 @@ import (
 	"image/png"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -48,6 +49,75 @@ var supportedKiroImageFormats = map[string]string{
 }
 
 // translateRequest converts OpenAI chat completion to Kiro AWS CodeWhisperer format
+// resolveThinkingBudget maps an OpenAI-style `reasoning_effort` value
+// onto a Kiro thinking-token budget. Returns 0 to mean "do not enable
+// thinking" — the caller skips the <thinking_mode> tag injection.
+//
+// Budget tiers (mirror 9router + Anthropic's published thinking caps):
+//
+//	"" / "none" / "auto"  →  0      (no tag, native default)
+//	"low"                 →  4_096
+//	"medium"              → 16_000  (also default for bare -thinking suffix)
+//	"high"                → 24_000
+//	"max"                 → 32_000  (Kiro's empirical ceiling — going higher
+//	                                  is silently ignored or rejected)
+//	numeric string        →  parsed integer, clamped 1..32_000
+//
+// isOverlayBypassedModel returns true for Kiro upstream models that
+// either pattern-match the LIAM overlay as a jailbreak (and refuse
+// outright) or don't support extended thinking. Haiku 4.5 has been
+// verified May 2026 to refuse with explicit detection text ("what
+// you've described is a jailbreak pattern…") when the overlay is
+// present. Non-Anthropic Kiro models (Qwen, DeepSeek, GLM, MiniMax)
+// don't need our overlay to behave well because they don't carry the
+// strong "You are Kiro IDE assistant" upstream prompt — they came in
+// from different vendors via the same Kiro plumbing.
+//
+// The list is conservative: only models verified to misbehave with the
+// overlay are bypassed. Everything else (Opus 4.6/4.7, Sonnet 4.5/4.6)
+// keeps the overlay so persona / general-purpose use stays unlocked.
+func isOverlayBypassedModel(upstreamModel string) bool {
+	m := strings.ToLower(upstreamModel)
+	switch {
+	case strings.Contains(m, "haiku"):
+		return true
+	case strings.Contains(m, "minimax"):
+		return true
+	case strings.Contains(m, "qwen"):
+		return true
+	case strings.Contains(m, "deepseek"):
+		return true
+	case strings.Contains(m, "glm"):
+		return true
+	}
+	return false
+}
+
+// Anything else falls back to medium so the operator at least gets
+// some thinking enabled rather than silently no-op'ing.
+func resolveThinkingBudget(effort string) int {
+	const kiroMaxBudget = 32000
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "", "none", "auto":
+		return 0
+	case "low":
+		return 4096
+	case "medium":
+		return 16000
+	case "high":
+		return 24000
+	case "max":
+		return kiroMaxBudget
+	}
+	if n, err := strconv.Atoi(strings.TrimSpace(effort)); err == nil && n > 0 {
+		if n > kiroMaxBudget {
+			n = kiroMaxBudget
+		}
+		return n
+	}
+	return 16000
+}
+
 func translateRequest(model string, body []byte, profileARN string) ([]byte, error) {
 	var openaiReq OpenAIRequest
 	if err := json.Unmarshal(body, &openaiReq); err != nil {
@@ -319,6 +389,16 @@ func translateRequest(model string, body []byte, profileARN string) ([]byte, err
 	// We still attach the timestamp on every currentMessage because
 	// time-of-day is genuinely fresh per turn and doesn't pattern-match
 	// as injection.
+	// Skip the overlay entirely on Haiku 4.5 and lighter models. Smaller
+	// Anthropic models pattern-match the LIAM overlay's "deployment
+	// configuration" framing as a jailbreak and refuse with explicit
+	// detection text. They also don't have extended thinking, so the
+	// reasoning_effort default we apply elsewhere is wasted on them.
+	// Verified May 2026: Haiku 4.5 returns "what you've described is a
+	// jailbreak pattern…" when the overlay is present. Quote/match-list
+	// is conservative — only models known to break are bypassed.
+	overlayBypass := isOverlayBypassedModel(upstreamModel)
+
 	overlayPrefix := liamOverlay + "\n\n"
 	if systemContent != "" {
 		overlayPrefix += "Developer instructions:\n" + strings.TrimSpace(systemContent) + "\n\n"
@@ -328,20 +408,22 @@ func translateRequest(model string, body []byte, profileARN string) ([]byte, err
 	// (history first, falling back to currentMessage when history is
 	// empty / contains only assistant turns).
 	overlayApplied := false
-	for i := range history {
-		if history[i].UserInputMessage == nil {
-			continue
+	if !overlayBypass {
+		for i := range history {
+			if history[i].UserInputMessage == nil {
+				continue
+			}
+			um := history[i].UserInputMessage
+			if strings.TrimSpace(um.Content) != "" {
+				um.Content = overlayPrefix + um.Content
+			} else {
+				um.Content = strings.TrimRight(overlayPrefix, "\n")
+			}
+			overlayApplied = true
+			break
 		}
-		um := history[i].UserInputMessage
-		if strings.TrimSpace(um.Content) != "" {
-			um.Content = overlayPrefix + um.Content
-		} else {
-			um.Content = strings.TrimRight(overlayPrefix, "\n")
-		}
-		overlayApplied = true
-		break
 	}
-	if !overlayApplied {
+	if !overlayApplied && !overlayBypass {
 		// First-turn case: history is empty or has no user messages
 		// yet, so the overlay lives on currentMessage itself.
 		if strings.TrimSpace(currentMessage.Content) != "" {
@@ -351,12 +433,63 @@ func translateRequest(model string, body []byte, profileARN string) ([]byte, err
 			currentMessage.Content = strings.TrimRight(overlayPrefix, "\n")
 		}
 	}
+	// On bypassed models we still need to honour the developer's own
+	// system prompt — we just skip the LIAM overlay around it.
+	if overlayBypass && systemContent != "" {
+		devPrefix := "Developer instructions:\n" + strings.TrimSpace(systemContent) + "\n\n"
+		applied := false
+		for i := range history {
+			if history[i].UserInputMessage == nil {
+				continue
+			}
+			um := history[i].UserInputMessage
+			if strings.TrimSpace(um.Content) != "" {
+				um.Content = devPrefix + um.Content
+			} else {
+				um.Content = strings.TrimRight(devPrefix, "\n")
+			}
+			applied = true
+			break
+		}
+		if !applied {
+			if strings.TrimSpace(currentMessage.Content) != "" {
+				currentMessage.Content = devPrefix + currentMessage.Content
+			} else if currentMessage.UserInputMessageContext == nil ||
+				len(currentMessage.UserInputMessageContext.ToolResults) == 0 {
+				currentMessage.Content = strings.TrimRight(devPrefix, "\n")
+			}
+		}
+	}
 
 	// Always stamp the active turn with a fresh timestamp so the model
 	// has up-to-date time context. Prepending this to currentMessage
 	// (rather than burying it inside the overlay) avoids the
 	// re-injection look while still keeping the data flowing.
 	timestamp := "[Current time: " + currentTimestamp() + "]\n\n"
+
+	// Kiro / AWS CodeWhisperer doesn't honour OpenAI's `reasoning_effort`
+	// or Claude's `thinking` field natively. The only mechanism that
+	// actually turns extended thinking on for Kiro Claude models is the
+	// `<thinking_mode>enabled</thinking_mode>` system tag — same trick
+	// Cursor / AMP / 9router / CLIProxyAPIPlus use. We map the
+	// canonical reasoning levels onto a token budget so users can do
+	//   model="kr/claude-opus-4.7(max)"
+	// in OpenCode and get the same depth as Claude Code's "extended
+	// thinking on max" mode.
+	//
+	// Budget mapping (matches Anthropic's published thinking tiers):
+	//   none / "" → no tag, default behaviour
+	//   low       →  4096
+	//   medium    → 16000  (also the bare-suffix default)
+	//   high      → 32000
+	//   max       → 65536  (capped server-side, but request the ceiling)
+	//   numeric   → use the integer directly (clamped 1..200000)
+	if budget := resolveThinkingBudget(openaiReq.ReasoningEffort); budget > 0 && !overlayBypass {
+		timestamp = fmt.Sprintf(
+			"<thinking_mode>enabled</thinking_mode>\n<max_thinking_length>%d</max_thinking_length>\n\n",
+			budget,
+		) + timestamp
+	}
 	if strings.TrimSpace(currentMessage.Content) != "" {
 		currentMessage.Content = timestamp + currentMessage.Content
 	} else if currentMessage.UserInputMessageContext == nil ||
@@ -394,6 +527,20 @@ func translateRequest(model string, body []byte, profileARN string) ([]byte, err
 	} else {
 		infCfg.MaxTokens = 32000
 	}
+	// When thinking is enabled, the budget is consumed BEFORE the
+	// model emits any visible content — so a small max_tokens set by
+	// the client (e.g. OpenCode's tool-decision pings often request
+	// 400-1000 tokens) gets eaten by the thinking phase and the
+	// caller sees an empty / truncated response. Bump max_tokens to
+	// at least `thinking_budget + 4096` so there's always room for
+	// the answer after the model finishes thinking. We never lower
+	// the client's value, only raise the floor.
+	if budget := resolveThinkingBudget(openaiReq.ReasoningEffort); budget > 0 && !overlayBypass {
+		minHeadroom := budget + 4096
+		if infCfg.MaxTokens < minHeadroom {
+			infCfg.MaxTokens = minHeadroom
+		}
+	}
 	if openaiReq.Temperature != nil {
 		infCfg.Temperature = openaiReq.Temperature
 	}
@@ -407,7 +554,28 @@ func translateRequest(model string, body []byte, profileARN string) ([]byte, err
 		InferenceConfig:   infCfg,
 	}
 
-	return json.Marshal(kiroReq)
+	// Use a json.Encoder with SetEscapeHTML(false) instead of plain
+	// json.Marshal: the latter eagerly escapes "<", ">", "&" as
+	// \u003c \u003e \u0026 (a leftover from when JSON was always
+	// embedded in HTML). That breaks our `<thinking_mode>` /
+	// `<max_thinking_length>` directives — Kiro / Claude only
+	// recognises the literal-angle-bracket form, not the
+	// unicode-escaped one. Without this, persona prompts that
+	// contain XML-style tags also degrade because the model sees
+	// gibberish instead of structured directives.
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(kiroReq); err != nil {
+		return nil, err
+	}
+	// Encoder appends a trailing newline; the upstream tolerates it
+	// but we trim for cleanliness.
+	out := buf.Bytes()
+	if n := len(out); n > 0 && out[n-1] == '\n' {
+		out = out[:n-1]
+	}
+	return out, nil
 }
 
 // extractContentParts walks an OpenAI/Anthropic-style content payload and

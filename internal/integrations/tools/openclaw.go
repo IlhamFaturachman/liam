@@ -19,7 +19,7 @@ func (o *OpenClaw) SupportsAutoApply() bool { return true }
 
 func (o *OpenClaw) ModelSlots() []ModelSlot {
 	return []ModelSlot{
-		{Key: "primary", Label: "Primary Model", Description: "Default model for all agents", Default: "ag/claude-opus-4-6-thinking"},
+		{Key: "primary", Label: "Primary Model", Description: "Default model for all agents", Default: "kr/claude-opus-4.7"},
 	}
 }
 
@@ -65,7 +65,7 @@ func (o *OpenClaw) Apply(cfg ToolConfig) error {
 
 	model := cfg.Models["primary"]
 	if model == "" {
-		model = "ag/claude-opus-4-6-thinking"
+		model = "kr/claude-opus-4.7"
 	}
 
 	mod, _ := cfgMap["models"].(map[string]interface{})
@@ -224,7 +224,7 @@ func (o *OpenClaw) Reset() error {
 func (o *OpenClaw) Snippet(cfg ToolConfig) string {
 	model := cfg.Models["primary"]
 	if model == "" {
-		model = "ag/claude-opus-4-6-thinking"
+		model = "kr/claude-opus-4.7"
 	}
 	return fmt.Sprintf(`{
   "agents": {

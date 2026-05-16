@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -77,6 +78,20 @@ func (e *Executor) ExecuteWithSession(account *db.Account, model string, body []
 	kiroBody, err := translateRequest(model, body, creds.ProfileARN)
 	if err != nil {
 		return nil, fmt.Errorf("translate request: %w", err)
+	}
+
+	// Trace whether thinking-mode is active for this request. Useful for
+	// operators verifying that `model(max)` / `model-thinking` actually
+	// flow through the translator. Only logs when the tag is present;
+	// silent for plain non-thinking calls so the log stays tidy.
+	if bytes.Contains(kiroBody, []byte("<thinking_mode>enabled</thinking_mode>")) {
+		const tag = "<max_thinking_length>"
+		if i := bytes.Index(kiroBody, []byte(tag)); i >= 0 {
+			rest := kiroBody[i+len(tag):]
+			if end := bytes.IndexByte(rest, '<'); end > 0 {
+				log.Printf("[KIRO] thinking enabled, model=%s, budget=%s", model, rest[:end])
+			}
+		}
 	}
 
 	// Build URL

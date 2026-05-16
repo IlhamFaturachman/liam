@@ -10,7 +10,7 @@ import (
 type ToolConfig struct {
 	APIKey      string            `json:"api_key"`
 	BaseURL     string            `json:"base_url"`
-	Models      map[string]string `json:"models"`       // slot name -> model id (e.g. "primary": "ag/claude-opus-4-6-thinking")
+	Models      map[string]string `json:"models"`       // slot name -> model id (e.g. "primary": "kr/claude-opus-4.7")
 	AgentModels map[string]string `json:"agent_models"` // for tools with per-agent overrides (OpenClaw)
 }
 

@@ -18,7 +18,7 @@ func (c *Codex) SupportsAutoApply() bool { return true }
 
 func (c *Codex) ModelSlots() []ModelSlot {
 	return []ModelSlot{
-		{Key: "primary", Label: "Default Model", Description: "Used for all chat requests", Default: "ag/claude-opus-4-6-thinking"},
+		{Key: "primary", Label: "Default Model", Description: "Used for all chat requests", Default: "kr/claude-opus-4.7"},
 	}
 }
 
@@ -50,7 +50,7 @@ func (c *Codex) Apply(cfg ToolConfig) error {
 
 	model := cfg.Models["primary"]
 	if model == "" {
-		model = "ag/claude-opus-4-6-thinking"
+		model = "kr/claude-opus-4.7"
 	}
 
 	existing := ""
@@ -103,7 +103,7 @@ func (c *Codex) Reset() error {
 func (c *Codex) Snippet(cfg ToolConfig) string {
 	model := cfg.Models["primary"]
 	if model == "" {
-		model = "ag/claude-opus-4-6-thinking"
+		model = "kr/claude-opus-4.7"
 	}
 	return fmt.Sprintf(`# ~/.codex/config.toml
 model = "%s"

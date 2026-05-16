@@ -340,6 +340,25 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		body, _ = json.Marshal(req)
 	}
 
+	// Apply the operator-configured Kiro thinking default (LIAM_KIRO_THINKING_DEFAULT)
+	// when the request didn't bring its own DSL suffix. Out-of-the-box
+	// LIAM ships with the default set to "max" so every Kiro Claude
+	// call gets the upstream's full reasoning budget without the user
+	// having to remember the (max) syntax in every model id. Operators
+	// who want lighter / disabled defaults set the env var.
+	//
+	// Note: only applied to Kiro routes. Antigravity / other providers
+	// keep their existing behaviour because their reasoning_effort
+	// semantics are different (-thinking suffix path below).
+	if s.cfg.KiroThinkingDefault != "" && strings.ToLower(s.cfg.KiroThinkingDefault) != "off" {
+		if strings.HasPrefix(model, "kr/") || strings.HasPrefix(model, "kiro/") {
+			if _, ok := req["reasoning_effort"]; !ok {
+				req["reasoning_effort"] = s.cfg.KiroThinkingDefault
+				body, _ = json.Marshal(req)
+			}
+		}
+	}
+
 	// Option C Thinking: handle -thinking suffix (backward compat).
 	//
 	// For Antigravity we map the suffix to reasoning_effort=high and route
