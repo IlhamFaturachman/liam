@@ -107,10 +107,16 @@ func translateRequest(model string, body []byte, profileARN string) ([]byte, err
 			// tool_result blocks may be embedded inside a multimodal user
 			// message (Anthropic style). Forward them as toolResults
 			// instead of dropping to text.
+			//
+			// We do NOT attach an empty editorState here: 9router doesn't
+			// emit one, and we found Kiro's validator rejects payloads
+			// with an empty cursorState alongside an image attachment as
+			// "Improperly formed request". The field is purely an IDE
+			// hint Kiro uses, and dropping it removes a whole class of
+			// 400 errors with zero downside.
 			if results := extractToolResults(msg.Content); len(results) > 0 {
 				um.UserInputMessageContext = &UserInputMessageContext{
 					ToolResults: results,
-					EditorState: &EditorState{CursorState: map[string]interface{}{}},
 				}
 			}
 			history = append(history, ChatMessage{UserInputMessage: um})
@@ -129,7 +135,6 @@ func translateRequest(model string, body []byte, profileARN string) ([]byte, err
 						Status:    "success",
 						Content:   []KiroToolResultContent{{Text: text}},
 					}},
-					EditorState: &EditorState{CursorState: map[string]interface{}{}},
 				},
 			}
 			history = append(history, ChatMessage{UserInputMessage: um})
@@ -192,9 +197,7 @@ func translateRequest(model string, body []byte, profileARN string) ([]byte, err
 		toolSpecs := buildToolSpecs(openaiReq.Tools)
 		if len(toolSpecs) > 0 {
 			if currentMessage.UserInputMessageContext == nil {
-				currentMessage.UserInputMessageContext = &UserInputMessageContext{
-					EditorState: &EditorState{CursorState: map[string]interface{}{}},
-				}
+				currentMessage.UserInputMessageContext = &UserInputMessageContext{}
 			}
 			currentMessage.UserInputMessageContext.Tools = toolSpecs
 		}
@@ -951,9 +954,7 @@ func mergeConsecutiveUserTurns(history []ChatMessage) []ChatMessage {
 				p.Images = append(p.Images, c.Images...)
 				if c.UserInputMessageContext != nil {
 					if p.UserInputMessageContext == nil {
-						p.UserInputMessageContext = &UserInputMessageContext{
-							EditorState: &EditorState{CursorState: map[string]interface{}{}},
-						}
+						p.UserInputMessageContext = &UserInputMessageContext{}
 					}
 					p.UserInputMessageContext.ToolResults = append(
 						p.UserInputMessageContext.ToolResults,
