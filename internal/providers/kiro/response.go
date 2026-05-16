@@ -82,6 +82,16 @@ type streamState struct {
 	toolCalls map[string]*toolCallAccum
 	usage     *OpenAIUsage
 
+	// activeToolID is the toolUseId of the most recent toolUseEvent
+	// that arrived with one. Kiro's upstream emits the start chunk
+	// with the full {toolUseId, name, input_chunk_1} envelope, then
+	// streams the rest of the JSON arguments as bare {input: "..."}
+	// chunks (no toolUseId). Without this fallback we drop every tail
+	// chunk and OpenCode receives a half-formed JSON like
+	//   {"filePath": "/path/to/file.md"
+	// which then fails its own JSON.parse with "Expected '}'".
+	activeToolID string
+
 	// outputCharCount tracks the total characters of assistant content
 	// we forwarded downstream, so we can synthesize a completion-tokens
 	// estimate when Kiro's metricsEvent reports outputTokens=0 (a known
@@ -185,10 +195,21 @@ func handleFrame(w io.Writer, state *streamState, frame *eventFrame) {
 			ev.ToolUseID = ev.ToolUseEvent.ToolUseID
 			ev.Name = ev.ToolUseEvent.Name
 			ev.Input = ev.ToolUseEvent.Input
+			ev.Stop = ev.ToolUseEvent.Stop
+		}
+		// Continuation chunks arrive with only `input` populated — no
+		// toolUseId, no name. Without a fallback they'd be dropped and
+		// OpenCode would parse an unterminated JSON like
+		//   {"filePath": "/path/to/file.md"
+		// triggering "JSON Parse error: Expected '}'". Resolve to the
+		// most recently started toolUse so the args stream keeps flowing.
+		if ev.ToolUseID == "" {
+			ev.ToolUseID = state.activeToolID
 		}
 		if ev.ToolUseID == "" {
 			return
 		}
+		state.activeToolID = ev.ToolUseID
 		acc, ok := state.toolCalls[ev.ToolUseID]
 		if !ok {
 			acc = &toolCallAccum{id: ev.ToolUseID, name: ev.Name}
@@ -211,6 +232,12 @@ func handleFrame(w io.Writer, state *streamState, frame *eventFrame) {
 					Function: OpenAIFunctionCall{Arguments: ev.Input},
 				}},
 			}, nil)
+		}
+		// Stop=true marks the end of THIS tool call's argument stream.
+		// Subsequent toolUseEvent frames belong to a different call, so
+		// clear the active id to force the next one to bring its own.
+		if ev.Stop {
+			state.activeToolID = ""
 		}
 
 	case "messageStopEvent":
