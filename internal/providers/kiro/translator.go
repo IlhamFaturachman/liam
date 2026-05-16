@@ -517,6 +517,13 @@ func translateRequest(model string, body []byte, profileARN string) ([]byte, err
 	// definitions and the current message intact.
 	history = trimHistoryToBudget(history, currentMessage)
 
+	// Trim above can re-introduce orphan tool_results: dropping the
+	// oldest pair removes an assistant turn that emitted a tool_use,
+	// while a later user turn still carries that tool's result. Run
+	// the orphan filter once more after trim so the payload that
+	// actually leaves LIAM is guaranteed clean.
+	history = dropOrphanToolResults(history)
+
 	convState.CurrentMessage = ChatMessage{UserInputMessage: currentMessage}
 	convState.History = history
 
