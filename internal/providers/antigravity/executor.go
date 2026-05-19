@@ -2,11 +2,15 @@ package antigravity
 
 import (
 	"bytes"
-	"crypto/rand"
+	crypto_rand "crypto/rand"
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,10 +19,13 @@ import (
 	"github.com/liam-auto/liam/internal/db"
 )
 
-const (
-	baseURL         = "https://daily-cloudcode-pa.googleapis.com"
+var (
+	baseURLs = []string{
+		"https://daily-cloudcode-pa.googleapis.com",
+		"https://cloudcode-pa.googleapis.com",
+	}
 	apiPath         = "/v1internal"
-	maxOutputTokens = 65536 // No artificial cap - let model use full capacity
+	maxOutputTokens = 65536
 )
 
 // Device profiles for stabilization (pinned per account)
@@ -31,9 +38,7 @@ var deviceProfiles = []string{
 }
 
 // getStableUserAgent returns a per-account stable User-Agent
-// Same account always gets same device profile (prevents fingerprint drift)
 func getStableUserAgent(accountID string) string {
-	// Deterministic selection based on account ID hash
 	hash := 0
 	for _, c := range accountID {
 		hash = hash*31 + int(c)
@@ -52,26 +57,20 @@ type Executor struct {
 }
 
 // NewExecutor creates a new Antigravity executor.
-//
-// We deliberately do NOT set http.Client.Timeout: that field caps the
-// entire request lifecycle including streaming body reads, which would
-// truncate long Gemini Code Assist SSE responses (commonly multi-minute
-// for agentic tasks). Mid-stream truncation surfaces downstream as
-// half-formed tool calls (incomplete JSON arguments) that then fail
-// the consumer's parser with "Expected '}'". Instead we install a
-// custom Transport whose ResponseHeaderTimeout caps time-to-first-byte
-// without bounding the streaming body. See CLIProxyAPI's AGENTS.md:
-// "after an upstream connection is established, do not set timeouts
-// for any subsequent network behavior."
+// We force HTTP/1.1 to match NodeJS behavior (anti-fingerprint).
 func NewExecutor(cfg *config.Config) *Executor {
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
-		ForceAttemptHTTP2:     true,
+		ForceAttemptHTTP2:     false, // Anti-fingerprint: force HTTP/1.1 like CLIProxyAPI
 		MaxIdleConns:          50,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   15 * time.Second,
 		ResponseHeaderTimeout: 60 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+		TLSNextProto:          make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
+		TLSClientConfig: &tls.Config{
+			NextProtos: []string{"http/1.1"},
+		},
 	}
 	return &Executor{
 		cfg:    cfg,
@@ -79,14 +78,11 @@ func NewExecutor(cfg *config.Config) *Executor {
 	}
 }
 
-// Execute sends a request to Antigravity API
 func (e *Executor) Execute(account *db.Account, model string, body []byte, stream bool) (*http.Response, error) {
 	return e.ExecuteWithSession(account, model, body, stream, "")
 }
 
-// ExecuteWithSession sends a request with a stable session ID (for anti-ban + prompt caching)
 func (e *Executor) ExecuteWithSession(account *db.Account, model string, body []byte, stream bool, sessionID string) (*http.Response, error) {
-	// Parse credentials
 	var creds db.AGCredentials
 	if err := json.Unmarshal(account.Credentials, &creds); err != nil {
 		return nil, fmt.Errorf("parse credentials: %w", err)
@@ -96,59 +92,70 @@ func (e *Executor) ExecuteWithSession(account *db.Account, model string, body []
 		return nil, fmt.Errorf("no access token for account %s", account.Email)
 	}
 
-	// Strip "ag/" prefix from model name
 	upstreamModel := strings.TrimPrefix(model, "ag/")
-
-	// Translate OpenAI request to Gemini Cloud Code format
-	geminiBody, err := e.translateRequest(upstreamModel, body, stream, &creds)
+	geminiBody, err := e.translateRequest(upstreamModel, body, stream, &creds, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("translate request: %w", err)
 	}
 
-	// Build URL
 	action := "generateContent"
 	if stream {
 		action = "streamGenerateContent?alt=sse"
 	}
-	url := fmt.Sprintf("%s%s:%s", baseURL, apiPath, action)
 
-	// Build request
-	req, err := http.NewRequest("POST", url, bytes.NewReader(geminiBody))
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
+	var lastErr error
+	var resp *http.Response
 
-	// Headers — use per-account stable User-Agent (device profile stabilization)
-	if sessionID == "" {
-		sessionID = generateSessionID(account.Email)
-	}
 	userAgent := getStableUserAgent(account.ID)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
-	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("X-Machine-Session-Id", sessionID)
-	req.Header.Set("x-request-source", "local")
-	if stream {
-		req.Header.Set("Accept", "text/event-stream")
+
+	for _, baseURL := range baseURLs {
+		url := fmt.Sprintf("%s%s:%s", baseURL, apiPath, action)
+
+		req, err := http.NewRequest("POST", url, bytes.NewReader(geminiBody))
+		if err != nil {
+			return nil, fmt.Errorf("create request: %w", err)
+		}
+
+		req.Close = true // Anti-fingerprint: Connection: close
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
+		req.Header.Set("User-Agent", userAgent)
+		req.Header.Set("x-request-source", "local")
+		if stream {
+			req.Header.Set("Accept", "text/event-stream")
+		}
+
+		resp, err = e.client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue // try fallback
+		}
+
+		if resp.StatusCode == 429 && len(baseURLs) > 1 {
+			// If rate limited, try the next URL if available
+			lastErr = fmt.Errorf("rate limited")
+			// Read and close body to reuse connection
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			continue
+		}
+
+		// Success or final error status
+		break
 	}
 
-	// Execute
-	resp, err := e.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("execute request: %w", err)
+	if resp == nil {
+		return nil, fmt.Errorf("execute request failed on all endpoints: %v", lastErr)
 	}
 
-	// If streaming, translate response on-the-fly
 	if stream && resp.StatusCode == 200 {
-		translatedResp := e.translateStreamingResponse(resp)
-		return translatedResp, nil
+		return e.translateStreamingResponse(resp), nil
 	}
 
-	// Non-streaming: translate response
 	if !stream && resp.StatusCode == 200 {
 		translatedResp, err := e.translateResponse(resp)
 		if err != nil {
-			return resp, nil // Return raw on translation error
+			return resp, nil
 		}
 		return translatedResp, nil
 	}
@@ -156,20 +163,80 @@ func (e *Executor) ExecuteWithSession(account *db.Account, model string, body []
 	return resp, nil
 }
 
-// translateRequest converts OpenAI chat completion request to Gemini Cloud Code format
-func (e *Executor) translateRequest(model string, body []byte, stream bool, creds *db.AGCredentials) ([]byte, error) {
+func (e *Executor) translateRequest(model string, body []byte, stream bool, creds *db.AGCredentials, forceSessionID string) ([]byte, error) {
 	var openaiReq OpenAIRequest
 	if err := json.Unmarshal(body, &openaiReq); err != nil {
 		return nil, fmt.Errorf("parse openai request: %w", err)
 	}
 
-	// Build Gemini contents from OpenAI messages
+	isClaude := strings.Contains(strings.ToLower(model), "claude")
+
+	// Pass 1: Build tool call ID to name map
+	tcID2Name := make(map[string]string)
+	for _, msg := range openaiReq.Messages {
+		if msg.Role == "assistant" {
+			for _, tc := range msg.ToolCalls {
+				if tc.Type == "function" && tc.ID != "" && tc.Function.Name != "" {
+					tcID2Name[tc.ID] = tc.Function.Name
+				}
+			}
+		}
+	}
+
+	// Pass 2: Build tool responses cache
+	toolResponses := make(map[string]string)
+	for _, msg := range openaiReq.Messages {
+		if msg.Role == "tool" && msg.ToolCallID != "" {
+			toolResponses[msg.ToolCallID] = string(msg.Content)
+		}
+	}
+
 	contents := []GeminiContent{}
 	var systemParts []GeminiPart
+	firstUserText := ""
+
+	// We'll process tool responses in batches after the assistant message
+	var pendingToolCallIDs []string
+
+	flushPendingTools := func() {
+		if len(pendingToolCallIDs) > 0 {
+			toolParts := []GeminiPart{}
+			for _, fid := range pendingToolCallIDs {
+				if resp, ok := toolResponses[fid]; ok {
+					name := "tool"
+					if n, exists := tcID2Name[fid]; exists {
+						name = n
+					}
+
+					var parsedResp interface{}
+					json.Unmarshal([]byte(extractTextContent(json.RawMessage(resp))), &parsedResp)
+					if parsedResp == nil {
+						parsedResp = extractTextContent(json.RawMessage(resp))
+					}
+
+					toolParts = append(toolParts, GeminiPart{
+						FunctionResponse: &GeminiFunctionResponse{
+							Name:     sanitizeFunctionName(name),
+							Response: map[string]interface{}{"result": parsedResp},
+						},
+					})
+				}
+			}
+			if len(toolParts) > 0 {
+				contents = append(contents, GeminiContent{Role: "user", Parts: toolParts})
+			}
+			pendingToolCallIDs = nil
+		}
+	}
 
 	for _, msg := range openaiReq.Messages {
+		if msg.Role == "tool" {
+			continue // handled via batching
+		}
+		flushPendingTools()
+
 		switch msg.Role {
-		case "system":
+		case "system", "developer":
 			text := extractTextContent(msg.Content)
 			if text != "" {
 				systemParts = append(systemParts, GeminiPart{Text: &text})
@@ -178,54 +245,54 @@ func (e *Executor) translateRequest(model string, body []byte, stream bool, cred
 		case "user":
 			parts := convertContentToParts(msg.Content)
 			if len(parts) > 0 {
+				if firstUserText == "" && parts[0].Text != nil {
+					firstUserText = *parts[0].Text
+				}
 				contents = append(contents, GeminiContent{Role: "user", Parts: parts})
 			}
 
 		case "assistant":
 			parts := []GeminiPart{}
 			text := extractTextContent(msg.Content)
+
+			if msg.ReasoningContent != nil && *msg.ReasoningContent != "" {
+				rc := *msg.ReasoningContent
+				t := true
+				parts = append(parts, GeminiPart{
+					Thought: &t,
+					Text:    &rc,
+				})
+			}
+
 			if text != "" {
 				parts = append(parts, GeminiPart{Text: &text})
 			}
-			// Handle tool calls
+
 			if len(msg.ToolCalls) > 0 {
+				skipSig := "skip_thought_signature_validator"
 				for _, tc := range msg.ToolCalls {
 					args := map[string]interface{}{}
 					json.Unmarshal([]byte(tc.Function.Arguments), &args)
-					parts = append(parts, GeminiPart{
+					part := GeminiPart{
 						FunctionCall: &GeminiFunctionCall{
 							Name: sanitizeFunctionName(tc.Function.Name),
 							Args: args,
 						},
-					})
+					}
+					if !isClaude {
+						part.ThoughtSignature = &skipSig
+					}
+					parts = append(parts, part)
+					pendingToolCallIDs = append(pendingToolCallIDs, tc.ID)
 				}
 			}
 			if len(parts) > 0 {
 				contents = append(contents, GeminiContent{Role: "model", Parts: parts})
 			}
-
-		case "tool":
-			// Tool response → functionResponse
-			var result interface{}
-			json.Unmarshal([]byte(extractTextContent(msg.Content)), &result)
-			if result == nil {
-				result = extractTextContent(msg.Content)
-			}
-			name := "tool"
-			if msg.Name != "" {
-				name = sanitizeFunctionName(msg.Name)
-			}
-			parts := []GeminiPart{{
-				FunctionResponse: &GeminiFunctionResponse{
-					Name:     name,
-					Response: map[string]interface{}{"result": result},
-				},
-			}}
-			contents = append(contents, GeminiContent{Role: "user", Parts: parts})
 		}
 	}
+	flushPendingTools()
 
-	// Build tools (functionDeclarations)
 	var tools []GeminiToolGroup
 	if len(openaiReq.Tools) > 0 {
 		declarations := []GeminiFunctionDeclaration{}
@@ -244,13 +311,8 @@ func (e *Executor) translateRequest(model string, body []byte, stream bool, cred
 		}
 	}
 
-	// Build generation config
 	genConfig := GeminiGenerationConfig{}
-	if openaiReq.MaxTokens > 0 {
-		genConfig.MaxOutputTokens = openaiReq.MaxTokens
-	} else {
-		genConfig.MaxOutputTokens = maxOutputTokens
-	}
+
 	if openaiReq.Temperature != nil {
 		genConfig.Temperature = openaiReq.Temperature
 	}
@@ -258,44 +320,51 @@ func (e *Executor) translateRequest(model string, body []byte, stream bool, cred
 		genConfig.TopP = openaiReq.TopP
 	}
 
-	// Map reasoning_effort to thinkingConfig.thinkingBudget
-	if openaiReq.ReasoningEffort != "" {
-		budget := 0
-		switch openaiReq.ReasoningEffort {
-		case "low":
-			budget = 2048
-		case "medium":
-			budget = 8192
-		case "high":
-			budget = 32768
-		case "max":
-			budget = 65536
-		case "none":
-			// Explicitly disable thinking — don't set config
-		case "auto":
-			// Let model decide — set budget to -1 (auto)
-			budget = -1
-		default:
-			// Try parse as numeric (direct budget from DSL)
-			fmt.Sscanf(openaiReq.ReasoningEffort, "%d", &budget)
+	// Max tokens (Claude vs Gemini)
+	if isClaude {
+		if openaiReq.MaxTokens > 0 {
+			genConfig.MaxOutputTokens = openaiReq.MaxTokens
+		} else {
+			genConfig.MaxOutputTokens = maxOutputTokens
 		}
-		if budget > 0 {
+		// Cap at 16384 for safety (per 9router)
+		if genConfig.MaxOutputTokens > 16384 {
+			genConfig.MaxOutputTokens = 16384
+		}
+	} else {
+		// Gemini API handles maxOutputTokens on server. Must be omitted.
+		genConfig.MaxOutputTokens = 0
+	}
+
+	if openaiReq.ReasoningEffort != "" {
+		effort := strings.ToLower(openaiReq.ReasoningEffort)
+		if effort == "auto" {
 			genConfig.ThinkingConfig = &GeminiThinkingConfig{
-				ThinkingBudget:  budget,
+				ThinkingBudget:  -1,
 				IncludeThoughts: true,
 			}
-		} else if budget == -1 {
-			// Auto mode — include thoughts but let model decide budget
+		} else if effort != "none" {
 			genConfig.ThinkingConfig = &GeminiThinkingConfig{
+				ThinkingLevel:   effort,
 				IncludeThoughts: true,
 			}
 		}
 	}
 
-	// Build Cloud Code envelope
 	projectID := creds.ProjectID
 	if projectID == "" {
 		projectID = generateProjectID()
+	}
+
+	sessionID := forceSessionID
+	if sessionID == "" {
+		if firstUserText != "" {
+			h := sha256.Sum256([]byte(firstUserText))
+			n := int64(binary.BigEndian.Uint64(h[:8])) & 0x7FFFFFFFFFFFFFFF
+			sessionID = "-" + strconv.FormatInt(n, 10)
+		} else {
+			sessionID = "-" + fmt.Sprintf("%d", time.Now().UnixNano())
+		}
 	}
 
 	envelope := CloudCodeRequest{
@@ -307,11 +376,10 @@ func (e *Executor) translateRequest(model string, body []byte, stream bool, cred
 		Request: GeminiRequest{
 			Contents:         contents,
 			GenerationConfig: genConfig,
-			SessionID:        generateSessionID(creds.ProjectID),
+			SessionID:        sessionID,
 		},
 	}
 
-	// System instruction (user's only, no injection)
 	if len(systemParts) > 0 {
 		envelope.Request.SystemInstruction = &GeminiSystemInstruction{
 			Role:  "user",
@@ -319,18 +387,22 @@ func (e *Executor) translateRequest(model string, body []byte, stream bool, cred
 		}
 	}
 
-	// Tools
 	if len(tools) > 0 {
 		envelope.Request.Tools = tools
-		envelope.Request.ToolConfig = &GeminiToolConfig{
-			FunctionCallingConfig: GeminiFunctionCallingConfig{Mode: "AUTO"},
+		if isClaude {
+			envelope.Request.ToolConfig = &GeminiToolConfig{
+				FunctionCallingConfig: GeminiFunctionCallingConfig{Mode: "VALIDATED"},
+			}
+		} else {
+			envelope.Request.ToolConfig = &GeminiToolConfig{
+				FunctionCallingConfig: GeminiFunctionCallingConfig{Mode: "AUTO"},
+			}
 		}
 	}
 
 	return json.Marshal(envelope)
 }
 
-// translateStreamingResponse wraps the upstream SSE response and translates Gemini SSE → OpenAI SSE
 func (e *Executor) translateStreamingResponse(resp *http.Response) *http.Response {
 	pr, pw := io.Pipe()
 
@@ -346,7 +418,6 @@ func (e *Executor) translateStreamingResponse(resp *http.Response) *http.Respons
 			if n > 0 {
 				accumulated += string(buf[:n])
 
-				// Process complete SSE lines
 				for {
 					idx := strings.Index(accumulated, "\n")
 					if idx == -1 {
@@ -365,7 +436,6 @@ func (e *Executor) translateStreamingResponse(resp *http.Response) *http.Respons
 				}
 			}
 			if err != nil {
-				// Send [DONE]
 				fmt.Fprintf(pw, "data: [DONE]\n\n")
 				break
 			}
@@ -381,7 +451,6 @@ func (e *Executor) translateStreamingResponse(resp *http.Response) *http.Respons
 	}
 }
 
-// translateResponse translates non-streaming Gemini response to OpenAI format
 func (e *Executor) translateResponse(resp *http.Response) (*http.Response, error) {
 	defer resp.Body.Close()
 
@@ -392,7 +461,6 @@ func (e *Executor) translateResponse(resp *http.Response) (*http.Response, error
 
 	var geminiResp GeminiResponse
 	if err := json.Unmarshal(body, &geminiResp); err != nil {
-		// Return raw if can't parse
 		return &http.Response{
 			StatusCode: resp.StatusCode,
 			Header:     http.Header{"Content-Type": []string{"application/json"}},
@@ -410,17 +478,11 @@ func (e *Executor) translateResponse(resp *http.Response) (*http.Response, error
 	}, nil
 }
 
-// --- Helpers ---
-
-func generateSessionID(seed string) string {
-	return uuid.New().String() + fmt.Sprintf("%d", time.Now().UnixMilli())
-}
-
 func generateProjectID() string {
 	adjs := []string{"useful", "bright", "swift", "calm", "bold"}
 	nouns := []string{"fuze", "wave", "spark", "flow", "core"}
 	b := make([]byte, 3)
-	rand.Read(b)
+	crypto_rand.Read(b)
 	adj := adjs[int(b[0])%len(adjs)]
 	noun := nouns[int(b[1])%len(nouns)]
 	return fmt.Sprintf("%s-%s-%s", adj, noun, uuid.New().String()[:5])
@@ -430,7 +492,6 @@ func sanitizeFunctionName(name string) string {
 	if name == "" {
 		return "_unknown"
 	}
-	// Gemini requires: [a-zA-Z_][a-zA-Z0-9_.:−]{0,63}
 	result := strings.Builder{}
 	for i, c := range name {
 		if i == 0 {

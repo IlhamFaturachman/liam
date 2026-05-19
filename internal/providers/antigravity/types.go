@@ -2,7 +2,6 @@ package antigravity
 
 import (
 	"encoding/json"
-	"fmt"
 	"strings"
 	"time"
 
@@ -23,11 +22,12 @@ type OpenAIRequest struct {
 }
 
 type OpenAIMessage struct {
-	Role       string           `json:"role"`
-	Content    json.RawMessage  `json:"content"`
-	Name       string           `json:"name,omitempty"`
-	ToolCalls  []OpenAIToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string           `json:"tool_call_id,omitempty"`
+	Role             string           `json:"role"`
+	Content          json.RawMessage  `json:"content"`
+	Name             string           `json:"name,omitempty"`
+	ReasoningContent *string          `json:"reasoning_content,omitempty"`
+	ToolCalls        []OpenAIToolCall `json:"tool_calls,omitempty"`
+	ToolCallID       string           `json:"tool_call_id,omitempty"`
 }
 
 type OpenAIToolCall struct {
@@ -120,6 +120,7 @@ type GeminiContent struct {
 type GeminiPart struct {
 	Text             *string                 `json:"text,omitempty"`
 	Thought          *bool                   `json:"thought,omitempty"`
+	ThoughtSignature *string                 `json:"thoughtSignature,omitempty"`
 	FunctionCall     *GeminiFunctionCall     `json:"functionCall,omitempty"`
 	FunctionResponse *GeminiFunctionResponse `json:"functionResponse,omitempty"`
 	InlineData       *GeminiInlineData       `json:"inlineData,omitempty"`
@@ -153,8 +154,9 @@ type GeminiGenerationConfig struct {
 }
 
 type GeminiThinkingConfig struct {
-	ThinkingBudget  int  `json:"thinkingBudget,omitempty"`
-	IncludeThoughts bool `json:"includeThoughts,omitempty"`
+	ThinkingBudget  int    `json:"thinkingBudget,omitempty"`
+	ThinkingLevel   string `json:"thinkingLevel,omitempty"`
+	IncludeThoughts bool   `json:"includeThoughts,omitempty"`
 }
 
 type GeminiToolGroup struct {
@@ -458,71 +460,4 @@ func convertContentToParts(content json.RawMessage) []GeminiPart {
 	}
 
 	return parts
-}
-
-// cleanSchema performs minimal JSON Schema cleaning for Gemini compatibility
-// Only strips truly unsupported keywords, preserves structure
-func cleanSchema(schema map[string]interface{}) map[string]interface{} {
-	if schema == nil {
-		return map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}
-	}
-
-	// Keywords to remove (truly unsupported by Gemini)
-	unsupported := []string{
-		"$schema", "$ref", "$defs", "definitions", "$comment",
-		"additionalProperties", "patternProperties", "propertyNames",
-		"if", "then", "else", "dependencies", "dependentSchemas",
-		"contentMediaType", "contentEncoding",
-	}
-
-	for _, key := range unsupported {
-		delete(schema, key)
-	}
-
-	// Recursively clean nested schemas
-	if props, ok := schema["properties"].(map[string]interface{}); ok {
-		for key, val := range props {
-			if valMap, ok := val.(map[string]interface{}); ok {
-				props[key] = cleanSchema(valMap)
-			}
-		}
-	}
-
-	if items, ok := schema["items"].(map[string]interface{}); ok {
-		schema["items"] = cleanSchema(items)
-	}
-
-	// Handle anyOf/oneOf: pick first non-null type
-	for _, key := range []string{"anyOf", "oneOf"} {
-		if arr, ok := schema[key].([]interface{}); ok {
-			for _, item := range arr {
-				if itemMap, ok := item.(map[string]interface{}); ok {
-					if t, _ := itemMap["type"].(string); t != "null" {
-						// Merge into parent
-						for k, v := range itemMap {
-							if k != "type" || schema["type"] == nil {
-								schema[k] = v
-							}
-						}
-						break
-					}
-				}
-			}
-			delete(schema, key)
-		}
-	}
-
-	// Ensure type exists if properties exist
-	if _, hasProps := schema["properties"]; hasProps {
-		if _, hasType := schema["type"]; !hasType {
-			schema["type"] = "object"
-		}
-	}
-
-	return schema
-}
-
-// formatToolCallID generates a unique tool call ID
-func formatToolCallID() string {
-	return fmt.Sprintf("call_%s", uuid.New().String()[:12])
 }
