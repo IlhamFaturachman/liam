@@ -179,6 +179,7 @@ type QuotaBreakdownEntry struct {
 	Used    float64 `json:"used"`
 	Total   float64 `json:"total"`
 	ResetAt string  `json:"reset_at,omitempty"`
+	Label   string  `json:"label,omitempty"`
 }
 
 // QuotaResult holds the result of a quota fetch

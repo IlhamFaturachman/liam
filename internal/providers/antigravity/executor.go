@@ -93,10 +93,17 @@ func (e *Executor) ExecuteWithSession(account *db.Account, model string, body []
 	}
 
 	upstreamModel := strings.TrimPrefix(model, "ag/")
+	if upstreamModel == "gemini-3.1-pro-high" {
+		upstreamModel = "gemini-pro-agent"
+	}
+	// ...
 	geminiBody, err := e.translateRequest(upstreamModel, body, stream, &creds, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("translate request: %w", err)
 	}
+
+	// DEBUG LOG
+	fmt.Printf("[AG DEBUG] Payload for %s: %s\n", upstreamModel, string(geminiBody))
 
 	action := "generateContent"
 	if stream {
@@ -367,12 +374,19 @@ func (e *Executor) translateRequest(model string, body []byte, stream bool, cred
 		}
 	}
 
+	requestType := "agent"
+	requestID := "agent-" + uuid.New().String()
+	if strings.Contains(strings.ToLower(model), "image") {
+		requestType = "image_gen"
+		requestID = "gemini_" + uuid.New().String()
+	}
+
 	envelope := CloudCodeRequest{
 		Project:     projectID,
 		Model:       model,
 		UserAgent:   "antigravity",
-		RequestType: "agent",
-		RequestID:   "agent-" + uuid.New().String(),
+		RequestType: requestType,
+		RequestID:   requestID,
 		Request: GeminiRequest{
 			Contents:         contents,
 			GenerationConfig: genConfig,

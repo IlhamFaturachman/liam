@@ -56,6 +56,11 @@ func BuiltInModels() []Model {
 		{ProviderAlias: "ag", ModelID: "claude-sonnet-4-6", DisplayName: "Claude Sonnet 4.6", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
 		{ProviderAlias: "ag", ModelID: "claude-opus-4-6-thinking", DisplayName: "Claude Opus 4.6 Thinking", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
 		{ProviderAlias: "ag", ModelID: "gpt-oss-120b-medium", DisplayName: "GPT OSS 120B Medium", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "ag", ModelID: "gemini-3-pro-high", DisplayName: "Gemini 3 Pro (High)", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "ag", ModelID: "gemini-3-pro-low", DisplayName: "Gemini 3 Pro (Low)", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "ag", ModelID: "gemini-3.1-flash-image", DisplayName: "Gemini 3.1 Flash Image", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "ag", ModelID: "gemini-pro-agent", DisplayName: "Gemini 3.1 Pro (High)", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "ag", ModelID: "gemini-3.1-flash-lite", DisplayName: "Gemini 3.1 Flash Lite", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
 
 		// Kiro
 		{ProviderAlias: "kr", ModelID: "claude-sonnet-4.5", DisplayName: "Claude Sonnet 4.5", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},

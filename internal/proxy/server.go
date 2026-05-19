@@ -66,6 +66,59 @@ func Start(cfg *config.Config, database *db.Database) error {
 		combo:        NewComboHandler(database),
 	}
 
+	// Wire up harvest quota fetching immediately upon import
+	s.harvest.OnAccountImported = func(account *db.Account) {
+		if account.Provider == "antigravity" {
+			var creds struct {
+				AccessToken string `json:"access_token"`
+			}
+			if err := json.Unmarshal(account.Credentials, &creds); err == nil && creds.AccessToken != "" {
+				if qr, qErr := antigravity.FetchQuota(creds.AccessToken); qErr == nil && qr != nil {
+					account.QuotaTotal = qr.Total
+					account.QuotaRemaining = qr.Total - qr.Used
+					account.Plan = qr.Plan
+					if qr.ResetAt != "" {
+						if t, parseErr := time.Parse(time.RFC3339, qr.ResetAt); parseErr == nil {
+							account.QuotaResetAt = &t
+						}
+					}
+					if len(qr.Breakdown) > 0 {
+						if b, mErr := json.Marshal(qr.Breakdown); mErr == nil {
+							account.QuotaBreakdown = b
+						}
+					}
+				}
+			}
+		} else if account.Provider == "kiro" {
+			var creds struct {
+				AccessToken string `json:"access_token"`
+				ProfileARN  string `json:"profile_arn"`
+			}
+			if err := json.Unmarshal(account.Credentials, &creds); err == nil && creds.AccessToken != "" {
+				if qr, qErr := kiro.FetchQuota(creds.AccessToken, creds.ProfileARN); qErr == nil && qr != nil {
+					account.QuotaTotal = qr.Total
+					account.QuotaRemaining = qr.Total - qr.Used
+					account.Plan = qr.Plan
+					if qr.ResetAt != "" {
+						if t, parseErr := time.Parse(time.RFC3339, qr.ResetAt); parseErr == nil {
+							account.QuotaResetAt = &t
+						}
+					}
+					if len(qr.Breakdown) > 0 {
+						if b, mErr := json.Marshal(qr.Breakdown); mErr == nil {
+							account.QuotaBreakdown = b
+						}
+					}
+				}
+			}
+		}
+
+		// Fallback to UpsertAccount with or without quota data
+		if err := database.UpsertAccount(account); err != nil {
+			log.Printf("IMPORT ERROR: %s - %v", account.Email, err)
+		}
+	}
+
 	// Build the provider registry. New backends drop in here without
 	// touching server.go's request flow — the chat handler, refresh
 	// loop, stats endpoints, and dashboard now all source their list

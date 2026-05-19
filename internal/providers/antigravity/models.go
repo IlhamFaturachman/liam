@@ -81,5 +81,10 @@ func staticAGModels() []UpstreamModel {
 		{ID: "claude-sonnet-4-6", Name: "Claude Sonnet 4.6"},
 		{ID: "claude-opus-4-6-thinking", Name: "Claude Opus 4.6 Thinking"},
 		{ID: "gpt-oss-120b-medium", Name: "GPT OSS 120B Medium"},
+		{ID: "gemini-3-pro-high", Name: "Gemini 3 Pro (High)"},
+		{ID: "gemini-3-pro-low", Name: "Gemini 3 Pro (Low)"},
+		{ID: "gemini-3.1-flash-image", Name: "Gemini 3.1 Flash Image"},
+		{ID: "gemini-pro-agent", Name: "Gemini 3.1 Pro (High)"},
+		{ID: "gemini-3.1-flash-lite", Name: "Gemini 3.1 Flash Lite"},
 	}
 }

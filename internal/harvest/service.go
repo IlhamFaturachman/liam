@@ -18,10 +18,14 @@ import (
 type HarvestService struct {
 	cfg      *config.Config
 	database *db.Database
-	mu       sync.Mutex
-	running  bool
-	cmd      *exec.Cmd
-	status   HarvestStatus
+
+	mu      sync.Mutex
+	running bool
+	cmd     *exec.Cmd
+	status  HarvestStatus
+
+	// Hook to perform extra processing (like quota fetching) after an account is harvested
+	OnAccountImported func(account *db.Account)
 }
 
 type HarvestStatus struct {
@@ -338,7 +342,9 @@ func (h *HarvestService) importResult(data map[string]interface{}) {
 		Credentials: credsJSON,
 	}
 
-	if err := h.database.UpsertAccount(account); err != nil {
+	if h.OnAccountImported != nil {
+		h.OnAccountImported(account)
+	} else if err := h.database.UpsertAccount(account); err != nil {
 		h.addLog(fmt.Sprintf("IMPORT ERROR: %s - %v", email, err))
 	}
 }

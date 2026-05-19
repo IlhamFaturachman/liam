@@ -1874,7 +1874,7 @@ function app() {
           const percent = total > 0 ? Math.round((remaining / total) * 100) : 0;
           return {
             key,
-            label: this.quotaResourceLabel(key),
+            label: entry?.label || this.quotaResourceLabel(key),
             used,
             total,
             remaining,

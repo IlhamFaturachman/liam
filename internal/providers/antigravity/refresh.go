@@ -311,6 +311,7 @@ type QuotaBreakdownEntry struct {
 	Used    float64 `json:"used"`
 	Total   float64 `json:"total"`
 	ResetAt string  `json:"reset_at,omitempty"`
+	Label   string  `json:"label,omitempty"`
 }
 
 // QuotaResult is the AG analogue of kiro.QuotaResult: a single primary
@@ -360,6 +361,11 @@ var importantAGModels = map[string]bool{
 	"gemini-3.1-pro-low":       true,
 	"gemini-3-flash":           true,
 	"gpt-oss-120b-medium":      true,
+	"gemini-3-pro-high":        true,
+	"gemini-3-pro-low":         true,
+	"gemini-3.1-flash-image":   true,
+	"gemini-pro-agent":         true,
+	"gemini-3.1-flash-lite":    true,
 }
 
 // agQuotaTotal is the normalised "100% capacity" value we use for the
@@ -410,7 +416,7 @@ func FetchQuota(accessToken string) (*QuotaResult, error) {
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "google-api-nodejs-client/9.15.1")
+	req.Header.Set("User-Agent", "antigravity/1.107.0 darwin/arm64")
 	req.Header.Set("X-Client-Name", "antigravity")
 	req.Header.Set("X-Client-Version", "1.107.0")
 	// "x-request-source": "local" matches 9router's MITM bypass header.
@@ -490,6 +496,7 @@ func FetchQuota(accessToken string) (*QuotaResult, error) {
 			Used:    used,
 			Total:   agQuotaTotal,
 			ResetAt: resetAt,
+			Label:   info.DisplayName,
 		}
 		breakdown[modelKey] = entry
 

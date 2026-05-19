@@ -14,26 +14,10 @@ import (
 	"time"
 )
 
-// GetHarvestDir returns the path to the harvest module
+// GetHarvestDir returns the absolute path to the harvest module (~/.liam/harvest)
 func GetHarvestDir() string {
-	// Try relative to binary first
-	exe, _ := os.Executable()
-	exeDir := filepath.Dir(exe)
-
-	// Check: binary_dir/harvest/
-	harvestDir := filepath.Join(exeDir, "harvest")
-	if _, err := os.Stat(filepath.Join(harvestDir, "main.py")); err == nil {
-		return harvestDir
-	}
-
-	// Check: working directory/harvest/
-	cwd, _ := os.Getwd()
-	harvestDir = filepath.Join(cwd, "harvest")
-	if _, err := os.Stat(filepath.Join(harvestDir, "main.py")); err == nil {
-		return harvestDir
-	}
-
-	return ""
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".liam", "harvest")
 }
 
 // GetVenvPython returns the path to the venv Python binary
