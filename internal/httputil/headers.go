@@ -1,4 +1,4 @@
-package httputil
+package upstream
 
 import "net/http"
 
@@ -22,7 +22,7 @@ func ScrubUpstreamHeaders(req *http.Request) {
 	req.Header.Del("X-Stainless-Arch")
 	req.Header.Del("X-Stainless-Runtime")
 	req.Header.Del("X-Stainless-Runtime-Version")
-	req.Header.Del("Http-Referer")
+	req.Header.Del("Http-Referer") // non-standard; some SDKs mistakenly prefix Referer with Http-
 	req.Header.Del("Referer")
 
 	// Electron / Chromium fingerprint headers

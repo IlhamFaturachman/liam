@@ -1,4 +1,4 @@
-package httputil
+package upstream
 
 import (
 	"net/http"
@@ -72,4 +72,10 @@ func TestScrubUpstreamHeaders_preservesSafeHeaders(t *testing.T) {
 			t.Errorf("header %q: got %q, want %q", test.header, got, test.want)
 		}
 	}
+}
+
+func TestScrubUpstreamHeaders_doesNotPanicOnEmptyHeaders(t *testing.T) {
+	req, _ := http.NewRequest("POST", "https://example.com", nil)
+	// req.Header is already initialised by NewRequest; no headers set
+	ScrubUpstreamHeaders(req) // must not panic
 }
