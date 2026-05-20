@@ -16,14 +16,23 @@ func rewriteModelInChunk(chunk []byte, targetModel string) []byte {
 	lines := bytes.Split(chunk, []byte("\n"))
 	modified := false
 	for i, line := range lines {
-		trimmed := bytes.TrimSpace(line)
-		if !bytes.HasPrefix(trimmed, []byte("data: {")) {
+		// Strip trailing \r to handle CRLF framing; restore it after rewrite.
+		hasCR := len(line) > 0 && line[len(line)-1] == '\r'
+		stripped := line
+		if hasCR {
+			stripped = line[:len(line)-1]
+		}
+		if !bytes.HasPrefix(stripped, []byte("data: {")) {
 			continue
 		}
-		data := bytes.TrimPrefix(trimmed, []byte("data: "))
+		data := bytes.TrimPrefix(stripped, []byte("data: "))
 		rewritten := rewriteModelField(data, targetModel)
 		if !bytes.Equal(rewritten, data) {
-			lines[i] = append([]byte("data: "), rewritten...)
+			out := append([]byte("data: "), rewritten...)
+			if hasCR {
+				out = append(out, '\r')
+			}
+			lines[i] = out
 			modified = true
 		}
 	}

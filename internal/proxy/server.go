@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -576,28 +578,33 @@ func (s *Server) streamResponse(w http.ResponseWriter, resp *http.Response, mode
 	const maxCapture = 1 * 1024 * 1024 // 1 MB rolling capture
 	captured := make([]byte, 0, 64*1024)
 
-	buf := make([]byte, 4096)
-	for {
-		n, err := resp.Body.Read(buf)
-		if n > 0 {
-			chunk := rewriteModelInChunk(buf[:n], model)
-			w.Write(chunk)
-			flusher.Flush()
+	// Read line-by-line so model rewriting is never split across chunk boundaries.
+	// bufio.Scanner strips the line terminator; we re-add \n on output (SSE is LF).
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 256*1024), 256*1024)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		out := line
+		if bytes.HasPrefix(line, []byte("data: {")) {
+			jsonPart := line[len("data: "):]
+			if rewritten := rewriteModelField(jsonPart, model); !bytes.Equal(rewritten, jsonPart) {
+				out = append([]byte("data: "), rewritten...)
+			}
+		}
+		out = append(out, '\n')
+		w.Write(out)
+		flusher.Flush()
 
-			// Append to capture, then trim to keep only the tail. The
-			// usage record is always emitted last so we just need the
-			// final ~64 KB to find it.
-			captured = append(captured, chunk...)
-			if len(captured) > maxCapture {
-				captured = captured[len(captured)-maxCapture:]
-			}
+		// Append to capture, then trim to keep only the tail. The
+		// usage record is always emitted last so we just need the
+		// final ~64 KB to find it.
+		captured = append(captured, out...)
+		if len(captured) > maxCapture {
+			captured = captured[len(captured)-maxCapture:]
 		}
-		if err != nil {
-			if err != io.EOF {
-				log.Printf("Stream read error: %v", err)
-			}
-			break
-		}
+	}
+	if err := scanner.Err(); err != nil {
+		log.Printf("Stream read error: %v", err)
 	}
 	return string(captured)
 }

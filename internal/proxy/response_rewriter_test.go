@@ -72,6 +72,27 @@ func TestRewriteModelInChunk_nonJsonDataLine(t *testing.T) {
 	}
 }
 
+func TestRewriteModelInChunk_preservesCRLF(t *testing.T) {
+	chunk := []byte("data: {\"id\":\"c1\",\"model\":\"upstream\",\"choices\":[]}\r\n\r\n")
+	got := rewriteModelInChunk(chunk, "kr/claude-3-5")
+
+	if !bytes.Contains(got, []byte(`"model":"kr/claude-3-5"`)) {
+		t.Errorf("model not rewritten in CRLF chunk:\n%s", got)
+	}
+	// The rewritten line must still end with \r\n framing, not just \n.
+	if !bytes.Contains(got, []byte("}\r\n")) {
+		t.Errorf("CRLF line ending was corrupted:\n%q", got)
+	}
+}
+
+func TestRewriteModelInChunk_malformedDataLine(t *testing.T) {
+	chunk := []byte("data: {not json}\n\n")
+	got := rewriteModelInChunk(chunk, "kr/model")
+	if !bytes.Equal(got, chunk) {
+		t.Errorf("expected malformed JSON data line to pass through unchanged, got %s", got)
+	}
+}
+
 func TestRewriteModelInBody_replacesModel(t *testing.T) {
 	input := []byte(`{"model":"upstream-internal","choices":[{"message":{"content":"hi"}}]}`)
 	got := rewriteModelInBody(input, "ag/gemini-2.5-pro")
