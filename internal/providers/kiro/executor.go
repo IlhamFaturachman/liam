@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/liam-auto/liam/internal/db"
+	upstream "github.com/liam-auto/liam/internal/httputil"
 )
 
 // Executor handles Kiro (AWS CodeWhisperer) requests
@@ -23,7 +24,7 @@ type Executor struct {
 // NewExecutor creates a new Kiro executor
 func NewExecutor() *Executor {
 	return &Executor{
-		client: &http.Client{Timeout: 120 * time.Second},
+		client: upstream.NewUTLSClient(120 * time.Second),
 	}
 }
 
@@ -78,6 +79,11 @@ func (e *Executor) ExecuteWithSession(account *db.Account, model string, body []
 	if sessionID != "" {
 		req.Header.Set("X-Amz-Session-Id", sessionID)
 	}
+
+	// Strip proxy/fingerprint leak headers, then add native Kiro headers.
+	// Accept-Encoding matches Node.js inside Electron (aws-sdk-js default, no zstd).
+	upstream.ScrubUpstreamHeaders(req)
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
 
 	resp, err := e.client.Do(req)
 	if err != nil {
