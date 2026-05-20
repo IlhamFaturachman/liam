@@ -516,11 +516,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 		// Stream or return response
 		if stream {
-			streamBody := s.streamResponse(w, resp)
+			streamBody := s.streamResponse(w, resp, model)
 			usageLog.TokensIn, usageLog.TokensOut = extractTokenUsage(streamBody)
 			usageLog.ResponseBody = "(streaming response)"
 		} else {
-			respBody := s.forwardResponseCapture(w, resp)
+			respBody := s.forwardResponseCapture(w, resp, model)
 			usageLog.TokensIn, usageLog.TokensOut = extractTokenUsage(respBody)
 			if len(respBody) > 5120 {
 				usageLog.ResponseBody = respBody[:5120] + "\n...(truncated)"
@@ -558,7 +558,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 // stream finishes. Buffer is capped at 1 MB to avoid blowing memory on
 // long generations — the usage chunk always lands at the very end and the
 // last 64 KB is more than enough to recover it.
-func (s *Server) streamResponse(w http.ResponseWriter, resp *http.Response) string {
+func (s *Server) streamResponse(w http.ResponseWriter, resp *http.Response, model string) string {
 	defer resp.Body.Close()
 
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -580,13 +580,14 @@ func (s *Server) streamResponse(w http.ResponseWriter, resp *http.Response) stri
 	for {
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
-			w.Write(buf[:n])
+			chunk := rewriteModelInChunk(buf[:n], model)
+			w.Write(chunk)
 			flusher.Flush()
 
 			// Append to capture, then trim to keep only the tail. The
 			// usage record is always emitted last so we just need the
 			// final ~64 KB to find it.
-			captured = append(captured, buf[:n]...)
+			captured = append(captured, chunk...)
 			if len(captured) > maxCapture {
 				captured = captured[len(captured)-maxCapture:]
 			}
@@ -602,9 +603,10 @@ func (s *Server) streamResponse(w http.ResponseWriter, resp *http.Response) stri
 }
 
 // forwardResponseCapture returns non-streaming response and captures body for logging
-func (s *Server) forwardResponseCapture(w http.ResponseWriter, resp *http.Response) string {
+func (s *Server) forwardResponseCapture(w http.ResponseWriter, resp *http.Response, model string) string {
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
+	body = rewriteModelInBody(body, model)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
 	w.Write(body)
@@ -926,11 +928,11 @@ func (s *Server) handleComboRequest(w http.ResponseWriter, r *http.Request, req 
 		})
 
 		if stream {
-			streamBody := s.streamResponse(w, resp)
+			streamBody := s.streamResponse(w, resp, comboModel)
 			usageLog.TokensIn, usageLog.TokensOut = extractTokenUsage(streamBody)
 			usageLog.ResponseBody = "(streaming response)"
 		} else {
-			respBody := s.forwardResponseCapture(w, resp)
+			respBody := s.forwardResponseCapture(w, resp, comboModel)
 			usageLog.TokensIn, usageLog.TokensOut = extractTokenUsage(respBody)
 			if len(respBody) > 5120 {
 				usageLog.ResponseBody = respBody[:5120] + "\n...(truncated)"
