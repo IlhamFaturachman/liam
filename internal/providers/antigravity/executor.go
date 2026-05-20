@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/liam-auto/liam/internal/config"
 	"github.com/liam-auto/liam/internal/db"
+	upstream "github.com/liam-auto/liam/internal/httputil"
 )
 
 const (
@@ -54,10 +55,8 @@ type Executor struct {
 // NewExecutor creates a new Antigravity executor
 func NewExecutor(cfg *config.Config) *Executor {
 	return &Executor{
-		cfg: cfg,
-		client: &http.Client{
-			Timeout: 120 * time.Second,
-		},
+		cfg:    cfg,
+		client: upstream.NewUTLSClient(120 * time.Second),
 	}
 }
 
@@ -113,6 +112,13 @@ func (e *Executor) ExecuteWithSession(account *db.Account, model string, body []
 	if stream {
 		req.Header.Set("Accept", "text/event-stream")
 	}
+
+	// Strip proxy/fingerprint leak headers, then add native Antigravity headers.
+	// X-Goog-Api-Client matches the Node.js Gemini SDK the native extension sends.
+	// Accept-Encoding matches Node.js default (gzip/deflate/br, no zstd).
+	upstream.ScrubUpstreamHeaders(req)
+	req.Header.Set("X-Goog-Api-Client", "google-genai-sdk/1.41.0 gl-node/v22.19.0")
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
 
 	// Execute
 	resp, err := e.client.Do(req)
