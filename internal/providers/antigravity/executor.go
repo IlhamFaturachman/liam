@@ -103,7 +103,7 @@ func (e *Executor) ExecuteWithSession(account *db.Account, model string, body []
 	}
 
 	// DEBUG LOG
-	fmt.Printf("[AG DEBUG] Payload for %s: %s\n", upstreamModel, string(geminiBody))
+	// fmt.Printf("[AG DEBUG] Payload for %s: %s\n", upstreamModel, string(geminiBody))
 
 	action := "generateContent"
 	if stream {

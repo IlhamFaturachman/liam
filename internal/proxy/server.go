@@ -62,7 +62,7 @@ func Start(cfg *config.Config, database *db.Database) error {
 		harvest:      harvest.NewHarvestService(cfg, database),
 		registry:     registry,
 		aliases:      aliases,
-		integrations: integrations.NewService(),
+		integrations: integrations.NewService(registry),
 		combo:        NewComboHandler(database),
 	}
 

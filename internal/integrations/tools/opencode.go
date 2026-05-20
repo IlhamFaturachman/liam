@@ -79,11 +79,38 @@ func (o *OpenCode) Apply(cfg ToolConfig) error {
 		subagent = "ag/claude-sonnet-4-6"
 	}
 
-	models := map[string]interface{}{
-		primary: map[string]interface{}{"name": modelDisplay(primary)},
-	}
-	if subagent != primary {
-		models[subagent] = map[string]interface{}{"name": modelDisplay(subagent)}
+	models := map[string]interface{}{}
+
+	// Populate with all models from LIAM registry
+	if len(cfg.AllModels) > 0 {
+		for _, m := range cfg.AllModels {
+			models[m.ID] = map[string]interface{}{
+				"name": m.DisplayName,
+				// Add modalities to enable vision natively for all LIAM models
+				"modalities": map[string]interface{}{
+					"input":  []string{"text", "image"},
+					"output": []string{"text"},
+				},
+			}
+		}
+	} else {
+		// Fallback if registry list is somehow empty
+		models[primary] = map[string]interface{}{
+			"name": modelDisplay(primary),
+			"modalities": map[string]interface{}{
+				"input":  []string{"text", "image"},
+				"output": []string{"text"},
+			},
+		}
+		if subagent != primary {
+			models[subagent] = map[string]interface{}{
+				"name": modelDisplay(subagent),
+				"modalities": map[string]interface{}{
+					"input":  []string{"text", "image"},
+					"output": []string{"text"},
+				},
+			}
+		}
 	}
 
 	providers["liam"] = map[string]interface{}{
@@ -252,13 +279,13 @@ func (o *OpenCode) Snippet(cfg ToolConfig) string {
         "apiKey": "%s"
       },
       "models": {
-        "%s": { "name": "%s" },
-        "%s": { "name": "%s" }
+        "%s": { "name": "%s", "modalities": { "input": ["text", "image"], "output": ["text"] } },
+        "...": "..."
       }
     }
   }
 }`, primary, subagent, cfg.BaseURL, cfg.APIKey,
-		primary, modelDisplay(primary), subagent, modelDisplay(subagent))
+		primary, modelDisplay(primary))
 }
 
 func modelDisplay(modelID string) string {
