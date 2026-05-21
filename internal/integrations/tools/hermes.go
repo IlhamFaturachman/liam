@@ -21,7 +21,7 @@ func (h *Hermes) SupportsAutoApply() bool { return true }
 
 func (h *Hermes) ModelSlots() []ModelSlot {
 	return []ModelSlot{
-		{Key: "primary", Label: "Default Model", Description: "Model used by Hermes agent", Default: "ag/claude-opus-4-6-thinking"},
+		{Key: "primary", Label: "Default Model", Description: "Model used by Hermes agent", Default: "kr/claude-opus-4.7"},
 	}
 }
 
@@ -66,7 +66,7 @@ func (h *Hermes) Apply(cfg ToolConfig) error {
 
 	model := cfg.Models["primary"]
 	if model == "" {
-		model = "ag/claude-opus-4-6-thinking"
+		model = "kr/claude-opus-4.7"
 	}
 
 	existing := ""
@@ -115,7 +115,7 @@ func (h *Hermes) Reset() error {
 func (h *Hermes) Snippet(cfg ToolConfig) string {
 	model := cfg.Models["primary"]
 	if model == "" {
-		model = "ag/claude-opus-4-6-thinking"
+		model = "kr/claude-opus-4.7"
 	}
 	return fmt.Sprintf(`# ~/.hermes/config.yaml
 model:

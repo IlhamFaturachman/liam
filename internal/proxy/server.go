@@ -64,8 +64,61 @@ func Start(cfg *config.Config, database *db.Database) error {
 		harvest:      harvest.NewHarvestService(cfg, database),
 		registry:     registry,
 		aliases:      aliases,
-		integrations: integrations.NewService(),
+		integrations: integrations.NewService(registry),
 		combo:        NewComboHandler(database),
+	}
+
+	// Wire up harvest quota fetching immediately upon import
+	s.harvest.OnAccountImported = func(account *db.Account) {
+		if account.Provider == "antigravity" {
+			var creds struct {
+				AccessToken string `json:"access_token"`
+			}
+			if err := json.Unmarshal(account.Credentials, &creds); err == nil && creds.AccessToken != "" {
+				if qr, qErr := antigravity.FetchQuota(creds.AccessToken); qErr == nil && qr != nil {
+					account.QuotaTotal = qr.Total
+					account.QuotaRemaining = qr.Total - qr.Used
+					account.Plan = qr.Plan
+					if qr.ResetAt != "" {
+						if t, parseErr := time.Parse(time.RFC3339, qr.ResetAt); parseErr == nil {
+							account.QuotaResetAt = &t
+						}
+					}
+					if len(qr.Breakdown) > 0 {
+						if b, mErr := json.Marshal(qr.Breakdown); mErr == nil {
+							account.QuotaBreakdown = b
+						}
+					}
+				}
+			}
+		} else if account.Provider == "kiro" {
+			var creds struct {
+				AccessToken string `json:"access_token"`
+				ProfileARN  string `json:"profile_arn"`
+			}
+			if err := json.Unmarshal(account.Credentials, &creds); err == nil && creds.AccessToken != "" {
+				if qr, qErr := kiro.FetchQuota(creds.AccessToken, creds.ProfileARN); qErr == nil && qr != nil {
+					account.QuotaTotal = qr.Total
+					account.QuotaRemaining = qr.Total - qr.Used
+					account.Plan = qr.Plan
+					if qr.ResetAt != "" {
+						if t, parseErr := time.Parse(time.RFC3339, qr.ResetAt); parseErr == nil {
+							account.QuotaResetAt = &t
+						}
+					}
+					if len(qr.Breakdown) > 0 {
+						if b, mErr := json.Marshal(qr.Breakdown); mErr == nil {
+							account.QuotaBreakdown = b
+						}
+					}
+				}
+			}
+		}
+
+		// Fallback to UpsertAccount with or without quota data
+		if err := database.UpsertAccount(account); err != nil {
+			log.Printf("IMPORT ERROR: %s - %v", account.Email, err)
+		}
 	}
 
 	// Build the provider registry. New backends drop in here without
@@ -176,6 +229,8 @@ func Start(cfg *config.Config, database *db.Database) error {
 			// Settings
 			r.Get("/settings/base-url", s.handleGetBaseURL)
 			r.Post("/settings/base-url", s.handleSetBaseURL)
+			r.Get("/settings/token-saver", s.handleGetTokenSaver)
+			r.Post("/settings/token-saver", s.handleSetTokenSaver)
 
 			// Stats & Usage
 			r.Get("/stats", s.handleStats)
@@ -342,6 +397,25 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		body, _ = json.Marshal(req)
 	}
 
+	// Apply the operator-configured Kiro thinking default (LIAM_KIRO_THINKING_DEFAULT)
+	// when the request didn't bring its own DSL suffix. Out-of-the-box
+	// LIAM ships with the default set to "max" so every Kiro Claude
+	// call gets the upstream's full reasoning budget without the user
+	// having to remember the (max) syntax in every model id. Operators
+	// who want lighter / disabled defaults set the env var.
+	//
+	// Note: only applied to Kiro routes. Antigravity / other providers
+	// keep their existing behaviour because their reasoning_effort
+	// semantics are different (-thinking suffix path below).
+	if s.cfg.KiroThinkingDefault != "" && strings.ToLower(s.cfg.KiroThinkingDefault) != "off" {
+		if strings.HasPrefix(model, "kr/") || strings.HasPrefix(model, "kiro/") {
+			if _, ok := req["reasoning_effort"]; !ok {
+				req["reasoning_effort"] = s.cfg.KiroThinkingDefault
+				body, _ = json.Marshal(req)
+			}
+		}
+	}
+
 	// Option C Thinking: handle -thinking suffix (backward compat).
 	//
 	// For Antigravity we map the suffix to reasoning_effort=high and route
@@ -390,6 +464,17 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// chat handler stays provider-agnostic.
 	provider := s.resolveProviderFromModel(model)
 	providerInfo := s.providers.ByID(provider)
+
+	// Token savers (RTK + Caveman) — run AFTER thinking DSL has been
+	// stripped from the model name and BEFORE combo dispatch / any
+	// provider's translateRequest. This keeps both savers
+	// provider-agnostic by operating on the OpenAI canonical shape
+	// that all clients speak. Combo paths inherit the savings via
+	// `body` and `req` (we always re-marshal in lockstep).
+	// See internal/proxy/tokensaver.go for design notes on safety
+	// w.r.t. Kiro overlay, tool calls, and thinking config.
+	policy := loadTokenSaverPolicy(s.db, r.Header)
+	body = applyTokenSavers(req, body, policy)
 
 	// Extract session ID for session affinity
 	sessionID := extractSessionID(r, req)

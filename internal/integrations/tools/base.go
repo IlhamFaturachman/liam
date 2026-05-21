@@ -10,8 +10,15 @@ import (
 type ToolConfig struct {
 	APIKey      string            `json:"api_key"`
 	BaseURL     string            `json:"base_url"`
-	Models      map[string]string `json:"models"`       // slot name -> model id (e.g. "primary": "ag/claude-opus-4-6-thinking")
+	Models      map[string]string `json:"models"`       // slot name -> model id (e.g. "primary": "kr/claude-opus-4.7")
 	AgentModels map[string]string `json:"agent_models"` // for tools with per-agent overrides (OpenClaw)
+	AllModels   []ModelInfo       `json:"all_models"`   // all available models in the registry
+}
+
+// ModelInfo describes a model available in the registry
+type ModelInfo struct {
+	ID          string `json:"id"`           // "ag/claude-opus-4-6-thinking"
+	DisplayName string `json:"display_name"` // "Claude Opus 4.6 Thinking"
 }
 
 // ModelSlot describes a model configuration slot for a tool

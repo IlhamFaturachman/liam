@@ -18,7 +18,7 @@ func (c *Cline) SupportsAutoApply() bool { return false }
 
 func (c *Cline) ModelSlots() []ModelSlot {
 	return []ModelSlot{
-		{Key: "primary", Label: "Default Model", Description: "Model to use in Cline", Default: "ag/claude-opus-4-6-thinking"},
+		{Key: "primary", Label: "Default Model", Description: "Model to use in Cline", Default: "kr/claude-opus-4.7"},
 	}
 }
 
@@ -77,7 +77,7 @@ func (c *Cline) Reset() error {
 func (c *Cline) Snippet(cfg ToolConfig) string {
 	model := cfg.Models["primary"]
 	if model == "" {
-		model = "ag/claude-opus-4-6-thinking"
+		model = "kr/claude-opus-4.7"
 	}
 	return fmt.Sprintf(`Cline (VSCode extension) → Settings:
 

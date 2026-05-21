@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -21,10 +22,25 @@ type Executor struct {
 	client *http.Client
 }
 
-// NewExecutor creates a new Kiro executor
+// NewExecutor creates a new Kiro executor.
+//
+// We deliberately do NOT set http.Client.Timeout: that field caps the
+// entire request lifecycle including streaming body reads, which would
+// truncate long Kiro EventStream responses (commonly 5–20 minutes for
+// agentic coding tasks). Mid-stream truncation surfaces downstream as
+// half-formed tool calls like
+//
+//	{"filePath": "/path/to/file.md"
+//
+// which then explodes in the consumer's JSON.parse with the dreaded
+// "Expected '}'" error. Instead we install a custom Transport whose
+// ResponseHeaderTimeout caps the *time-to-first-byte* (so a hung
+// upstream still surfaces quickly) without bounding the streaming body.
+// See CLIProxyAPI's AGENTS.md: "after an upstream connection is
+// established, do not set timeouts for any subsequent network behavior."
 func NewExecutor() *Executor {
 	return &Executor{
-		client: upstream.NewUTLSClient(120 * time.Second),
+		client: upstream.NewUTLSClient(0, 60*time.Second),
 	}
 }
 
@@ -54,6 +70,20 @@ func (e *Executor) ExecuteWithSession(account *db.Account, model string, body []
 	kiroBody, err := translateRequest(model, body, creds.ProfileARN)
 	if err != nil {
 		return nil, fmt.Errorf("translate request: %w", err)
+	}
+
+	// Trace whether thinking-mode is active for this request. Useful for
+	// operators verifying that `model(max)` / `model-thinking` actually
+	// flow through the translator. Only logs when the tag is present;
+	// silent for plain non-thinking calls so the log stays tidy.
+	if bytes.Contains(kiroBody, []byte("<thinking_mode>enabled</thinking_mode>")) {
+		const tag = "<max_thinking_length>"
+		if i := bytes.Index(kiroBody, []byte(tag)); i >= 0 {
+			rest := kiroBody[i+len(tag):]
+			if end := bytes.IndexByte(rest, '<'); end > 0 {
+				log.Printf("[KIRO] thinking enabled, model=%s, budget=%s", model, rest[:end])
+			}
+		}
 	}
 
 	// Build URL

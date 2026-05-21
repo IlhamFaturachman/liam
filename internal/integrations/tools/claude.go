@@ -19,7 +19,7 @@ func (c *ClaudeCode) SupportsAutoApply() bool { return true }
 
 func (c *ClaudeCode) ModelSlots() []ModelSlot {
 	return []ModelSlot{
-		{Key: "opus", Label: "Opus Model", Description: "Default model for opus class requests", Default: "ag/claude-opus-4-6-thinking"},
+		{Key: "opus", Label: "Opus Model", Description: "Default model for opus class requests", Default: "kr/claude-opus-4.7"},
 		{Key: "sonnet", Label: "Sonnet Model", Description: "Default model for sonnet class requests", Default: "ag/claude-sonnet-4-6"},
 		{Key: "haiku", Label: "Haiku Model", Description: "Default model for haiku class requests", Default: "ag/claude-sonnet-4-6"},
 	}
@@ -123,7 +123,7 @@ func (c *ClaudeCode) Snippet(cfg ToolConfig) string {
 	sonnet := cfg.Models["sonnet"]
 	haiku := cfg.Models["haiku"]
 	if opus == "" {
-		opus = "ag/claude-opus-4-6-thinking"
+		opus = "kr/claude-opus-4.7"
 	}
 	if sonnet == "" {
 		sonnet = "ag/claude-sonnet-4-6"

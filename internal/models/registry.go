@@ -50,22 +50,26 @@ func ProviderByAlias(alias string) *Provider {
 func BuiltInModels() []Model {
 	return []Model{
 		// Antigravity
-		{ProviderAlias: "ag", ModelID: "gemini-3.1-pro-high", DisplayName: "Gemini 3 Pro High", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
-		{ProviderAlias: "ag", ModelID: "gemini-3.1-pro-low", DisplayName: "Gemini 3 Pro Low", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
-		{ProviderAlias: "ag", ModelID: "gemini-3-flash", DisplayName: "Gemini 3 Flash", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{"thinking": false}},
-		{ProviderAlias: "ag", ModelID: "claude-sonnet-4-6", DisplayName: "Claude Sonnet 4.6", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
-		{ProviderAlias: "ag", ModelID: "claude-opus-4-6-thinking", DisplayName: "Claude Opus 4.6 Thinking", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
-		{ProviderAlias: "ag", ModelID: "gpt-oss-120b-medium", DisplayName: "GPT OSS 120B Medium", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "ag", ModelID: "gemini-pro-agent", DisplayName: "AG Gemini 3.1 Pro High", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "ag", ModelID: "gemini-3.1-pro-low", DisplayName: "AG Gemini 3.1 Pro Low", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "ag", ModelID: "gemini-3-flash", DisplayName: "AG Gemini 3 Flash", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{"thinking": false}},
+		{ProviderAlias: "ag", ModelID: "claude-sonnet-4-6", DisplayName: "AG Claude Sonnet 4.6", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "ag", ModelID: "claude-opus-4-6-thinking", DisplayName: "AG Claude Opus 4.6 Thinking", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "ag", ModelID: "gpt-oss-120b-medium", DisplayName: "AG GPT OSS 120B Medium", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "ag", ModelID: "gemini-3-pro-high", DisplayName: "AG Gemini 3 Pro High", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "ag", ModelID: "gemini-3-pro-low", DisplayName: "AG Gemini 3 Pro Low", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "ag", ModelID: "gemini-3.1-flash-image", DisplayName: "AG Gemini 3.1 Flash Image", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "ag", ModelID: "gemini-3.1-flash-lite", DisplayName: "AG Gemini 3.1 Flash Lite", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
 
 		// Kiro
-		{ProviderAlias: "kr", ModelID: "claude-sonnet-4.5", DisplayName: "Claude Sonnet 4.5", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
-		{ProviderAlias: "kr", ModelID: "claude-haiku-4.5", DisplayName: "Claude Haiku 4.5", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
-		{ProviderAlias: "kr", ModelID: "claude-opus-4.6", DisplayName: "Claude Opus 4.6", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
-		{ProviderAlias: "kr", ModelID: "claude-opus-4.7", DisplayName: "Claude Opus 4.7", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
-		{ProviderAlias: "kr", ModelID: "deepseek-3.2", DisplayName: "DeepSeek 3.2", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
-		{ProviderAlias: "kr", ModelID: "qwen3-coder-next", DisplayName: "Qwen3 Coder Next", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
-		{ProviderAlias: "kr", ModelID: "glm-5", DisplayName: "GLM 5", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
-		{ProviderAlias: "kr", ModelID: "MiniMax-M2.5", DisplayName: "MiniMax M2.5", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "kr", ModelID: "claude-sonnet-4.5", DisplayName: "KR Claude Sonnet 4.5", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "kr", ModelID: "claude-haiku-4.5", DisplayName: "KR Claude Haiku 4.5", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "kr", ModelID: "claude-opus-4.6", DisplayName: "KR Claude Opus 4.6", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "kr", ModelID: "claude-opus-4.7", DisplayName: "KR Claude Opus 4.7", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "kr", ModelID: "deepseek-3.2", DisplayName: "KR DeepSeek 3.2", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "kr", ModelID: "qwen3-coder-next", DisplayName: "KR Qwen3 Coder Next", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "kr", ModelID: "glm-5", DisplayName: "KR GLM 5", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "kr", ModelID: "MiniMax-M2.5", DisplayName: "KR MiniMax M2.5", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
 		// NOTE on thinking: Kiro upstream rejects model SKUs with the
 		// `-thinking` suffix ("Invalid model" error from CodeWhisperer).
 		// Models like deepseek-3.2 emit reasoningContentEvent natively

@@ -6,17 +6,19 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/liam-auto/liam/internal/models"
 	tools "github.com/liam-auto/liam/internal/integrations/tools"
 )
 
 // Service manages all CLI tool integrations
 type Service struct {
-	tools map[string]tools.Tool
-	order []string
+	tools    map[string]tools.Tool
+	order    []string
+	registry *models.Registry
 }
 
 // NewService creates a new integrations service with all tool adapters
-func NewService() *Service {
+func NewService(registry *models.Registry) *Service {
 	t := []tools.Tool{
 		&tools.ClaudeCode{},
 		&tools.Codex{},
@@ -34,7 +36,7 @@ func NewService() *Service {
 		order = append(order, tool.Name())
 	}
 
-	return &Service{tools: m, order: order}
+	return &Service{tools: m, order: order, registry: registry}
 }
 
 // HandleList returns the list of all tools with their status
@@ -46,9 +48,13 @@ func (s *Service) HandleList(w http.ResponseWriter, r *http.Request) {
 	result := []ToolInfo{}
 	for _, name := range s.order {
 		tool, ok := s.tools[name]
-		if !ok { continue }
+		if !ok {
+			continue
+		}
 		status, err := tool.Status()
-		if err != nil { continue }
+		if err != nil {
+			continue
+		}
 		result = append(result, ToolInfo{ToolStatus: status})
 	}
 	writeJSON(w, 200, result)
@@ -73,8 +79,12 @@ func (s *Service) HandleGet(w http.ResponseWriter, r *http.Request) {
 	model := r.URL.Query().Get("model")
 	apiKey := r.URL.Query().Get("api_key")
 	baseURL := r.URL.Query().Get("base_url")
-	if apiKey == "" { apiKey = "<YOUR_KEY>" }
-	if baseURL == "" { baseURL = "http://localhost:666/v1" }
+	if apiKey == "" {
+		apiKey = "<YOUR_KEY>"
+	}
+	if baseURL == "" {
+		baseURL = "http://localhost:666/v1"
+	}
 
 	models := map[string]string{}
 	for _, slot := range tool.ModelSlots() {
@@ -88,10 +98,24 @@ func (s *Service) HandleGet(w http.ResponseWriter, r *http.Request) {
 		models[slot.Key] = val
 	}
 
+	var allModels []tools.ModelInfo
+	if s.registry != nil {
+		list, _ := s.registry.List("")
+		for _, m := range list {
+			if m.IsEnabled {
+				allModels = append(allModels, tools.ModelInfo{
+					ID:          m.ID,
+					DisplayName: m.DisplayName,
+				})
+			}
+		}
+	}
+
 	cfg := tools.ToolConfig{
-		APIKey:  apiKey,
-		BaseURL: baseURL,
-		Models:  models,
+		APIKey:    apiKey,
+		BaseURL:   baseURL,
+		Models:    models,
+		AllModels: allModels,
 	}
 
 	type Detail struct {
@@ -134,11 +158,25 @@ func (s *Service) HandleApply(w http.ResponseWriter, r *http.Request) {
 		req.Models = map[string]string{}
 	}
 
+	var allModels []tools.ModelInfo
+	if s.registry != nil {
+		list, _ := s.registry.List("")
+		for _, m := range list {
+			if m.IsEnabled {
+				allModels = append(allModels, tools.ModelInfo{
+					ID:          m.ID,
+					DisplayName: m.DisplayName,
+				})
+			}
+		}
+	}
+
 	cfg := tools.ToolConfig{
 		APIKey:      req.APIKey,
 		BaseURL:     req.BaseURL,
 		Models:      req.Models,
 		AgentModels: req.AgentModels,
+		AllModels:   allModels,
 	}
 
 	if err := tool.Apply(cfg); err != nil {
@@ -170,13 +208,32 @@ func (s *Service) HandleSnippet(w http.ResponseWriter, r *http.Request) {
 	}
 	json.NewDecoder(r.Body).Decode(&req)
 
-	if req.APIKey == "" { req.APIKey = "<YOUR_KEY>" }
-	if req.BaseURL == "" { req.BaseURL = "http://localhost:666/v1" }
-	if req.Models == nil { req.Models = map[string]string{} }
+	if req.APIKey == "" {
+		req.APIKey = "<YOUR_KEY>"
+	}
+	if req.BaseURL == "" {
+		req.BaseURL = "http://localhost:666/v1"
+	}
+	if req.Models == nil {
+		req.Models = map[string]string{}
+	}
 
 	for _, slot := range tool.ModelSlots() {
 		if req.Models[slot.Key] == "" {
 			req.Models[slot.Key] = slot.Default
+		}
+	}
+
+	var allModels []tools.ModelInfo
+	if s.registry != nil {
+		list, _ := s.registry.List("")
+		for _, m := range list {
+			if m.IsEnabled {
+				allModels = append(allModels, tools.ModelInfo{
+					ID:          m.ID,
+					DisplayName: m.DisplayName,
+				})
+			}
 		}
 	}
 
@@ -185,10 +242,11 @@ func (s *Service) HandleSnippet(w http.ResponseWriter, r *http.Request) {
 		BaseURL:     req.BaseURL,
 		Models:      req.Models,
 		AgentModels: req.AgentModels,
+		AllModels:   allModels,
 	}
 
 	writeJSON(w, 200, map[string]string{
-		"snippet": tool.Snippet(cfg),
+		"snippet":     tool.Snippet(cfg),
 		"config_path": tool.ConfigPath(),
 	})
 }

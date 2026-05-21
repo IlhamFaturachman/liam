@@ -18,7 +18,7 @@ func (c *Cursor) SupportsAutoApply() bool { return false }
 
 func (c *Cursor) ModelSlots() []ModelSlot {
 	return []ModelSlot{
-		{Key: "primary", Label: "Default Model", Description: "Model to use in Cursor", Default: "ag/claude-opus-4-6-thinking"},
+		{Key: "primary", Label: "Default Model", Description: "Model to use in Cursor", Default: "kr/claude-opus-4.7"},
 	}
 }
 
@@ -78,7 +78,7 @@ func (c *Cursor) Reset() error {
 func (c *Cursor) Snippet(cfg ToolConfig) string {
 	model := cfg.Models["primary"]
 	if model == "" {
-		model = "ag/claude-opus-4-6-thinking"
+		model = "kr/claude-opus-4.7"
 	}
 	return fmt.Sprintf(`Cursor → Settings → Models → OpenAI API:
 

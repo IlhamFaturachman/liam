@@ -19,7 +19,7 @@ func (o *OpenClaw) SupportsAutoApply() bool { return true }
 
 func (o *OpenClaw) ModelSlots() []ModelSlot {
 	return []ModelSlot{
-		{Key: "primary", Label: "Primary Model", Description: "Default model for all agents", Default: "ag/claude-opus-4-6-thinking"},
+		{Key: "primary", Label: "Primary Model", Description: "Default model for all agents", Default: "kr/claude-opus-4.7"},
 	}
 }
 
@@ -65,7 +65,7 @@ func (o *OpenClaw) Apply(cfg ToolConfig) error {
 
 	model := cfg.Models["primary"]
 	if model == "" {
-		model = "ag/claude-opus-4-6-thinking"
+		model = "kr/claude-opus-4.7"
 	}
 
 	mod, _ := cfgMap["models"].(map[string]interface{})
@@ -77,16 +77,27 @@ func (o *OpenClaw) Apply(cfg ToolConfig) error {
 		providers = map[string]interface{}{}
 	}
 
-	// Collect all unique models (primary + per-agent)
-	allModels := map[string]bool{model: true}
+	// Collect all unique models
+	allModels := map[string]string{}
+	allModels[model] = model
+
+	// Add all models from registry if available
+	if len(cfg.AllModels) > 0 {
+		for _, m := range cfg.AllModels {
+			allModels[m.ID] = m.DisplayName
+		}
+	}
+
 	for _, m := range cfg.AgentModels {
 		if m != "" {
-			allModels[m] = true
+			if _, exists := allModels[m]; !exists {
+				allModels[m] = m
+			}
 		}
 	}
 	modelsList := []map[string]interface{}{}
-	for m := range allModels {
-		modelsList = append(modelsList, map[string]interface{}{"id": m, "name": m})
+	for id, name := range allModels {
+		modelsList = append(modelsList, map[string]interface{}{"id": id, "name": name})
 	}
 
 	providers["liam"] = map[string]interface{}{
@@ -122,8 +133,8 @@ func (o *OpenClaw) Apply(cfg ToolConfig) error {
 			delete(dmodels, k)
 		}
 	}
-	for m := range allModels {
-		dmodels["liam/"+m] = map[string]interface{}{}
+	for id := range allModels {
+		dmodels["liam/"+id] = map[string]interface{}{}
 	}
 	defaults["models"] = dmodels
 	agents["defaults"] = defaults
@@ -224,7 +235,7 @@ func (o *OpenClaw) Reset() error {
 func (o *OpenClaw) Snippet(cfg ToolConfig) string {
 	model := cfg.Models["primary"]
 	if model == "" {
-		model = "ag/claude-opus-4-6-thinking"
+		model = "kr/claude-opus-4.7"
 	}
 	return fmt.Sprintf(`{
   "agents": {

@@ -86,6 +86,14 @@ function app() {
     baseURLOk: null,
     syncStatus: { enabled: false, connected: false, last_sync: '', supabase_url: '' },
 
+    // Token savers (RTK + Caveman). Defaults match the server constants
+    // in internal/proxy/tokensaver.go — RTK on, Caveman off, level lite —
+    // so an unconfigured fresh DB renders the same checkboxes the server
+    // will actually apply on first request.
+    tokenSaver: { rtk_enabled: true, caveman_enabled: false, caveman_level: 'lite' },
+    tokenSaverMsg: '',
+    tokenSaverOk: null,
+
     // Combos
     combos: [],
     showComboModal: false,
@@ -478,6 +486,7 @@ function app() {
         this.fetchSyncStatus(),
         this.fetchCombos(),
         this.fetchRouting(),
+        this.fetchTokenSaver(),
       ]);
       this.buildOverviewStats();
       this.startSSE();
@@ -1615,6 +1624,53 @@ function app() {
       setTimeout(() => { this.baseURLMsg = ''; }, 4000);
     },
 
+    // Token savers (RTK + Caveman). Settings load on page open; we save
+    // optimistically on every checkbox/level change so the user never
+    // has to hunt for a "Save" button — change the toggle, change is
+    // applied to the next request.
+    async fetchTokenSaver() {
+      try {
+        const r = await fetch('/api/settings/token-saver');
+        if (!r.ok) return;
+        const d = await r.json();
+        // Server is the source of truth; replace the local view rather
+        // than merge so a setting deleted server-side disappears here too.
+        this.tokenSaver.rtk_enabled = d.rtk_enabled;
+        this.tokenSaver.caveman_enabled = d.caveman_enabled;
+        this.tokenSaver.caveman_level = d.caveman_level || 'lite';
+      } catch (e) {
+        // Silent on initial fetch failure: page still loads, defaults
+        // ride along until next refresh.
+      }
+    },
+
+    async saveTokenSaver() {
+      this.tokenSaverMsg = '';
+      try {
+        const r = await fetch('/api/settings/token-saver', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            rtk_enabled: this.tokenSaver.rtk_enabled,
+            caveman_enabled: this.tokenSaver.caveman_enabled,
+            caveman_level: this.tokenSaver.caveman_level,
+          })
+        });
+        if (r.ok) {
+          this.tokenSaverMsg = 'Saved';
+          this.tokenSaverOk = true;
+        } else {
+          const d = await r.json().catch(() => ({}));
+          this.tokenSaverMsg = d.error?.message || 'Failed to save';
+          this.tokenSaverOk = false;
+        }
+      } catch (e) {
+        this.tokenSaverMsg = 'Connection error';
+        this.tokenSaverOk = false;
+      }
+      setTimeout(() => { this.tokenSaverMsg = ''; }, 3000);
+    },
+
     // Harvest
     async startHarvest() {
       if (!this.harvest.accounts.trim()) { this.toast('Paste accounts first', {kind:'warn'}); return; }
@@ -1818,7 +1874,7 @@ function app() {
           const percent = total > 0 ? Math.round((remaining / total) * 100) : 0;
           return {
             key,
-            label: this.quotaResourceLabel(key),
+            label: entry?.label || this.quotaResourceLabel(key),
             used,
             total,
             remaining,

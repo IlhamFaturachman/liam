@@ -14,7 +14,12 @@ import (
 // indistinguishable from real Kiro (Electron) or Antigravity (VS Code/Electron)
 // IDE traffic at the TLS layer. Uses HTTP/1.1 negotiation for broad
 // compatibility with AWS and Google provider endpoints.
-func NewUTLSClient(timeout time.Duration) *http.Client {
+//
+// timeout is the overall request deadline (0 = none; use 0 for streaming
+// providers to avoid truncating long SSE sessions).
+// responseHeaderTimeout caps time-to-first-byte so a hung upstream surfaces
+// quickly without bounding the streaming body.
+func NewUTLSClient(timeout time.Duration, responseHeaderTimeout time.Duration) *http.Client {
 	dialer := &net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
@@ -40,9 +45,10 @@ func NewUTLSClient(timeout time.Duration) *http.Client {
 				}
 				return tlsConn, nil
 			},
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 10,
-			IdleConnTimeout:     90 * time.Second,
+			MaxIdleConns:          100,
+			MaxIdleConnsPerHost:   10,
+			IdleConnTimeout:       90 * time.Second,
+			ResponseHeaderTimeout: responseHeaderTimeout,
 		},
 		Timeout: timeout,
 	}

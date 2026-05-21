@@ -75,11 +75,17 @@ func FetchModels(accessToken string) ([]UpstreamModel, error) {
 // staticAGModels returns the known AG models (fallback)
 func staticAGModels() []UpstreamModel {
 	return []UpstreamModel{
-		{ID: "gemini-3.1-pro-high", Name: "Gemini 3 Pro High"},
-		{ID: "gemini-3.1-pro-low", Name: "Gemini 3 Pro Low"},
-		{ID: "gemini-3-flash", Name: "Gemini 3 Flash"},
-		{ID: "claude-sonnet-4-6", Name: "Claude Sonnet 4.6"},
-		{ID: "claude-opus-4-6-thinking", Name: "Claude Opus 4.6 Thinking"},
-		{ID: "gpt-oss-120b-medium", Name: "GPT OSS 120B Medium"},
+		{ID: "gemini-pro-agent", Name: "AG Gemini 3.1 Pro High"},
+		{ID: "gemini-3.1-pro-low", Name: "AG Gemini 3.1 Pro Low"},
+		{ID: "gemini-3-flash", Name: "AG Gemini 3 Flash"},
+		{ID: "claude-sonnet-4-6", Name: "AG Claude Sonnet 4.6"},
+		{ID: "claude-opus-4-6-thinking", Name: "AG Claude Opus 4.6 Thinking"},
+		{ID: "gpt-oss-120b-medium", Name: "AG GPT OSS 120B Medium"},
+
+		// older or redundant references:
+		{ID: "gemini-3-pro-high", Name: "AG Gemini 3 Pro High"},
+		{ID: "gemini-3-pro-low", Name: "AG Gemini 3 Pro Low"},
+		{ID: "gemini-3.1-flash-image", Name: "AG Gemini 3.1 Flash Image"},
+		{ID: "gemini-3.1-flash-lite", Name: "AG Gemini 3.1 Flash Lite"},
 	}
 }

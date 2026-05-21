@@ -65,6 +65,15 @@ type Config struct {
 	DisableAfterErrors   int // Disable account after N consecutive errors
 	StickyRequests       int // Use same account for N requests before rotating (0=pure LRU)
 
+	// Provider behaviour knobs
+	// KiroThinkingDefault is the implicit thinking budget applied to
+	// every Kiro request that doesn't carry an explicit DSL suffix
+	// (e.g. `kr/claude-opus-4.7`). Accepts: "off", "low", "medium",
+	// "high", "max", or a numeric token budget. The DSL suffix on the
+	// model id always wins — `kr/claude-opus-4.7(none)` forces no
+	// thinking even when the default is "max".
+	KiroThinkingDefault string
+
 	// Token refresh
 	RefreshLeadMin int // Refresh token N minutes before expiry
 }
@@ -119,6 +128,13 @@ func Load() *Config {
 		CooldownMaxSec:     cooldownMax,  // 30 min max cooldown
 		DisableAfterErrors: disableAfter, // Disable after 10 consecutive errors
 		StickyRequests:     stickyReqs,   // Use same account for 3 requests then rotate
+
+		// Default Kiro thinking budget (applied when the request doesn't
+		// supply its own DSL suffix). "max" gives every Opus/Sonnet
+		// Claude on Kiro the upstream's full thinking budget out of
+		// the box — operators who want lighter behaviour can set
+		// LIAM_KIRO_THINKING_DEFAULT=off / low / medium / high.
+		KiroThinkingDefault: getEnv("LIAM_KIRO_THINKING_DEFAULT", "max"),
 
 		// Token refresh
 		RefreshLeadMin: 5,
