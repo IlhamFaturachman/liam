@@ -93,6 +93,33 @@ function app() {
     tokenSaver: { rtk_enabled: true, caveman_enabled: false, caveman_level: 'lite' },
     tokenSaverMsg: '',
     tokenSaverOk: null,
+    contentFilters: {
+      mode: 'off',
+      rules: [],
+      modes: [
+        { id: 'both', enabled: false },
+        { id: 'cloud', enabled: false },
+        { id: 'local', enabled: true },
+        { id: 'off', enabled: true },
+      ],
+      tabs: [
+        { id: 'cloud', enabled: false },
+        { id: 'local', enabled: true },
+        { id: 'community', enabled: false },
+      ],
+      activeTab: 'local',
+    },
+    contentFilterForm: {
+      id: '',
+      pattern_type: 'exact',
+      pattern: '',
+      replacement: '',
+      case_insensitive: false,
+      enabled: true,
+      position: 0,
+    },
+    contentFilterMsg: '',
+    contentFilterOk: null,
 
     // Combos
     combos: [],
@@ -487,6 +514,7 @@ function app() {
         this.fetchCombos(),
         this.fetchRouting(),
         this.fetchTokenSaver(),
+        this.fetchContentFilters(),
       ]);
       this.buildOverviewStats();
       this.startSSE();
@@ -1669,6 +1697,183 @@ function app() {
         this.tokenSaverOk = false;
       }
       setTimeout(() => { this.tokenSaverMsg = ''; }, 3000);
+    },
+
+    async fetchContentFilters() {
+      try {
+        const r = await fetch('/api/settings/content-filters');
+        if (!r.ok) return;
+        const d = await r.json();
+        this.contentFilters.mode = d.mode || 'off';
+        this.contentFilters.rules = d.rules || [];
+        if (Array.isArray(d.modes)) this.contentFilters.modes = d.modes;
+        if (Array.isArray(d.tabs)) this.contentFilters.tabs = d.tabs;
+      } catch (e) {
+        // Keep page usable on transient failures.
+      }
+    },
+
+    async setContentFilterMode(mode) {
+      if (mode !== 'local' && mode !== 'off') return;
+      try {
+        const r = await fetch('/api/settings/content-filters/mode', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ mode })
+        });
+        if (!r.ok) {
+          const d = await r.json().catch(() => ({}));
+          this.contentFilterMsg = d.error?.message || 'Failed to save mode';
+          this.contentFilterOk = false;
+          return;
+        }
+        const d = await r.json();
+        this.contentFilters.mode = d.mode || mode;
+        this.contentFilterMsg = 'Mode saved';
+        this.contentFilterOk = true;
+      } catch (e) {
+        this.contentFilterMsg = 'Connection error';
+        this.contentFilterOk = false;
+      }
+      setTimeout(() => { this.contentFilterMsg = ''; }, 3000);
+    },
+
+    resetContentFilterForm() {
+      this.contentFilterForm = {
+        id: '',
+        pattern_type: 'exact',
+        pattern: '',
+        replacement: '',
+        case_insensitive: false,
+        enabled: true,
+        position: 0,
+      };
+    },
+
+    editContentFilterRule(rule) {
+      this.contentFilterForm = {
+        id: rule.id || '',
+        pattern_type: rule.pattern_type || 'exact',
+        pattern: rule.pattern || '',
+        replacement: rule.replacement || '',
+        case_insensitive: !!rule.case_insensitive,
+        enabled: rule.enabled !== false,
+        position: rule.position || 0,
+      };
+    },
+
+    async saveContentFilterRule() {
+      this.contentFilterMsg = '';
+      const form = this.contentFilterForm;
+      if (!form.pattern || !form.pattern.trim()) {
+        this.contentFilterMsg = 'Pattern is required';
+        this.contentFilterOk = false;
+        return;
+      }
+      const payload = {
+        pattern_type: form.pattern_type,
+        pattern: form.pattern,
+        replacement: form.replacement || '',
+        case_insensitive: !!form.case_insensitive,
+        enabled: !!form.enabled,
+      };
+      if (form.position > 0) payload.position = form.position;
+
+      try {
+        let r;
+        if (form.id) {
+          r = await fetch('/api/settings/content-filters/rules/' + encodeURIComponent(form.id), {
+            method: 'PATCH',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(payload)
+          });
+        } else {
+          r = await fetch('/api/settings/content-filters/rules', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(payload)
+          });
+        }
+
+        if (!r.ok) {
+          const d = await r.json().catch(() => ({}));
+          this.contentFilterMsg = d.error?.message || 'Failed to save rule';
+          this.contentFilterOk = false;
+          return;
+        }
+        await this.fetchContentFilters();
+        this.resetContentFilterForm();
+        this.contentFilterMsg = 'Rule saved';
+        this.contentFilterOk = true;
+      } catch (e) {
+        this.contentFilterMsg = 'Connection error';
+        this.contentFilterOk = false;
+      }
+      setTimeout(() => { this.contentFilterMsg = ''; }, 3000);
+    },
+
+    async deleteContentFilterRule(id) {
+      if (!id) return;
+      const ok = await this.confirmDialog({
+        title: 'Delete filter rule?',
+        message: 'This cannot be undone.',
+        confirmLabel: 'Delete',
+        cancelLabel: 'Cancel',
+        danger: true,
+      });
+      if (!ok) return;
+
+      try {
+        const r = await fetch('/api/settings/content-filters/rules/' + encodeURIComponent(id), { method: 'DELETE' });
+        if (!r.ok) {
+          const d = await r.json().catch(() => ({}));
+          this.contentFilterMsg = d.error?.message || 'Failed to delete rule';
+          this.contentFilterOk = false;
+          return;
+        }
+        await this.fetchContentFilters();
+        this.contentFilterMsg = 'Rule deleted';
+        this.contentFilterOk = true;
+      } catch (e) {
+        this.contentFilterMsg = 'Connection error';
+        this.contentFilterOk = false;
+      }
+      setTimeout(() => { this.contentFilterMsg = ''; }, 3000);
+    },
+
+    async moveContentFilterRule(index, dir) {
+      const rules = this.contentFilters.rules || [];
+      const j = index + dir;
+      if (index < 0 || j < 0 || j >= rules.length) return;
+
+      const next = rules.slice();
+      const tmp = next[index];
+      next[index] = next[j];
+      next[j] = tmp;
+      this.contentFilters.rules = next.map((r, i) => ({ ...r, position: i + 1 }));
+
+      try {
+        const ids = this.contentFilters.rules.map(r => r.id).filter(Boolean);
+        const r = await fetch('/api/settings/content-filters/reorder', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ ids })
+        });
+        if (!r.ok) {
+          const d = await r.json().catch(() => ({}));
+          this.contentFilterMsg = d.error?.message || 'Failed to reorder';
+          this.contentFilterOk = false;
+          await this.fetchContentFilters();
+          return;
+        }
+        this.contentFilterMsg = 'Order saved';
+        this.contentFilterOk = true;
+      } catch (e) {
+        this.contentFilterMsg = 'Connection error';
+        this.contentFilterOk = false;
+        await this.fetchContentFilters();
+      }
+      setTimeout(() => { this.contentFilterMsg = ''; }, 3000);
     },
 
     // Harvest

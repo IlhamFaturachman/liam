@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -22,6 +23,9 @@ type Database struct {
 	db  *sql.DB
 	cfg *config.Config
 }
+
+// ErrNotFound indicates the requested row does not exist.
+var ErrNotFound = errors.New("not found")
 
 // Account represents a provider account
 type Account struct {
@@ -113,6 +117,20 @@ type UsageLog struct {
 	RequestBody  string    `json:"request_body,omitempty"`
 	ResponseBody string    `json:"response_body,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
+}
+
+// ContentFilterRule is one request-body text replacement rule.
+type ContentFilterRule struct {
+	ID              string    `json:"id"`
+	Source          string    `json:"source"` // v1: local
+	PatternType     string    `json:"pattern_type"`
+	Pattern         string    `json:"pattern"`
+	Replacement     string    `json:"replacement"`
+	CaseInsensitive bool      `json:"case_insensitive"`
+	Enabled         bool      `json:"enabled"`
+	Position        int       `json:"position"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 // New creates a new Database instance with auto-migration
@@ -213,6 +231,20 @@ func (d *Database) migrate() error {
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS content_filters (
+			id TEXT PRIMARY KEY,
+			source TEXT NOT NULL,
+			pattern_type TEXT NOT NULL,
+			pattern TEXT NOT NULL,
+			replacement TEXT NOT NULL DEFAULT '',
+			case_insensitive INTEGER NOT NULL DEFAULT 0,
+			enabled INTEGER NOT NULL DEFAULT 1,
+			position INTEGER NOT NULL DEFAULT 0,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_content_filters_source_position
+			ON content_filters(source, position)`,
 
 		`CREATE TABLE IF NOT EXISTS model_registry (
 			id TEXT PRIMARY KEY,
@@ -798,6 +830,137 @@ func (d *Database) SetSetting(key string, value string) error {
 		"INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
 		key, value)
 	return err
+}
+
+// ListContentFilterRules returns rules ordered by source/position.
+func (d *Database) ListContentFilterRules(source string) ([]ContentFilterRule, error) {
+	var rows *sql.Rows
+	var err error
+	if strings.TrimSpace(source) == "" {
+		rows, err = d.db.Query(`
+			SELECT id, source, pattern_type, pattern, replacement, case_insensitive, enabled, position, created_at, updated_at
+			FROM content_filters
+			ORDER BY source ASC, position ASC, created_at ASC`)
+	} else {
+		rows, err = d.db.Query(`
+			SELECT id, source, pattern_type, pattern, replacement, case_insensitive, enabled, position, created_at, updated_at
+			FROM content_filters
+			WHERE source = ?
+			ORDER BY position ASC, created_at ASC`, source)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]ContentFilterRule, 0)
+	for rows.Next() {
+		var r ContentFilterRule
+		var ci, en int
+		var createdAt, updatedAt string
+		if err := rows.Scan(&r.ID, &r.Source, &r.PatternType, &r.Pattern, &r.Replacement, &ci, &en, &r.Position, &createdAt, &updatedAt); err != nil {
+			return nil, err
+		}
+		r.CaseInsensitive = ci == 1
+		r.Enabled = en == 1
+		r.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+		r.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+// CreateContentFilterRule inserts a new content filter rule.
+func (d *Database) CreateContentFilterRule(rule *ContentFilterRule) (*ContentFilterRule, error) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if rule.ID == "" {
+		rule.ID = uuid.New().String()
+	}
+	if strings.TrimSpace(rule.Source) == "" {
+		rule.Source = "local"
+	}
+	if rule.Position <= 0 {
+		_ = d.db.QueryRow(`SELECT COALESCE(MAX(position), 0) + 1 FROM content_filters WHERE source = ?`, rule.Source).Scan(&rule.Position)
+	}
+	if _, err := d.db.Exec(`
+		INSERT INTO content_filters (id, source, pattern_type, pattern, replacement, case_insensitive, enabled, position, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		rule.ID, rule.Source, rule.PatternType, rule.Pattern, rule.Replacement,
+		boolToInt(rule.CaseInsensitive), boolToInt(rule.Enabled), rule.Position, now, now); err != nil {
+		return nil, err
+	}
+	return d.GetContentFilterRule(rule.ID)
+}
+
+// GetContentFilterRule returns one rule by id.
+func (d *Database) GetContentFilterRule(id string) (*ContentFilterRule, error) {
+	var r ContentFilterRule
+	var ci, en int
+	var createdAt, updatedAt string
+	err := d.db.QueryRow(`
+		SELECT id, source, pattern_type, pattern, replacement, case_insensitive, enabled, position, created_at, updated_at
+		FROM content_filters
+		WHERE id = ?`, id).Scan(
+		&r.ID, &r.Source, &r.PatternType, &r.Pattern, &r.Replacement, &ci, &en, &r.Position, &createdAt, &updatedAt)
+	if err != nil {
+		return nil, err
+	}
+	r.CaseInsensitive = ci == 1
+	r.Enabled = en == 1
+	r.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+	r.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+	return &r, nil
+}
+
+// UpdateContentFilterRule updates an existing content filter rule.
+func (d *Database) UpdateContentFilterRule(rule *ContentFilterRule) (*ContentFilterRule, error) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	res, err := d.db.Exec(`
+		UPDATE content_filters
+		SET pattern_type = ?, pattern = ?, replacement = ?, case_insensitive = ?, enabled = ?, position = ?, updated_at = ?
+		WHERE id = ? AND source = ?`,
+		rule.PatternType, rule.Pattern, rule.Replacement, boolToInt(rule.CaseInsensitive), boolToInt(rule.Enabled), rule.Position, now, rule.ID, rule.Source)
+	if err != nil {
+		return nil, err
+	}
+	if rows, _ := res.RowsAffected(); rows == 0 {
+		return nil, ErrNotFound
+	}
+	return d.GetContentFilterRule(rule.ID)
+}
+
+// DeleteContentFilterRule deletes a rule by id.
+func (d *Database) DeleteContentFilterRule(id string) error {
+	_, err := d.db.Exec(`DELETE FROM content_filters WHERE id = ?`, id)
+	return err
+}
+
+// ReorderContentFilterRules rewrites position from ordered IDs.
+func (d *Database) ReorderContentFilterRules(source string, ids []string) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	for i, id := range ids {
+		res, err := tx.Exec(`UPDATE content_filters SET position = ?, updated_at = ? WHERE id = ? AND source = ?`,
+			i+1, time.Now().UTC().Format(time.RFC3339Nano), id, source)
+		if err != nil {
+			return err
+		}
+		if rows, _ := res.RowsAffected(); rows != 1 {
+			return ErrNotFound
+		}
+	}
+	return tx.Commit()
+}
+
+func boolToInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
 }
 
 // EnsureInternalTestKey ensures an internal test API key exists for

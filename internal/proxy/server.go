@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -40,6 +41,10 @@ type Server struct {
 	integrations  *integrations.Service
 	syncer        *liamsync.Syncer
 	combo         *ComboHandler
+
+	contentFilterMu         sync.RWMutex
+	contentFilterCacheReady bool
+	contentFilterCompiled   []compiledContentFilterRule
 }
 
 // GetPort implements ServerConfig for ModelsHandler
@@ -231,6 +236,12 @@ func Start(cfg *config.Config, database *db.Database) error {
 			r.Post("/settings/base-url", s.handleSetBaseURL)
 			r.Get("/settings/token-saver", s.handleGetTokenSaver)
 			r.Post("/settings/token-saver", s.handleSetTokenSaver)
+			r.Get("/settings/content-filters", s.handleGetContentFilters)
+			r.Post("/settings/content-filters/mode", s.handleSetContentFilterMode)
+			r.Post("/settings/content-filters/rules", s.handleCreateContentFilterRule)
+			r.Patch("/settings/content-filters/rules/{id}", s.handleUpdateContentFilterRule)
+			r.Delete("/settings/content-filters/rules/{id}", s.handleDeleteContentFilterRule)
+			r.Post("/settings/content-filters/reorder", s.handleReorderContentFilterRules)
 
 			// Stats & Usage
 			r.Get("/stats", s.handleStats)
@@ -473,6 +484,15 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// `body` and `req` (we always re-marshal in lockstep).
 	// See internal/proxy/tokensaver.go for design notes on safety
 	// w.r.t. Kiro overlay, tool calls, and thinking config.
+	filterMode := normalizeContentFilterMode(s.db.GetSetting(settingContentFiltersMode, contentFilterModeOff))
+	if filterMode == contentFilterModeLocal {
+		compiled, cErr := s.getCompiledLocalContentFilters()
+		if cErr != nil {
+			log.Printf("[FILTER] compile failed: %v", cErr)
+		} else if applyContentFiltersToRequest(req, filterMode, compiled) {
+			body, _ = json.Marshal(req)
+		}
+	}
 	policy := loadTokenSaverPolicy(s.db, r.Header)
 	body = applyTokenSavers(req, body, policy)
 

@@ -213,12 +213,11 @@ func TestTrimHistoryToBudgetRespectsCurrentMessage(t *testing.T) {
 	t.Logf("trimmed: payload=%d bytes, history=%d items", len(out), len(hist))
 }
 
-// TestSchemaSanitization guards the regex of validation noise we strip from
-// tool parameter schemas. Each entry that lands in schemaNoiseFields
-// caused the OpenCode "SchemaError: Missing key" warning at least once in
-// real-world traffic — keeping them out of the prompt reduces the
-// retry-loop frequency without changing tool semantics.
-func TestSchemaSanitization(t *testing.T) {
+// TestSchemaPassThroughPreservesAnnotations verifies buildToolSpecs keeps
+// caller-provided JSON-schema annotations intact. We only patch required
+// structural keys (type/properties/required) and do not aggressively rewrite
+// schemas, which previously caused malformed tool payloads in real traffic.
+func TestSchemaPassThroughPreservesAnnotations(t *testing.T) {
 	body := []byte(`{
 		"model": "kr/claude-sonnet-4.6",
 		"messages": [{"role": "user", "content": "test"}],
@@ -261,12 +260,16 @@ func TestSchemaSanitization(t *testing.T) {
 	spec := tools[0].(map[string]interface{})["toolSpecification"].(map[string]interface{})
 	schema := spec["inputSchema"].(map[string]interface{})["json"].(map[string]interface{})
 
-	for noisy := range schemaNoiseFields {
-		if _, present := schema[noisy]; present {
-			t.Errorf("noise field %q should have been stripped", noisy)
+	for _, key := range []string{
+		"$schema", "$id", "$comment", "definitions", "$defs",
+		"examples", "readOnly", "writeOnly", "deprecated",
+		"contentMediaType", "contentEncoding",
+	} {
+		if _, present := schema[key]; !present {
+			t.Errorf("schema annotation %q should be preserved", key)
 		}
 	}
-	// But user-defined essentials must still be there.
+	// Essentials must still be there.
 	if schema["type"] != "object" {
 		t.Errorf("type field clobbered: %v", schema["type"])
 	}
@@ -278,10 +281,9 @@ func TestSchemaSanitization(t *testing.T) {
 	}
 }
 
-// TestSchemaRefIsResolved verifies that an unresolved $ref pointer (a
-// classic culprit behind the OpenCode validator warnings) is replaced
-// with a permissive object schema rather than forwarded as-is.
-func TestSchemaRefIsResolved(t *testing.T) {
+// TestSchemaRefIsPreserved verifies $ref pointers are passed through
+// unchanged. Kiro tolerates references and we avoid schema surgery.
+func TestSchemaRefIsPreserved(t *testing.T) {
 	body := []byte(`{
 		"model": "kr/claude-sonnet-4.6",
 		"messages": [{"role": "user", "content": "test"}],
@@ -313,10 +315,11 @@ func TestSchemaRefIsResolved(t *testing.T) {
 	schema := spec["inputSchema"].(map[string]interface{})["json"].(map[string]interface{})
 	props := schema["properties"].(map[string]interface{})
 	value := props["value"].(map[string]interface{})
-	if _, hasRef := value["$ref"]; hasRef {
-		t.Errorf("$ref leaked through: %v", value)
+	ref, hasRef := value["$ref"]
+	if !hasRef {
+		t.Fatalf("expected $ref to be preserved, got: %v", value)
 	}
-	if value["type"] != "object" {
-		t.Errorf("expected $ref replacement to be permissive object, got: %v", value)
+	if ref != "#/definitions/Whatever" {
+		t.Errorf("unexpected $ref value: %v", ref)
 	}
 }
