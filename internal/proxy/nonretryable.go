@@ -20,6 +20,10 @@ var nonRetryableKeywords = []string{
 	"invalid_api_key",
 	"billing_not_active",
 	"unsupported_model",
+	// ElevenLabs
+	"voice_not_found",
+	"detected_unusual_activity",
+	"text_too_long",
 }
 
 // Non-retryable status codes (when combined with error keywords)

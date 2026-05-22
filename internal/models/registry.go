@@ -33,6 +33,7 @@ func KnownProviders() []Provider {
 	return []Provider{
 		{ID: "antigravity", Alias: "ag", Name: "Antigravity"},
 		{ID: "kiro", Alias: "kr", Name: "Kiro"},
+		{ID: "elevenlabs", Alias: "el", Name: "ElevenLabs"},
 	}
 }
 
@@ -77,6 +78,12 @@ func BuiltInModels() []Model {
 		// variants for Kiro at all — see internal/proxy/server.go where
 		// the suffix is preserved literally only if the user adds a
 		// custom Kiro model with that name.
+
+		// ElevenLabs TTS
+		{ProviderAlias: "el", ModelID: "eleven_flash_v2_5", DisplayName: "EL Flash v2.5", Type: "tts", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "el", ModelID: "eleven_turbo_v2_5", DisplayName: "EL Turbo v2.5", Type: "tts", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "el", ModelID: "eleven_multilingual_v2", DisplayName: "EL Multilingual v2", Type: "tts", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "el", ModelID: "eleven_v3", DisplayName: "EL v3", Type: "tts", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
 	}
 }
 

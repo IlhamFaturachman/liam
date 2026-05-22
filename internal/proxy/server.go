@@ -22,6 +22,7 @@ import (
 	"github.com/liam-auto/liam/internal/models"
 	"github.com/liam-auto/liam/internal/providers/antigravity"
 	"github.com/liam-auto/liam/internal/providers/kiro"
+	"github.com/liam-auto/liam/internal/providers/elevenlabs"
 	liamsync "github.com/liam-auto/liam/internal/sync"
 )
 
@@ -32,6 +33,7 @@ type Server struct {
 	pool          *AccountPool
 	ag            *antigravity.Executor
 	kiro          *kiro.Executor
+	el            *elevenlabs.Executor
 	providers     *providerRegistry
 	harvest       *harvest.HarvestService
 	registry      *models.Registry
@@ -61,6 +63,7 @@ func Start(cfg *config.Config, database *db.Database) error {
 		pool:         NewAccountPool(database, cfg),
 		ag:           antigravity.NewExecutor(cfg),
 		kiro:         kiro.NewExecutor(),
+		el:           elevenlabs.NewExecutor(),
 		harvest:      harvest.NewHarvestService(cfg, database),
 		registry:     registry,
 		aliases:      aliases,
@@ -144,6 +147,14 @@ func Start(cfg *config.Config, database *db.Database) error {
 		Executor:       s.kiro,
 		Refresh:        RefreshKiroIfNeeded,
 	})
+	s.providers.Register(&ProviderInfo{
+		ID:             "elevenlabs",
+		Aliases:        []string{"el", "elevenlabs"},
+		Label:          "ElevenLabs",
+		Icon:           "graphic_eq",
+		SupportsImport: false,
+		Executor:       s.el,
+	})
 
 	// Initialize Supabase sync first so the models handler can wire it
 	// for auto-sync of custom-model CRUD.
@@ -197,6 +208,7 @@ func Start(cfg *config.Config, database *db.Database) error {
 	r.Route("/v1", func(r chi.Router) {
 		r.Use(s.authMiddleware)
 		r.Post("/chat/completions", s.handleChatCompletions)
+		r.Post("/audio/speech", s.handleAudioSpeech)
 		r.Get("/models", s.handleModels)
 	})
 
@@ -1222,6 +1234,9 @@ func (s *Server) handleAddAccount(w http.ResponseWriter, r *http.Request) {
 				input.Credentials = patched
 			}
 		}
+	case "elevenlabs":
+		s.handleAddElevenLabsAccount(w, input.Credentials)
+		return
 	}
 
 	account := &db.Account{

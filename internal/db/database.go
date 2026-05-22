@@ -587,6 +587,14 @@ func (d *Database) UpdateAccountCredentials(id string, creds json.RawMessage) er
 	return err
 }
 
+// DecrementAccountQuota subtracts cost from quota_remaining (floor at 0).
+func (d *Database) DecrementAccountQuota(id string, cost int) error {
+	_, err := d.db.Exec(
+		"UPDATE accounts SET quota_remaining = MAX(0, quota_remaining - ?) WHERE id = ?",
+		cost, id)
+	return err
+}
+
 // GetAccountsNeedingRefresh returns accounts with tokens expiring soon
 func (d *Database) GetAccountsNeedingRefresh(provider string, withinMinutes int) ([]Account, error) {
 	// We check credentials JSON for expires_at field. Guard with json_valid()
