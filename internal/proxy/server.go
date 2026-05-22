@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -48,7 +49,9 @@ func (s *Server) GetPort() int {
 }
 
 // Start initializes and starts the HTTP server
-func Start(cfg *config.Config, database *db.Database) error {
+// ListenAndServe initializes and starts the HTTP server with graceful shutdown.
+// When ctx is cancelled, the server drains active connections (up to 30s) before returning.
+func ListenAndServe(ctx context.Context, cfg *config.Config, database *db.Database) error {
 	registry := models.NewRegistry(database.Conn())
 	if err := registry.SeedBuiltIn(); err != nil {
 		log.Printf("[REGISTRY] Seed warning: %v", err)
@@ -302,7 +305,21 @@ func Start(cfg *config.Config, database *db.Database) error {
 	r.Get("/sse/requests", s.HandleSSE)
 
 	addr := fmt.Sprintf(":%d", cfg.Port)
-	return http.ListenAndServe(addr, r)
+	srv := &http.Server{Addr: addr, Handler: r}
+
+	go func() {
+		<-ctx.Done()
+		log.Println("[SHUTDOWN] Signal received, draining connections...")
+		shutCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		srv.Shutdown(shutCtx)
+	}()
+
+	err := srv.ListenAndServe()
+	if err == http.ErrServerClosed {
+		return nil
+	}
+	return err
 }
 
 // --- Auth Middleware ---
