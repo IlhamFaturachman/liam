@@ -727,7 +727,7 @@ function app() {
     async openAddAccount(replaceAccountId) {
       this.showAddAccountModal = true;
       this.addAccountTab = 'oauth';
-      this.addAccountForm = { refresh_token: '', email: '', callback_url: '' };
+      this.addAccountForm = { refresh_token: '', email: '', callback_url: '', api_key: '' };
       this.addAccountOAuthURL = '';
       this.addAccountMsg = '';
       this.addAccountLoading = false;
@@ -745,6 +745,9 @@ function app() {
             this.addAccountOAuthURL = d.auth_url;
           }
         } catch (e) {}
+      } else if (this.providerDetail === 'pioneer') {
+        // Pioneer: API key tab (no OAuth, no refresh token)
+        this.addAccountTab = 'apikey';
       } else {
         // Kiro: default to token tab
         this.addAccountTab = 'token';
@@ -802,6 +805,38 @@ function app() {
 
       try {
         const r = await fetch(endpoint, {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify(body)
+        });
+        const d = await r.json();
+        if (r.ok && d.success) {
+          this.addAccountMsg = (d.replaced ? 'Account re-imported: ' : 'Account added: ') + d.email;
+          this.addAccountOk = true;
+          await this.fetchAccounts();
+          await this.fetchProviders();
+          if (this.providerDetail) await this.openProvider(this.providerDetail);
+          setTimeout(() => this.closeAddAccount(), 2000);
+        } else {
+          this.addAccountMsg = d.error?.message || d.error || 'Failed';
+          this.addAccountOk = false;
+        }
+      } catch (e) { this.addAccountMsg = 'Connection error'; this.addAccountOk = false; }
+      this.addAccountLoading = false;
+    },
+
+    async submitAddAccountAPIKey() {
+      if (!this.addAccountForm.api_key) { this.addAccountMsg = 'API key required'; this.addAccountOk = false; return; }
+      this.addAccountLoading = true;
+      this.addAccountMsg = '';
+
+      const body = { api_key: this.addAccountForm.api_key, email: this.addAccountForm.email || '' };
+      if (this.addAccountReplaceId) {
+        body.account_id = this.addAccountReplaceId;
+      }
+
+      try {
+        const r = await fetch('/api/accounts/import/pio', {
           method: 'POST',
           headers: {'Content-Type':'application/json'},
           body: JSON.stringify(body)
@@ -906,6 +941,23 @@ function app() {
       }
       return r.error || 'Test failed';
     },
+    async cleanExhaustedAccounts() {
+      const exhausted = this.providerAccounts.filter(a => a.quota_total > 0 && a.quota_remaining === 0);
+      if (exhausted.length === 0) return;
+      if (!await this.confirmDialog(`Delete ${exhausted.length} exhausted account(s)? This cannot be undone.`, {title:'Clean Exhausted', danger:true, confirmLabel:'Delete All'})) return;
+      
+      let count = 0;
+      for (const a of exhausted) {
+        try {
+          const r = await fetch('/api/accounts/' + a.id, { method: 'DELETE' });
+          if (r.ok) count++;
+        } catch (e) {}
+      }
+      this.toast(`Deleted ${count} exhausted account(s)`, {kind:'success'});
+      await this.fetchAccounts();
+      await this.fetchProviders();
+      if (this.providerDetail) await this.openProvider(this.providerDetail);
+    },
     async deleteAccountById(id) {
       if (!await this.confirmDialog('Delete this account? This cannot be undone.', {title:'Delete account', danger:true, confirmLabel:'Delete'})) return;
       try {
@@ -965,6 +1017,7 @@ function app() {
     providerNameToAlias(name) {
       if (name === 'antigravity') return 'ag';
       if (name === 'kiro') return 'kr';
+      if (name === 'pioneer') return 'pio';
       return name;
     },
     async openProvider(name) {
@@ -1752,6 +1805,18 @@ function app() {
     quotaPercent(a) { return a.quota_total > 0 ? Math.round((a.quota_remaining / a.quota_total) * 100) : 0; },
     quotaColor(a) { const p = this.quotaPercent(a); return p > 50 ? 'bg-ok' : p > 20 ? 'bg-warn' : 'bg-err'; },
 
+    // Format the used/total label for the fallback quota bar.
+    // Pioneer stores cents — display as "$X.XX / $Y.YY".
+    // Other providers display raw integers ("423 / 1000").
+    quotaUsedLabel(a) {
+      const used = (a.quota_total || 0) - (a.quota_remaining || 0);
+      const total = a.quota_total || 0;
+      if (a.provider === 'pioneer') {
+        return '$' + (used / 100).toFixed(2) + ' / $' + (total / 100).toFixed(2);
+      }
+      return used + ' / ' + (total || '?');
+    },
+
     // True when the account is currently sitting out an upstream-error
     // cooldown (per-account backoff window). Drives the "cooldown 8s"
     // badge on each account card. Auto-clears once cooldown_until lapses.
@@ -1783,6 +1848,26 @@ function app() {
       const t = Date.parse(a.token_expires_at);
       if (!isFinite(t)) return false;
       return t <= Date.now();
+    },
+
+    // Group Exhaustion (AG specific)
+    isGroup1Exhausted(a) { return this.checkGroupExhausted(a, ['claude-sonnet-4-6', 'claude-opus-4-6-thinking', 'gpt-oss-120b-medium']); },
+    isGroup2Exhausted(a) { return this.checkGroupExhausted(a, ['gemini-3.1-pro-high', 'gemini-3.1-pro-low']); },
+    isGroup3Exhausted(a) { return this.checkGroupExhausted(a, ['gemini-3-flash']); },
+    checkGroupExhausted(a, models) {
+      if (a.provider !== 'antigravity' || !a.quota_breakdown || Object.keys(a.quota_breakdown).length === 0) return false;
+      let allExhausted = true;
+      let hasData = false;
+      for (const m of models) {
+        if (a.quota_breakdown[m]) {
+          hasData = true;
+          if (a.quota_breakdown[m].used < a.quota_breakdown[m].total) {
+            allExhausted = false;
+            break;
+          }
+        }
+      }
+      return hasData && allExhausted;
     },
 
     tokenExpiryClass(a) {
@@ -1872,6 +1957,9 @@ function app() {
           const total = Number(entry?.total) || 0;
           const remaining = Math.max(total - used, 0);
           const percent = total > 0 ? Math.round((remaining / total) * 100) : 0;
+          // Pioneer "credits" entry stores dollar amounts — format with $
+          const isDollar = (key === 'credits');
+          const fmtVal = (v) => isDollar ? ('$' + Number(v).toFixed(2)) : this.quotaFmt(v);
           return {
             key,
             label: entry?.label || this.quotaResourceLabel(key),
@@ -1879,8 +1967,8 @@ function app() {
             total,
             remaining,
             percent,
-            usedFmt: this.quotaFmt(used),
-            totalFmt: total > 0 ? this.quotaFmt(total) : '?',
+            usedFmt: fmtVal(used),
+            totalFmt: total > 0 ? fmtVal(total) : '?',
             resetAt: entry?.reset_at || '',
           };
         })

@@ -22,12 +22,13 @@ def parse_accounts(text: str) -> list[dict]:
         if not separator:
             continue
 
-        parts = line.split(separator, 1)
-        if len(parts) != 2:
+        parts = line.split(separator)
+        if len(parts) < 2:
             continue
 
         email = parts[0].strip()
         password = parts[1].strip()
+        recovery = parts[2].strip() if len(parts) > 2 else None
 
         if not email or not password:
             continue
@@ -37,7 +38,7 @@ def parse_accounts(text: str) -> list[dict]:
             continue
         seen_emails.add(email.lower())
 
-        accounts.append({"email": email, "password": password})
+        accounts.append({"email": email, "password": password, "recovery": recovery})
 
     return accounts
 

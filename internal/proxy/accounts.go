@@ -16,6 +16,7 @@ import (
 	"github.com/liam-auto/liam/internal/db"
 	"github.com/liam-auto/liam/internal/providers/antigravity"
 	"github.com/liam-auto/liam/internal/providers/kiro"
+	"github.com/liam-auto/liam/internal/providers/pioneer"
 )
 
 // handleImportAG imports an AG account from pasted credentials
@@ -253,6 +254,117 @@ func (s *Server) handleImportKiro(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleImportPioneer imports a Pioneer account from an API key.
+// Pioneer keys are long-lived (up to 1 year) and require no refresh.
+// We validate the key by calling the /base-models endpoint.
+func (s *Server) handleImportPioneer(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		APIKey    string `json:"api_key"`
+		AccountID string `json:"account_id,omitempty"`
+		Email     string `json:"email,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid JSON")
+		return
+	}
+	if req.APIKey == "" {
+		writeError(w, 400, "api_key is required")
+		return
+	}
+
+	// Validate format
+	if !strings.HasPrefix(req.APIKey, "pio_") {
+		writeError(w, 400, "Invalid Pioneer API key format (must start with 'pio_')")
+		return
+	}
+
+	// Validate by calling the /base-models endpoint
+	valReq, _ := http.NewRequest("GET", "https://api.pioneer.ai/base-models?supports_inference=true", nil)
+	valReq.Header.Set("X-API-Key", req.APIKey)
+	valResp, err := http.DefaultClient.Do(valReq)
+	if err != nil {
+		writeError(w, 502, fmt.Sprintf("Failed to validate key: %v", err))
+		return
+	}
+	defer func() {
+		if err := valResp.Body.Close(); err != nil {
+			log.Printf("[PIONEER] close validation response: %v", err)
+		}
+	}()
+	if valResp.StatusCode != 200 {
+		writeError(w, 400, fmt.Sprintf("Pioneer rejected the API key (HTTP %d)", valResp.StatusCode))
+		return
+	}
+
+	// Build credentials
+	creds := db.PioneerCredentials{APIKey: req.APIKey}
+	credsJSON, _ := json.Marshal(creds)
+
+	// Use provided email or derive from key prefix
+	email := req.Email
+	if email == "" {
+		// Extract a stable identifier from the key for display
+		parts := strings.SplitN(req.APIKey, "_", 4)
+		if len(parts) >= 3 {
+			email = "pio-" + parts[2][:8] + "@pioneer"
+		} else {
+			email = "pio-" + req.APIKey[4:12] + "@pioneer"
+		}
+	}
+
+	// Resolve target account for re-import
+	var targetAccount *db.Account
+	if req.AccountID != "" {
+		existing, lookupErr := s.findAccountByID(req.AccountID)
+		if lookupErr == nil && existing != nil && existing.Provider == "pioneer" {
+			targetAccount = existing
+		}
+	}
+
+	account := &db.Account{
+		Provider:    "pioneer",
+		Email:       email,
+		Status:      "active",
+		Credentials: credsJSON,
+		Plan:        "free",
+		AuthMethod:  "api_key",
+	}
+	if targetAccount != nil {
+		account.ID = targetAccount.ID
+	}
+
+	if err := s.db.UpsertAccount(account); err != nil {
+		writeError(w, 500, fmt.Sprintf("Failed to save: %v", err))
+		return
+	}
+
+	// Best-effort initial quota fetch (like AG/Kiro imports)
+	if qr, qErr := pioneer.FetchQuota(req.APIKey); qErr == nil && qr != nil {
+		account.QuotaTotal = qr.Total
+		account.QuotaRemaining = qr.Remaining
+		account.Plan = qr.Plan
+		if len(qr.Breakdown) > 0 {
+			if b, mErr := json.Marshal(qr.Breakdown); mErr == nil {
+				account.QuotaBreakdown = b
+			}
+		}
+		if err := s.db.UpsertAccount(account); err != nil {
+			log.Printf("[PIONEER-IMPORT] persist quota: %v", err)
+		}
+	}
+
+	if s.syncer != nil {
+		s.syncer.PushAccountAsync(account)
+	}
+
+	writeJSON(w, 201, map[string]interface{}{
+		"success":  true,
+		"email":    email,
+		"id":       account.ID,
+		"replaced": targetAccount != nil,
+	})
+}
+
 // handleRefreshQuota refreshes quota info for an account (on-demand)
 func (s *Server) handleRefreshQuota(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
@@ -282,6 +394,30 @@ func (s *Server) handleRefreshQuota(w http.ResponseWriter, r *http.Request) {
 		if creds.AccessToken == "" && creds.RefreshToken == "" {
 			writeError(w, 400, "no access or refresh token")
 			return
+		}
+
+		// Ensure token is fresh before anything else
+		if creds.RefreshToken != "" && antigravity.IsTokenExpired(&creds, s.cfg.RefreshLeadMin) {
+			refreshed, rErr := antigravity.RefreshToken(s.cfg, account)
+			if rErr != nil {
+				writeError(w, 502, fmt.Sprintf("token refresh failed: %v", rErr))
+				return
+			}
+			newCredsJSON, _ := json.Marshal(refreshed)
+			if err := s.db.UpdateAccountCredentials(account.ID, newCredsJSON); err != nil {
+				log.Printf("[REFRESH-QUOTA] persist refreshed AG creds: %v", err)
+			}
+			account.Credentials = newCredsJSON
+			creds = *refreshed
+		}
+
+		// Ensure onboarded (has projectId) before fetching quota.
+		// New accounts from harvest won't have a projectId yet —
+		// onboarding provisions the account with Google Code Assist.
+		if err := antigravity.EnsureOnboarded(s.cfg, s.db, account); err != nil {
+			log.Printf("[REFRESH-QUOTA] onboarding %s: %v", account.Email, err)
+			// Re-read credentials after onboarding may have updated them
+			json.Unmarshal(account.Credentials, &creds)
 		}
 
 		// Try once with the cached access token. If Cloud Code Assist
@@ -426,6 +562,51 @@ func (s *Server) handleRefreshQuota(w http.ResponseWriter, r *http.Request) {
 			"total":     qr.Total,
 			"remaining": qr.Total - qr.Used,
 			"reset_at":  qr.ResetAt,
+			"plan":      qr.Plan,
+			"breakdown": qr.Breakdown,
+		})
+	} else if account.Provider == "pioneer" {
+		var creds db.PioneerCredentials
+		if err := json.Unmarshal(account.Credentials, &creds); err != nil {
+			writeError(w, 500, fmt.Sprintf("parse credentials: %v", err))
+			return
+		}
+		if creds.APIKey == "" {
+			writeError(w, 400, "no API key")
+			return
+		}
+
+		qr, qErr := pioneer.FetchQuota(creds.APIKey)
+		if qErr != nil {
+			writeError(w, 502, fmt.Sprintf("Failed to fetch quota: %v", qErr))
+			return
+		}
+		if qr == nil {
+			writeError(w, 502, "quota response was empty")
+			return
+		}
+
+		// Persist quota to DB
+		account.QuotaTotal = qr.Total
+		account.QuotaRemaining = qr.Remaining
+		account.Plan = qr.Plan
+		if len(qr.Breakdown) > 0 {
+			if b, mErr := json.Marshal(qr.Breakdown); mErr == nil {
+				account.QuotaBreakdown = b
+			}
+		}
+		if err := s.db.UpsertAccount(account); err != nil {
+			log.Printf("[REFRESH-QUOTA] persist Pioneer account: %v", err)
+		}
+		if s.syncer != nil {
+			s.syncer.PushAccountAsync(account)
+		}
+
+		writeJSON(w, 200, map[string]interface{}{
+			"status":    "refreshed",
+			"used":      qr.Used,
+			"total":     qr.Total,
+			"remaining": qr.Remaining,
 			"plan":      qr.Plan,
 			"breakdown": qr.Breakdown,
 		})

@@ -50,33 +50,22 @@ async def handle_consent(page: Page):
     # Google consent screen has multiple possible layouts/languages
     # Try various button selectors in order of likelihood
     allow_selectors = [
-        # Native App Warning Screen (Login/Sign in)
-        'span:has-text("Login")',
-        'button:has-text("Login")',
-        'div[role="button"]:has-text("Login")',
-        'span:has-text("Sign in")',
-        'button:has-text("Sign in")',
-        'div[role="button"]:has-text("Sign in")',
         # English
         'button:has-text("Allow")',
-        'span:has-text("Allow")',
-        'div[role="button"]:has-text("Allow")',
         'button:has-text("Continue")',
-        'span:has-text("Continue")',
-        'div[role="button"]:has-text("Continue")',
         '#submit_approve_access',
         'button[data-idom-class*="grant"]',
         # Indonesian
         'button:has-text("Izinkan")',
-        'span:has-text("Izinkan")',
-        'div[role="button"]:has-text("Izinkan")',
         'button:has-text("Lanjutkan")',
-        'span:has-text("Lanjutkan")',
-        'div[role="button"]:has-text("Lanjutkan")',
         # Other languages
         'button:has-text("Zulassen")',
         'button:has-text("Autoriser")',
         'button:has-text("Permitir")',
+        # Workspace "I understand" button (input[type="submit"], not <button>)
+        # This is a fallback in case edge_cases didn't catch it
+        'input[name="confirm"][value="I understand"]',
+        'input#confirm[type="submit"]',
     ]
 
     # Try to find and click the allow button

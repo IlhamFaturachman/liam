@@ -63,6 +63,11 @@ func RunBatch(harvestDir string, provider string, accountsFile string, concurren
 		return fmt.Errorf("harvest not set up. Run: liam setup")
 	}
 
+	accountsFileAbs, err := filepath.Abs(accountsFile)
+	if err != nil {
+		return fmt.Errorf("invalid file path: %w", err)
+	}
+
 	// Build Python command that runs batch directly
 	script := fmt.Sprintf(`
 import sys, asyncio, json
@@ -76,15 +81,42 @@ if not accounts:
     print('No valid accounts found in file')
     sys.exit(1)
 
-print(f'Loaded {len(accounts)} accounts')
-print(f'Provider: %s | Concurrency: %d | Headless: %v')
+# Filter out accounts that already exist in DB
+import sqlite3
+try:
+    conn = sqlite3.connect('../data.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT email FROM accounts WHERE provider = ?', ('antigravity' if '%s' == 'ag' else '%s',))
+    existing_emails = {row[0].lower() for row in cursor.fetchall()}
+    conn.close()
+    
+    filtered_accounts = []
+    skipped = 0
+    for acc in accounts:
+        if acc['email'].lower() in existing_emails:
+            skipped += 1
+        else:
+            filtered_accounts.append(acc)
+    accounts = filtered_accounts
+    
+    if skipped > 0:
+        print(f'Skipped {skipped} accounts (already in DB)')
+except Exception as e:
+    print(f'Warning: DB filter error: {e}')
+
+if not accounts:
+    print('No new accounts to harvest. Exiting.')
+    sys.exit(0)
+
+print(f'Loaded {len(accounts)} new accounts')
+print(f'Provider: %s | Concurrency: %d | Headless: %s')
 
 provider = get_provider('%s')
 orch = Orchestrator()
 orch.load_accounts(accounts)
 
 async def run():
-    await orch.start(provider=provider, concurrency=%d, headless=%v)
+    await orch.start(provider=provider, concurrency=%d, headless=%s)
     print(f'\nResults: {len(orch.results)} success, {len(orch.failed)} failed')
     if orch.results:
         with open('results/success.json', 'w') as f:
@@ -92,7 +124,7 @@ async def run():
         print(f'Saved to results/success.json')
 
 asyncio.run(run())
-`, accountsFile, provider, concurrency, headless, provider, concurrency, headless)
+`, accountsFileAbs, provider, provider, provider, concurrency, boolToPython(headless), provider, concurrency, boolToPython(headless))
 
 	cmd := exec.Command(python, "-c", script)
 	cmd.Dir = harvestDir

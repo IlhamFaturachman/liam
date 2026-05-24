@@ -13,22 +13,29 @@ import (
 	"github.com/liam-auto/liam/internal/providers/kiro"
 )
 
-// RefreshIfNeeded refreshes AG token if expired (inline, before request)
+// RefreshIfNeeded refreshes AG token if expired (inline, before request).
+// Also ensures the account is onboarded (has a projectId) — new accounts
+// imported via harvest may not have one yet.
 func RefreshIfNeeded(cfg *config.Config, database *db.Database, account *db.Account) error {
 	var creds db.AGCredentials
 	if err := json.Unmarshal(account.Credentials, &creds); err != nil {
 		return err
 	}
-	if !antigravity.IsTokenExpired(&creds, cfg.RefreshLeadMin) {
-		return nil
+	if antigravity.IsTokenExpired(&creds, cfg.RefreshLeadMin) {
+		newCreds, err := antigravity.RefreshToken(cfg, account)
+		if err != nil {
+			return err
+		}
+		credsJSON, _ := json.Marshal(newCreds)
+		database.UpdateAccountCredentials(account.ID, credsJSON)
+		account.Credentials = credsJSON
 	}
-	newCreds, err := antigravity.RefreshToken(cfg, account)
-	if err != nil {
-		return err
+
+	// Ensure onboarded (has projectId) — best-effort, don't fail the request
+	if onboardErr := antigravity.EnsureOnboarded(cfg, database, account); onboardErr != nil {
+		// Log but don't block — the executor can still work with a random projectId
+		_ = onboardErr
 	}
-	credsJSON, _ := json.Marshal(newCreds)
-	database.UpdateAccountCredentials(account.ID, credsJSON)
-	account.Credentials = credsJSON
 	return nil
 }
 

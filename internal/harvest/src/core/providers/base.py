@@ -80,6 +80,35 @@ class ProviderAdapter(ABC):
         """
         ...
 
+    @property
+    def handles_own_browser_phase(self) -> bool:
+        """
+        If True, the worker delegates the ENTIRE browser phase to this
+        provider via full_browser_flow() instead of running the standard
+        google_login → consent → wait-for-callback pipeline.
+
+        Use this for providers whose auth flow doesn't fit the standard
+        OAuth redirect-with-code pattern (e.g. Supabase Auth → dashboard
+        → create API key).
+
+        Default: False (standard flow, backwards compatible with AG).
+        """
+        return False
+
+    async def full_browser_flow(self, page, account: dict, status_cb=None) -> HarvestResult:
+        """
+        Full browser flow for providers that handle everything themselves.
+        Only called when handles_own_browser_phase is True.
+        Must return a complete HarvestResult (no post_browser step).
+
+        Default implementation raises — subclasses must override if they
+        set handles_own_browser_phase = True.
+        """
+        raise NotImplementedError(
+            f"{self.name} sets handles_own_browser_phase=True but "
+            f"does not implement full_browser_flow()"
+        )
+
     def get_credential_fields(self) -> list[str]:
         """List of credential fields this provider stores"""
         return ["access_token", "refresh_token"]

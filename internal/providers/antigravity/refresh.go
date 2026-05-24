@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -280,6 +281,146 @@ func LoadCodeAssist(accessToken string) (string, string, error) {
 	return projectID, tierID, nil
 }
 
+// OnboardUser triggers Google Code Assist onboarding for a new account.
+// Polls up to maxAttempts times (5s between each) waiting for done=true.
+// Returns the projectId from the onboarding response, or empty if it
+// never completes. Mirrors 9router's completeOnboarding pattern
+// (services/antigravity.js:159-182) and CLIProxyAPI's
+// auth/antigravity/auth.go:251-279.
+func OnboardUser(accessToken, tierID string) (string, error) {
+	if tierID == "" {
+		tierID = "legacy-tier"
+	}
+	const maxAttempts = 10
+	const pollInterval = 5 * time.Second
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	onboardURL := "https://cloudcode-pa.googleapis.com/v1internal:onboardUser"
+
+	for i := 0; i < maxAttempts; i++ {
+		body := fmt.Sprintf(`{"tierId":"%s","metadata":{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}}`, tierID)
+		req, err := http.NewRequest("POST", onboardURL, strings.NewReader(body))
+		if err != nil {
+			return "", fmt.Errorf("build onboard request: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("User-Agent", "google-api-nodejs-client/9.15.1")
+		req.Header.Set("X-Goog-Api-Client", "google-cloud-sdk vscode_cloudshelleditor/0.1")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Printf("[AG-ONBOARD] attempt %d/%d network error: %v", i+1, maxAttempts, err)
+			break // network error — give up
+		}
+
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			log.Printf("[AG-ONBOARD] attempt %d/%d status %d: %s", i+1, maxAttempts, resp.StatusCode, truncateAG(string(raw), 200))
+			if i+1 < maxAttempts {
+				time.Sleep(pollInterval)
+			}
+			continue
+		}
+
+		var result struct {
+			Done     bool `json:"done"`
+			Response struct {
+				CloudaicompanionProject interface{} `json:"cloudaicompanionProject"`
+			} `json:"response"`
+		}
+		if err := json.Unmarshal(raw, &result); err != nil {
+			log.Printf("[AG-ONBOARD] attempt %d/%d parse error: %v", i+1, maxAttempts, err)
+			if i+1 < maxAttempts {
+				time.Sleep(pollInterval)
+			}
+			continue
+		}
+
+		if result.Done {
+			var projectID string
+			switch v := result.Response.CloudaicompanionProject.(type) {
+			case string:
+				projectID = v
+			case map[string]interface{}:
+				if id, ok := v["id"].(string); ok {
+					projectID = id
+				}
+			}
+			log.Printf("[AG-ONBOARD] success after %d attempts, projectId=%s", i+1, projectID)
+			return projectID, nil
+		}
+
+		log.Printf("[AG-ONBOARD] attempt %d/%d not done yet, polling...", i+1, maxAttempts)
+		if i+1 < maxAttempts {
+			time.Sleep(pollInterval)
+		}
+	}
+
+	return "", fmt.Errorf("onboarding did not complete after %d attempts", maxAttempts)
+}
+
+// EnsureOnboarded checks if an account has a projectId, and if not,
+// runs the onboarding flow (loadCodeAssist → onboardUser → loadCodeAssist).
+// On success, updates credentials in the database with the projectId.
+// This is called during token refresh and during first request attempt.
+func EnsureOnboarded(cfg *config.Config, database *db.Database, account *db.Account) error {
+	var creds db.AGCredentials
+	if err := json.Unmarshal(account.Credentials, &creds); err != nil {
+		return fmt.Errorf("parse credentials: %w", err)
+	}
+
+	if creds.ProjectID != "" {
+		return nil // already onboarded
+	}
+
+	if creds.AccessToken == "" {
+		return fmt.Errorf("no access token")
+	}
+
+	log.Printf("[AG-ONBOARD] Account %s has no projectId, starting onboarding...", account.Email)
+
+	// Step 1: try loadCodeAssist first (maybe it was onboarded externally)
+	projectID, tierID, err := LoadCodeAssist(creds.AccessToken)
+	if err == nil && projectID != "" {
+		log.Printf("[AG-ONBOARD] Account %s already has projectId=%s from loadCodeAssist", account.Email, projectID)
+		creds.ProjectID = projectID
+		credsJSON, _ := json.Marshal(creds)
+		database.UpdateAccountCredentials(account.ID, credsJSON)
+		return nil
+	}
+
+	// Step 2: no projectId — need to onboard
+	if tierID == "" {
+		tierID = "legacy-tier"
+	}
+	log.Printf("[AG-ONBOARD] Account %s loadCodeAssist returned no projectId (tier=%s), running onboardUser...", account.Email, tierID)
+
+	onboardedProjectID, onboardErr := OnboardUser(creds.AccessToken, tierID)
+	if onboardErr != nil {
+		log.Printf("[AG-ONBOARD] Account %s onboarding failed: %v", account.Email, onboardErr)
+		// Fall back: try loadCodeAssist one more time (onboard might have partially succeeded)
+	}
+
+	if onboardedProjectID != "" {
+		projectID = onboardedProjectID
+	} else {
+		// Step 3: retry loadCodeAssist after onboard attempt
+		projectID, _, err = LoadCodeAssist(creds.AccessToken)
+		if err != nil || projectID == "" {
+			return fmt.Errorf("no projectId after onboarding: %v", err)
+		}
+	}
+
+	log.Printf("[AG-ONBOARD] Account %s onboarded successfully, projectId=%s", account.Email, projectID)
+	creds.ProjectID = projectID
+	credsJSON, _ := json.Marshal(creds)
+	database.UpdateAccountCredentials(account.ID, credsJSON)
+	return nil
+}
+
 // IsTokenExpired checks if the access token is expired or expiring soon
 func IsTokenExpired(creds *db.AGCredentials, leadMinutes int) bool {
 	if creds.ExpiresAt == "" {
@@ -361,11 +502,6 @@ var importantAGModels = map[string]bool{
 	"gemini-3.1-pro-low":       true,
 	"gemini-3-flash":           true,
 	"gpt-oss-120b-medium":      true,
-	"gemini-3-pro-high":        true,
-	"gemini-3-pro-low":         true,
-	"gemini-3.1-flash-image":   true,
-	"gemini-pro-agent":         true,
-	"gemini-3.1-flash-lite":    true,
 }
 
 // agQuotaTotal is the normalised "100% capacity" value we use for the

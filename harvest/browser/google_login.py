@@ -47,6 +47,24 @@ async def google_login(page: Page, email: str, password: str):
     password_next = page.locator("#passwordNext")
     await password_next.click()
 
+    # CRITICAL FIX: The redirect from password challenge to OAuth consent
+    # or speedbump can take several seconds and involves multiple internal
+    # redirects (SetSID, CheckConnection, etc). 
+    # 'networkidle' fires too early during this chain, causing edge_cases
+    # to run while still on the loading page!
+    
+    # Wait for the URL to change from the password challenge
+    try:
+        await page.wait_for_url(
+            lambda url: "signin/challenge" not in url and "identifier" not in url,
+            timeout=TIMEOUTS["login"]
+        )
+    except Exception:
+        pass # Let it fall through to error detection anyway
+
+    # Additional delay to let the final target page (consent/speedbump) fully render
+    await random_delay(2000, 4000)
+
     # Wait for navigation (consent, error, or redirect)
     try:
         await page.wait_for_load_state("networkidle", timeout=TIMEOUTS["login"])

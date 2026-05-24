@@ -72,6 +72,12 @@ type KiroCredentials struct {
 	ProfileARN   string `json:"profile_arn,omitempty"`
 }
 
+// PioneerCredentials for Pioneer accounts. The only credential is
+// a long-lived API key (up to 1 year, no refresh needed).
+type PioneerCredentials struct {
+	APIKey string `json:"api_key"`
+}
+
 // Combo represents a named model group with fallback/round-robin
 type Combo struct {
 	ID          string    `json:"id"`
@@ -277,6 +283,13 @@ func (d *Database) migrate() error {
 		"UPDATE accounts SET credentials = '{}' WHERE credentials IS NULL OR credentials = '' OR json_valid(credentials) = 0",
 		"UPDATE accounts SET metadata = '{}' WHERE metadata IS NULL OR metadata = '' OR json_valid(metadata) = 0",
 		"UPDATE accounts SET quota_breakdown = '{}' WHERE quota_breakdown IS NULL OR quota_breakdown = '' OR json_valid(quota_breakdown) = 0",
+		"UPDATE model_registry SET model_id = 'gemini-3.1-pro-high', id = 'ag/gemini-3.1-pro-high' WHERE id = 'ag/gemini-pro-agent'",
+		// Delete obsolete models that were removed from BuiltInModels
+		"DELETE FROM model_registry WHERE id IN ('ag/gemini-3-pro-high', 'ag/gemini-3-pro-low', 'ag/gemini-3.1-flash-image', 'ag/gemini-3.1-flash-lite')",
+		// Force-update display names for all models to have the proper AG/KR prefix
+		// if they don't already have it (happens for older installs because SeedBuiltIn uses ON CONFLICT DO NOTHING)
+		"UPDATE model_registry SET display_name = 'AG ' || display_name WHERE provider_alias = 'ag' AND display_name NOT LIKE 'AG %'",
+		"UPDATE model_registry SET display_name = 'KR ' || display_name WHERE provider_alias = 'kr' AND display_name NOT LIKE 'KR %'",
 	}
 	for _, stmt := range repairStatements {
 		d.db.Exec(stmt) // best-effort, log nothing
@@ -383,7 +396,8 @@ func (d *Database) ListAccounts(provider string) ([]Account, error) {
 			}
 			access, _ := credsMap["access_token"].(string)
 			refresh, _ := credsMap["refresh_token"].(string)
-			a.HasCredentials = strings.TrimSpace(access) != "" || strings.TrimSpace(refresh) != ""
+			apiKey, _ := credsMap["api_key"].(string)
+			a.HasCredentials = strings.TrimSpace(access) != "" || strings.TrimSpace(refresh) != "" || strings.TrimSpace(apiKey) != ""
 		}
 		if lastErr.Valid {
 			a.LastError = lastErr.String
@@ -429,7 +443,8 @@ func (d *Database) ListAccounts(provider string) ([]Account, error) {
 func (d *Database) GetActiveAccounts(provider string) ([]Account, error) {
 	rows, err := d.db.Query(`
 		SELECT id, provider, email, status, credentials, quota_total, quota_remaining, 
-			consecutive_errors, last_used_at, cooldown_until, created_at, updated_at
+			consecutive_errors, last_used_at, cooldown_until, created_at, updated_at,
+			quota_breakdown
 		FROM accounts 
 		WHERE provider = ? AND status = 'active' 
 			AND (cooldown_until IS NULL OR cooldown_until < ?)
@@ -443,11 +458,12 @@ func (d *Database) GetActiveAccounts(provider string) ([]Account, error) {
 	var accounts []Account
 	for rows.Next() {
 		var a Account
-		var creds sql.NullString
+		var creds, breakdown sql.NullString
 		var lastUsed, cooldown, createdAt, updatedAt sql.NullString
 		err := rows.Scan(&a.ID, &a.Provider, &a.Email, &a.Status, &creds,
 			&a.QuotaTotal, &a.QuotaRemaining, &a.ConsecutiveErrors,
-			&lastUsed, &cooldown, &createdAt, &updatedAt)
+			&lastUsed, &cooldown, &createdAt, &updatedAt,
+			&breakdown)
 		if err != nil {
 			return nil, err
 		}
@@ -455,6 +471,9 @@ func (d *Database) GetActiveAccounts(provider string) ([]Account, error) {
 			a.Credentials = json.RawMessage(creds.String)
 		} else {
 			a.Credentials = json.RawMessage("{}")
+		}
+		if breakdown.Valid && breakdown.String != "" {
+			a.QuotaBreakdown = json.RawMessage(breakdown.String)
 		}
 		if lastUsed.Valid {
 			t, _ := time.Parse(time.RFC3339Nano, lastUsed.String)

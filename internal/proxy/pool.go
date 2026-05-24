@@ -14,6 +14,33 @@ import (
 	"github.com/liam-auto/liam/internal/db"
 )
 
+// agModelGroups defines quota groupings for Antigravity accounts.
+// Models within the same group share a quota bucket — when ALL models
+// in a group hit used >= total (remaining = 0), the entire group is
+// considered exhausted and accounts with that group exhausted are
+// skipped for any model in that group. Other groups are unaffected.
+//
+// Group 1: Claude + GPT (premium models, shared tier)
+// Group 2: Gemini Pro (high + low compute variants)
+// Group 3: Gemini Flash (lightweight model)
+var agModelGroups = [][]string{
+	{"claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium"},
+	{"gemini-3.1-pro-high", "gemini-3.1-pro-low"},
+	{"gemini-3-flash"},
+}
+
+// agModelToGroup maps each bare model ID to its group index for O(1) lookup.
+var agModelToGroup map[string]int
+
+func init() {
+	agModelToGroup = make(map[string]int)
+	for groupIdx, models := range agModelGroups {
+		for _, m := range models {
+			agModelToGroup[m] = groupIdx
+		}
+	}
+}
+
 // AccountPool manages account selection with anti-ban protections
 type AccountPool struct {
 	database *db.Database
@@ -65,7 +92,18 @@ func (p *AccountPool) PickForSession(provider, model, sessionID string) (*db.Acc
 		if err == nil {
 			for i := range accounts {
 				if accounts[i].ID == accountID {
-					if model == "" || !p.isModelExcluded(&accounts[i], model) {
+					if model == "" {
+						p.mu.Lock()
+						p.recordUse(&accounts[i], time.Now())
+						p.mu.Unlock()
+						return &accounts[i], nil
+					}
+
+					// Check per-model gates
+					isExcluded := p.isModelExcluded(&accounts[i], model)
+					isExhausted := p.isGroupExhausted(&accounts[i], provider, model)
+
+					if !isExcluded && !isExhausted {
 						p.mu.Lock()
 						p.recordUse(&accounts[i], time.Now())
 						p.mu.Unlock()
@@ -201,10 +239,18 @@ func (p *AccountPool) PickForModel(provider, model string) (*db.Account, error) 
 		if !p.canUse(&accounts[i], now) {
 			continue
 		}
-		// Per-auth excluded models check
-		if model != "" && p.isModelExcluded(&accounts[i], model) {
-			continue
+
+		if model != "" {
+			// Per-auth excluded models check
+			if p.isModelExcluded(&accounts[i], model) {
+				continue
+			}
+			// Quota group check (Antigravity only)
+			if p.isGroupExhausted(&accounts[i], provider, model) {
+				continue
+			}
 		}
+
 		eligible = append(eligible, &accounts[i])
 	}
 
@@ -371,6 +417,50 @@ func (p *AccountPool) isModelExcluded(account *db.Account, model string) bool {
 		}
 	}
 	return false
+}
+
+// isGroupExhausted checks if the requested model belongs to an AG model group
+// that is completely exhausted (all models in the group have used >= total).
+func (p *AccountPool) isGroupExhausted(account *db.Account, provider string, fullModelID string) bool {
+	if provider != "antigravity" || account.QuotaBreakdown == nil || len(account.QuotaBreakdown) <= 2 {
+		return false // Only applies to AG, and only if we have breakdown data
+	}
+
+	// Extract bare model ID (strip "ag/" prefix if present)
+	bareModel := strings.TrimPrefix(fullModelID, "ag/")
+
+	groupIdx, exists := agModelToGroup[bareModel]
+	if !exists {
+		return false // Model not part of any defined group
+	}
+
+	// Parse the quota breakdown
+	var breakdown map[string]struct {
+		Used  float64 `json:"used"`
+		Total float64 `json:"total"`
+	}
+	if err := json.Unmarshal(account.QuotaBreakdown, &breakdown); err != nil {
+		return false // If we can't parse it, don't lock it
+	}
+
+	// Check all models in this group
+	groupModels := agModelGroups[groupIdx]
+	allExhausted := true
+	hasDataForGroup := false
+
+	for _, m := range groupModels {
+		if entry, ok := breakdown[m]; ok {
+			hasDataForGroup = true
+			// If even ONE model in the group has remaining quota, the group is NOT exhausted
+			if entry.Used < entry.Total {
+				allExhausted = false
+				break
+			}
+		}
+	}
+
+	// Only return true if we actually had data for the group AND all of it was exhausted
+	return hasDataForGroup && allExhausted
 }
 
 // matchWildcard matches a pattern with * wildcard against a string

@@ -17,10 +17,11 @@ import (
 const (
 	BackoffBaseMs       = 2000
 	BackoffMaxMs        = 5 * 60 * 1000
-	BackoffMaxLevel     = 15
-	TransientCooldownMs = 30 * 1000
-	LongCooldownMs      = 2 * 60 * 1000
-	ShortCooldownMs     = 5 * 1000
+	BackoffMaxLevel             = 15
+	TransientCooldownMs         = 30 * 1000
+	LongCooldownMs              = 2 * 60 * 1000
+	ShortCooldownMs             = 5 * 1000
+	CapacityExhaustedCooldownMs = 5 * 1000 // Server-side capacity issues -> fast retry
 
 	// Hard cap on Retry-After / provider-supplied cooldowns so a wildly
 	// long upstream value (e.g. codex resets_at 6h) doesn't take an
@@ -72,7 +73,8 @@ var errorRules = []errorRule{
 	{text: "rate limit", backoff: true},
 	{text: "too many requests", backoff: true},
 	{text: "quota exceeded", backoff: true},
-	{text: "capacity", backoff: true},
+	{text: "individual quota reached", backoff: true}, // Burst/quota limit on Antigravity
+	{text: "capacity", backoff: true},                 // Capacity/quota exhausted
 	{text: "overloaded", backoff: true},
 
 	// --- Status-based rules (fallback when text doesn't match) ---
@@ -81,6 +83,9 @@ var errorRules = []errorRule{
 	{status: 403, cooldownMs: LongCooldownMs},
 	{status: 404, cooldownMs: LongCooldownMs},
 	{status: 429, backoff: true},
+	{status: 502, cooldownMs: BackoffBaseMs}, // 2s
+	{status: 503, cooldownMs: BackoffBaseMs}, // 2s (Antigravity is dumb, retry fast)
+	{status: 504, cooldownMs: BackoffBaseMs}, // 2s
 }
 
 // ClassifyError classifies an upstream failure into a backoff/cooldown

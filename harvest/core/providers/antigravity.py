@@ -117,33 +117,59 @@ class AntigravityProvider(ProviderAdapter):
                 user_data = user_resp.json()
                 email = user_data.get("email", email)
 
-            # 3. Load Code Assist
-            assist_resp = await client.post(
-                AG_CONFIG["load_code_assist_url"],
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "Content-Type": "application/json",
-                    "User-Agent": "google-api-nodejs-client/9.15.1",
-                    "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
-                },
-                json={"metadata": {"ideType": "IDE_UNSPECIFIED", "platform": "PLATFORM_UNSPECIFIED", "pluginType": "GEMINI"}},
-            )
-            if assist_resp.status_code != 200:
-                raise Exception(f"loadCodeAssist failed ({assist_resp.status_code}): {assist_resp.text}")
-
-            assist_data = assist_resp.json()
-            project_id = assist_data.get("cloudaicompanionProject", "")
-            if isinstance(project_id, dict):
-                project_id = project_id.get("id", "")
-
+            # 3. Load Code Assist (with retry — new accounts may need onboarding first)
+            project_id = ""
             tier_id = "legacy-tier"
-            for tier in assist_data.get("allowedTiers", []):
-                if tier.get("isDefault") and tier.get("id"):
-                    tier_id = tier["id"].strip()
+            assist_data = {}
+
+            for load_attempt in range(3):
+                assist_resp = await client.post(
+                    AG_CONFIG["load_code_assist_url"],
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "Content-Type": "application/json",
+                        "User-Agent": "google-api-nodejs-client/9.15.1",
+                        "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
+                    },
+                    json={"metadata": {"ideType": "IDE_UNSPECIFIED", "platform": "PLATFORM_UNSPECIFIED", "pluginType": "GEMINI"}},
+                )
+                if assist_resp.status_code != 200:
+                    if load_attempt < 2:
+                        import asyncio
+                        await asyncio.sleep(3)
+                        continue
+                    raise Exception(f"loadCodeAssist failed ({assist_resp.status_code}): {assist_resp.text}")
+
+                assist_data = assist_resp.json()
+                project_id = assist_data.get("cloudaicompanionProject", "")
+                if isinstance(project_id, dict):
+                    project_id = project_id.get("id", "")
+
+                for tier in assist_data.get("allowedTiers", []):
+                    if tier.get("isDefault") and tier.get("id"):
+                        tier_id = tier["id"].strip()
+                        break
+
+                if project_id:
                     break
 
+                # No projectId yet — try onboarding first, then retry loadCodeAssist
+                if load_attempt < 2:
+                    onboard_resp = await client.post(
+                        AG_CONFIG["onboard_user_url"],
+                        headers={
+                            "Authorization": f"Bearer {access_token}",
+                            "Content-Type": "application/json",
+                            "User-Agent": "google-api-nodejs-client/9.15.1",
+                            "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
+                        },
+                        json={"tierId": tier_id, "metadata": {"ideType": "IDE_UNSPECIFIED", "platform": "PLATFORM_UNSPECIFIED", "pluginType": "GEMINI"}},
+                    )
+                    import asyncio
+                    await asyncio.sleep(5)
+
             if not project_id:
-                raise Exception("No projectId in loadCodeAssist response")
+                raise Exception(f"No projectId after {3} loadCodeAssist attempts (response: {assist_data})")
 
             # 4. Onboard user (fire and forget with retries)
             final_project_id = project_id

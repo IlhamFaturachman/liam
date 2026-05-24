@@ -49,17 +49,13 @@ func ProviderByAlias(alias string) *Provider {
 // BuiltInModels returns the hardcoded built-in models seeded on first boot
 func BuiltInModels() []Model {
 	return []Model{
-		// Antigravity
-		{ProviderAlias: "ag", ModelID: "gemini-pro-agent", DisplayName: "AG Gemini 3.1 Pro High", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		// Antigravity — display as "ag/gemini-3.1-pro-high", executor remaps to "gemini-pro-agent" upstream
+		{ProviderAlias: "ag", ModelID: "gemini-3.1-pro-high", DisplayName: "AG Gemini 3.1 Pro High", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
 		{ProviderAlias: "ag", ModelID: "gemini-3.1-pro-low", DisplayName: "AG Gemini 3.1 Pro Low", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
 		{ProviderAlias: "ag", ModelID: "gemini-3-flash", DisplayName: "AG Gemini 3 Flash", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{"thinking": false}},
 		{ProviderAlias: "ag", ModelID: "claude-sonnet-4-6", DisplayName: "AG Claude Sonnet 4.6", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
 		{ProviderAlias: "ag", ModelID: "claude-opus-4-6-thinking", DisplayName: "AG Claude Opus 4.6 Thinking", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
 		{ProviderAlias: "ag", ModelID: "gpt-oss-120b-medium", DisplayName: "AG GPT OSS 120B Medium", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
-		{ProviderAlias: "ag", ModelID: "gemini-3-pro-high", DisplayName: "AG Gemini 3 Pro High", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
-		{ProviderAlias: "ag", ModelID: "gemini-3-pro-low", DisplayName: "AG Gemini 3 Pro Low", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
-		{ProviderAlias: "ag", ModelID: "gemini-3.1-flash-image", DisplayName: "AG Gemini 3.1 Flash Image", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
-		{ProviderAlias: "ag", ModelID: "gemini-3.1-flash-lite", DisplayName: "AG Gemini 3.1 Flash Lite", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
 
 		// Kiro
 		{ProviderAlias: "kr", ModelID: "claude-sonnet-4.5", DisplayName: "KR Claude Sonnet 4.5", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
@@ -77,6 +73,20 @@ func BuiltInModels() []Model {
 		// variants for Kiro at all — see internal/proxy/server.go where
 		// the suffix is preserved literally only if the user adds a
 		// custom Kiro model with that name.
+
+		// Pioneer — OpenAI-compatible passthrough, API key auth
+		{ProviderAlias: "pio", ModelID: "claude-opus-4-7", DisplayName: "PIO Claude Opus 4.7", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "pio", ModelID: "claude-sonnet-4-6", DisplayName: "PIO Claude Sonnet 4.6", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "pio", ModelID: "claude-haiku-4-5", DisplayName: "PIO Claude Haiku 4.5", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "pio", ModelID: "gpt-5.5", DisplayName: "PIO GPT-5.5", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "pio", ModelID: "gpt-5.4", DisplayName: "PIO GPT-5.4", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "pio", ModelID: "gpt-5.1", DisplayName: "PIO GPT-5.1", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "pio", ModelID: "gpt-4.1", DisplayName: "PIO GPT-4.1", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "pio", ModelID: "gpt-4.1-mini", DisplayName: "PIO GPT-4.1 mini", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "pio", ModelID: "deepseek-ai/DeepSeek-V4-Pro", DisplayName: "PIO DeepSeek V4 Pro", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "pio", ModelID: "moonshotai/Kimi-K2.6", DisplayName: "PIO Kimi K2.6", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "pio", ModelID: "openai/gpt-oss-120b", DisplayName: "PIO GPT-OSS 120B", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
+		{ProviderAlias: "pio", ModelID: "Qwen/Qwen3-32B", DisplayName: "PIO Qwen3 32B", Type: "llm", IsCustom: false, IsEnabled: true, Metadata: map[string]interface{}{}},
 	}
 }
 

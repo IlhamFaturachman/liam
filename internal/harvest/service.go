@@ -132,9 +132,38 @@ from utils.parser import parse_accounts
 
 text = open('results/_batch_input.txt').read()
 accounts = parse_accounts(text)
+
+# Filter out accounts that already exist in DB
+import sqlite3
+try:
+    conn = sqlite3.connect('../data.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT email FROM accounts WHERE provider = ?', ({'ag':'antigravity','pio':'pioneer'}.get('%s','%s'),))
+    existing_emails = {row[0].lower() for row in cursor.fetchall()}
+    conn.close()
+    
+    filtered_accounts = []
+    skipped = 0
+    for acc in accounts:
+        if acc['email'].lower() in existing_emails:
+            skipped += 1
+        else:
+            filtered_accounts.append(acc)
+    accounts = filtered_accounts
+    
+    if skipped > 0:
+        print(json.dumps({
+            "type":"status",
+            "total":len(accounts),
+            "message":f"Skipped {skipped} accounts (already in DB)",
+            "accounts":[]
+        }), flush=True)
+except Exception as e:
+    print(json.dumps({"type":"error","message":f"DB filter error: {e}"}), flush=True)
+
 if not accounts:
-    print(json.dumps({"type":"error","message":"No valid accounts found"}), flush=True)
-    sys.exit(1)
+    print(json.dumps({"type":"error","message":"No new accounts to harvest"}), flush=True)
+    sys.exit(0)
 
 print(json.dumps({
     "type":"status",
@@ -142,6 +171,7 @@ print(json.dumps({
     "message":f"Loaded {len(accounts)} accounts",
     "accounts":[a["email"] for a in accounts],
 }), flush=True)
+
 
 provider = get_provider('%s')
 orch = Orchestrator()
@@ -186,7 +216,7 @@ async def run():
     print(json.dumps({"type":"done","success":len(orch.results),"failed":len(orch.failed)}), flush=True)
 
 asyncio.run(run())
-`, provider, concurrency, boolToPython(headless))
+`, provider, provider, provider, concurrency, boolToPython(headless))
 
 	h.cmd = exec.Command(python, "-c", script)
 	h.cmd.Dir = harvestDir
@@ -334,12 +364,29 @@ func (h *HarvestService) importResult(data map[string]interface{}) {
 		return
 	}
 
+	// Extract optional metadata (plan, credit, auth_method, etc.)
+	metadata, _ := data["metadata"].(map[string]interface{})
+
 	credsJSON, _ := json.Marshal(creds)
 	account := &db.Account{
 		Provider:    provider,
 		Email:       email,
 		Status:      "active",
 		Credentials: credsJSON,
+	}
+
+	// Set provider-specific fields from metadata
+	if metadata != nil {
+		if plan, ok := metadata["plan"].(string); ok {
+			account.Plan = plan
+		}
+	}
+	// Pioneer accounts use api_key auth
+	if provider == "pioneer" {
+		account.AuthMethod = "api_key"
+		if account.Plan == "" {
+			account.Plan = "free"
+		}
 	}
 
 	if h.OnAccountImported != nil {

@@ -7,13 +7,34 @@ import json
 from typing import Optional
 
 
+# Provider-specific import endpoints and payload builders.
+# Each provider has its own LIAM endpoint that expects a specific body shape.
+_IMPORT_ROUTES = {
+    "antigravity": {
+        "path": "/api/accounts/import/ag",
+        "payload": lambda r: {"refresh_token": r.get("credentials", {}).get("refresh_token", "")},
+    },
+    "pioneer": {
+        "path": "/api/accounts/import/pio",
+        "payload": lambda r: {"api_key": r.get("credentials", {}).get("api_key", "")},
+    },
+    # Future providers:
+    # "kiro": {"path": "/api/accounts/import/kiro", "payload": lambda r: ...},
+}
+
+
 async def import_to_proxy(
     results: list[dict],
     proxy_url: str = "http://localhost:8080",
-    timeout: int = 10,
+    timeout: int = 15,
 ) -> dict:
     """
-    Import harvest results directly to LIAM proxy's /api/accounts endpoint.
+    Import harvest results directly to LIAM proxy's provider-specific
+    import endpoints.
+
+    Uses provider-specific routes when available (e.g. /api/accounts/import/ag
+    for antigravity, /api/accounts/import/pio for pioneer). Falls back to
+    generic /api/accounts for unknown providers.
     
     Args:
         results: List of harvest results (from orchestrator.results)
@@ -30,15 +51,24 @@ async def import_to_proxy(
     async with httpx.AsyncClient(timeout=timeout) as client:
         for result in results:
             try:
-                # Build account payload matching LIAM proxy's expected format
-                payload = {
-                    "provider": result.get("provider", "antigravity"),
-                    "email": result.get("email", ""),
-                    "credentials": result.get("credentials", {}),
-                }
+                provider = result.get("provider", "antigravity")
+                route = _IMPORT_ROUTES.get(provider)
+
+                if route:
+                    # Use provider-specific import endpoint
+                    url = f"{proxy_url}{route['path']}"
+                    payload = route["payload"](result)
+                else:
+                    # Fallback: generic /api/accounts (original behavior)
+                    url = f"{proxy_url}/api/accounts"
+                    payload = {
+                        "provider": provider,
+                        "email": result.get("email", ""),
+                        "credentials": result.get("credentials", {}),
+                    }
 
                 resp = await client.post(
-                    f"{proxy_url}/api/accounts",
+                    url,
                     json=payload,
                     headers={"Content-Type": "application/json"},
                 )
@@ -49,6 +79,7 @@ async def import_to_proxy(
                     failed += 1
                     errors.append({
                         "email": result.get("email"),
+                        "provider": provider,
                         "status": resp.status_code,
                         "error": resp.text[:200],
                     })
@@ -79,14 +110,23 @@ def generate_import_curl(results: list[dict], proxy_url: str = "http://localhost
     ]
 
     for result in results:
-        payload = {
-            "provider": result.get("provider", "antigravity"),
-            "email": result.get("email", ""),
-            "credentials": result.get("credentials", {}),
-        }
+        provider = result.get("provider", "antigravity")
+        route = _IMPORT_ROUTES.get(provider)
+
+        if route:
+            url = f"{proxy_url}{route['path']}"
+            payload = route["payload"](result)
+        else:
+            url = f"{proxy_url}/api/accounts"
+            payload = {
+                "provider": provider,
+                "email": result.get("email", ""),
+                "credentials": result.get("credentials", {}),
+            }
+
         json_str = json.dumps(payload).replace("'", "'\\''")
         lines.append(
-            f"curl -s -X POST {proxy_url}/api/accounts "
+            f"curl -s -X POST {url} "
             f"-H 'Content-Type: application/json' "
             f"-d '{json_str}'"
         )

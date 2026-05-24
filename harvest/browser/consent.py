@@ -62,6 +62,10 @@ async def handle_consent(page: Page):
         'button:has-text("Zulassen")',
         'button:has-text("Autoriser")',
         'button:has-text("Permitir")',
+        # Workspace "I understand" button (input[type="submit"], not <button>)
+        # This is a fallback in case edge_cases didn't catch it
+        'input[name="confirm"][value="I understand"]',
+        'input#confirm[type="submit"]',
     ]
 
     # Try to find and click the allow button

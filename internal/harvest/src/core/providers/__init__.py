@@ -5,11 +5,14 @@ Register all providers here. Adding a new provider = add 1 import + 1 line.
 
 from core.providers.base import ProviderAdapter
 from core.providers.antigravity import AntigravityProvider
+from core.providers.pioneer import PioneerProvider
 
 # Registry of all available providers
 _PROVIDERS: dict[str, ProviderAdapter] = {
     "antigravity": AntigravityProvider(),
     "ag": AntigravityProvider(),  # Alias
+    "pioneer": PioneerProvider(),
+    "pio": PioneerProvider(),  # Alias
     # Future:
     # "kiro": KiroProvider(),
     # "codebuddy": CodeBuddyProvider(),

@@ -20,6 +20,7 @@ import (
 	"github.com/liam-auto/liam/internal/models"
 	"github.com/liam-auto/liam/internal/providers/antigravity"
 	"github.com/liam-auto/liam/internal/providers/kiro"
+	"github.com/liam-auto/liam/internal/providers/pioneer"
 	liamsync "github.com/liam-auto/liam/internal/sync"
 )
 
@@ -30,6 +31,7 @@ type Server struct {
 	pool          *AccountPool
 	ag            *antigravity.Executor
 	kiro          *kiro.Executor
+	pio           *pioneer.Executor
 	providers     *providerRegistry
 	harvest       *harvest.HarvestService
 	registry      *models.Registry
@@ -59,6 +61,7 @@ func Start(cfg *config.Config, database *db.Database) error {
 		pool:         NewAccountPool(database, cfg),
 		ag:           antigravity.NewExecutor(cfg),
 		kiro:         kiro.NewExecutor(),
+		pio:          pioneer.NewExecutor(),
 		harvest:      harvest.NewHarvestService(cfg, database),
 		registry:     registry,
 		aliases:      aliases,
@@ -111,6 +114,28 @@ func Start(cfg *config.Config, database *db.Database) error {
 					}
 				}
 			}
+		} else if account.Provider == "pioneer" {
+			var creds struct {
+				APIKey string `json:"api_key"`
+			}
+			if err := json.Unmarshal(account.Credentials, &creds); err == nil && creds.APIKey != "" {
+				if qr, qErr := pioneer.FetchQuota(creds.APIKey); qErr == nil && qr != nil {
+					account.QuotaTotal = qr.Total
+					account.QuotaRemaining = qr.Remaining
+					account.Plan = qr.Plan
+					if len(qr.Breakdown) > 0 {
+						if b, mErr := json.Marshal(qr.Breakdown); mErr == nil {
+							account.QuotaBreakdown = b
+						}
+					}
+				}
+			}
+			if account.AuthMethod == "" {
+				account.AuthMethod = "api_key"
+			}
+			if account.Plan == "" {
+				account.Plan = "free"
+			}
 		}
 
 		// Fallback to UpsertAccount with or without quota data
@@ -141,6 +166,15 @@ func Start(cfg *config.Config, database *db.Database) error {
 		SupportsImport: true,
 		Executor:       s.kiro,
 		Refresh:        RefreshKiroIfNeeded,
+	})
+	s.providers.Register(&ProviderInfo{
+		ID:             "pioneer",
+		Aliases:        []string{"pio", "pioneer"},
+		Label:          "Pioneer",
+		Icon:           "explore",
+		SupportsImport: true,
+		Executor:       s.pio,
+		// No Refresh needed — Pioneer API keys are long-lived (up to 1 year)
 	})
 
 	// Initialize Supabase sync first so the models handler can wire it
@@ -280,6 +314,7 @@ func Start(cfg *config.Config, database *db.Database) error {
 			// Account import (manual add)
 			r.Post("/accounts/import/ag", s.handleImportAG)
 			r.Post("/accounts/import/kiro", s.handleImportKiro)
+			r.Post("/accounts/import/pio", s.handleImportPioneer)
 			r.Get("/oauth/ag/authorize", s.handleAGAuthorize)
 			r.Post("/oauth/ag/exchange", s.handleAGExchange)
 
@@ -354,6 +389,13 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if model == "" {
 		writeError(w, http.StatusBadRequest, "Missing 'model' field")
 		return
+	}
+
+	// Strip "liam/" prefix if present (injected by integrations like OpenCode)
+	if strings.HasPrefix(model, "liam/") {
+		model = strings.TrimPrefix(model, "liam/")
+		req["model"] = model
+		body, _ = json.Marshal(req)
 	}
 
 	// Resolve aliases (user-defined shortcuts → canonical model)
@@ -526,9 +568,66 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, fmt.Sprintf("Unsupported provider: %s", provider))
 			return
 		}
-		resp, err = providerInfo.Executor.ExecuteWithSession(account, model, body, stream, sessionID)
 
-		// --- Network/transport error ---
+		// =========================================================
+		// AG SMART RETRY: Antigravity executor handles 429/503
+		// internally with its own retry loop. It surfaces a rich
+		// result telling us whether to switch accounts or not.
+		// Other providers use the generic error classification.
+		// =========================================================
+		var agResult *antigravity.ExecuteResult
+
+		if provider == "antigravity" {
+			agResult, err = s.ag.ExecuteWithResult(account, model, body, stream, sessionID)
+			if err != nil {
+				lastErr = err
+				cooldown, msg := s.applyAccountError(account, 0, []byte(err.Error()), nil)
+				log.Printf("[RETRY %d] Account %s AG transport error: %v -> %s", attempt+1, account.Email, err, msg)
+				if s.pool.Count(provider) <= 1 {
+					time.Sleep(cooldown)
+				}
+				continue
+			}
+			resp = agResult.Response
+
+			// AG executor returned a non-200 with explicit guidance
+			if agResult.ShouldSwitchAccount {
+				respBody, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				cooldownDuration := time.Duration(agResult.CooldownMs) * time.Millisecond
+				if cooldownDuration < time.Second {
+					cooldownDuration = time.Second
+				}
+				cooldownSecs := int(cooldownDuration.Seconds())
+				s.db.MarkAccountError(account.ID, agResult.Reason, cooldownSecs)
+				log.Printf("[RETRY %d] Account %s AG %d -> %s (cooldown %v, switch=%v)",
+					attempt+1, account.Email, resp.StatusCode, agResult.Reason, cooldownDuration, true)
+				s.logFailedRequest(r, account, provider, model, body, resp.StatusCode, string(respBody), startTime)
+				lastErr = fmt.Errorf("AG %d: %s", resp.StatusCode, agResult.Reason)
+				// Don't sleep for single-account case on quota exhaustion —
+				// no point retrying, just fail fast
+				if agResult.Reason == "quota_exhausted" && s.pool.Count(provider) <= 1 {
+					writeError(w, resp.StatusCode, ExtractErrorMessage(respBody))
+					return
+				}
+				continue
+			}
+
+			// AG executor exhausted retries but didn't flag switch
+			if resp.StatusCode != 200 && agResult.Reason == "retries_exhausted" {
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				log.Printf("[RETRY %d] Account %s AG retries exhausted (HTTP %d), retrying same account", attempt+1, account.Email, resp.StatusCode)
+				lastErr = fmt.Errorf("AG retries exhausted HTTP %d", resp.StatusCode)
+				// Short sleep and retry same account (outer loop picks same account via affinity)
+				time.Sleep(2 * time.Second)
+				continue
+			}
+		} else {
+			resp, err = providerInfo.Executor.ExecuteWithSession(account, model, body, stream, sessionID)
+		}
+
+		// --- Network/transport error (non-AG or fallthrough) ---
 		if err != nil {
 			lastErr = err
 			cooldown, msg := s.applyAccountError(account, 0, []byte(err.Error()), nil)
@@ -563,7 +662,8 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// --- 401/403/429 + 5xx — unified fallback path ---
+		// --- 401/403/429 + 5xx — unified fallback path (non-AG only,
+		//     AG already handled above) ---
 		if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 429 || resp.StatusCode >= 500 {
 			respBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
@@ -1212,6 +1312,16 @@ func (s *Server) handleAddAccount(w http.ResponseWriter, r *http.Request) {
 			if patched, err := json.Marshal(c); err == nil {
 				input.Credentials = patched
 			}
+		}
+	case "pioneer":
+		var c db.PioneerCredentials
+		if err := json.Unmarshal(input.Credentials, &c); err != nil {
+			writeError(w, http.StatusBadRequest, "credentials JSON invalid: "+err.Error())
+			return
+		}
+		if strings.TrimSpace(c.APIKey) == "" {
+			writeError(w, http.StatusBadRequest, "api_key is required for pioneer accounts")
+			return
 		}
 	}
 

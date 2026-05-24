@@ -31,5 +31,5 @@ func ReadNumbered(input string) string {
 }
 
 // ReadNumberedLineRe is exported so autodetect can sample lines without
-// having to re-derive the pattern.
-var ReadNumberedLineRe = regexp.MustCompile(`^\s*\d+\|`)
+// duplicating the rule.
+var ReadNumberedLineRe = regexp.MustCompile(`^\s*\d+[|:]`)
