@@ -108,6 +108,19 @@ make build
 
 Or grab a pre-built binary from [Releases](https://github.com/IlhamFaturachman/liam/releases) (mac, linux, windows).
 
+### Project Structure
+
+```
+liam/
+├── cmd/liam/main.go        # Entrypoint (CLI)
+├── internal/               # Core logic (proxy, providers, db, dashboard, etc.)
+├── harvest/                # Python batch login module
+├── bin/                    # Build output (cross-platform binaries)
+└── liam                    # Root binary (after `go build`)
+```
+
+LIAM follows standard Go project layout. The main entrypoint is in `cmd/liam/main.go`, not the root directory.
+
 ### First-time setup
 
 ```bash
@@ -118,11 +131,38 @@ The wizard installs harvest dependencies (Python venv + Camoufox), optionally co
 
 ### Run
 
+**Development mode** (auto-recompile):
 ```bash
-./bin/liam serve              # foreground (debug)
-./bin/liam start              # background daemon
-./bin/liam status             # health check
-./bin/liam stop               # stop daemon
+go run ./cmd/liam serve
+```
+
+**Production mode** (build first):
+```bash
+# Build binary
+go build -o liam ./cmd/liam
+
+# Run foreground (debug)
+./liam serve
+
+# OR run as daemon
+./liam start
+./liam status
+./liam stop
+```
+
+**Cross-platform build** (outputs to `bin/`):
+```bash
+make build-all
+./bin/liam-darwin-arm64 serve
+```
+
+**Harvest module** (batch login):
+```bash
+# Web UI
+liam harvest --ui                # http://localhost:8000
+
+# CLI batch mode
+liam harvest --provider ag --file accounts.txt --concurrency 4 --headless
 ```
 
 Dashboard: **http://localhost:666/dashboard** (default password: `123456`, change in setup).
